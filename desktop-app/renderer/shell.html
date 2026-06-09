@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>内容采集工具（桌面内嵌版）</title>
+    <link rel="stylesheet" href="./shell.css" />
+  </head>
+  <body>
+    <div id="topbar">
+      <div class="left">
+        <div class="brand">内容采集工具</div>
+        <div id="backendStatus" class="status">后端：启动中…</div>
+      </div>
+
+      <div class="right">
+        <input id="urlInput" placeholder="输入网址后回车（右侧为真内嵌浏览器）" />
+        <button id="btnGo">打开</button>
+        <button id="btnBack">后退</button>
+        <button id="btnForward">前进</button>
+        <button id="btnReload">刷新</button>
+
+        <div class="divider"></div>
+
+        <button id="btnRecStart">开始录制</button>
+        <button id="btnRecStop" disabled>停止并保存</button>
+        <span id="recCount" class="muted">0</span>
+
+        <select id="recFiles"></select>
+        <button id="btnReplay">回放</button>
+      </div>
+    </div>
+
+    <div id="layout">
+      <!-- 左侧：你的原有前端（由后端服务提供 UI），在桌面 App 内嵌显示 -->
+      <div id="leftPane">
+        <iframe id="appFrame" title="工具面板" src="about:blank"></iframe>
+      </div>
+
+      <!-- 右侧：留空（真实浏览器由主进程 BrowserView 内嵌渲染在这块区域） -->
+      <div id="rightPane">
+        <div class="hint">
+          右侧为“真内嵌浏览器”（BrowserView）。<br />
+          你可以直接手工点击、登录、滚动。<br />
+          上方可开始录制并保存为 JSON，之后回放。
+        </div>
+      </div>
+    </div>
+
+    <script src="./shell.js"></script>
+  </body>
+</html>

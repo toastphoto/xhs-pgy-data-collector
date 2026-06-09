@@ -1,0 +1,17 @@
+# 这是一个示例文件说明
+# 实际使用时请创建真正的Excel文件
+
+# Excel文件应该包含以下列：
+# 平台 | 账号名称 | 主页链接 | 备注
+
+# 示例数据：
+# 小红书 | 时尚博主小王 | https://www.xiaohongshu.com/user/xxx | 重点关注
+# 抖音 | 美妆达人Lisa | https://www.douyin.com/user/xxx | 
+# 微博 | 科技测评张三 | https://weibo.com/u/xxx | 
+# B站 | 游戏主播李四 | https://space.bilibili.com/xxx | 游戏区
+
+# 支持的列名（不区分大小写）：
+# - 平台 / platform
+# - 账号名称 / name / nickname
+# - 主页链接 / 链接 / url / link
+# - 备注 / note

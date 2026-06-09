@@ -1,0 +1,41 @@
+.DS_Store
+
+# Runtime secrets and local config
+.env
+*.local
+ai_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node/Electron
+node_modules/
+dist/
+out/
+
+# App runtime data
+/logs/
+/output/
+/data/
+/recordings/
+/runs/
+/db/
+/export_presets/
+content-analyzer/logs/
+content-analyzer/output/
+content-analyzer/data/
+content-analyzer/app/data/
+desktop-app/dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*cookie*.json
+*cookies*.json
+
+# Local task/input files that may contain real creator links
+蒲公英链接.txt
+任务队列_*.xlsx

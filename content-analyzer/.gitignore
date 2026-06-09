@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+logs/
+data/pgy_cookies.json
+app/data/pgy_cookies.json
+data/uploads/
+output/

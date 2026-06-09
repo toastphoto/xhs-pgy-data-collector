@@ -1,0 +1,46 @@
+{
+  "name": "content-analyzer-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "达人账号内容分析工具（桌面内嵌浏览器版）",
+  "main": "main.js",
+  "author": "",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "node ./scripts/run-electron.js",
+    "start": "node ./scripts/run-electron.js",
+    "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "minisearch": "^7.2.0",
+    "sql.js": "^1.13.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.solo.contentanalyzer",
+    "productName": "小红书相关信息采集工具",
+    "directories": {
+      "output": "dist"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "**/node_modules/sql.js/dist/sql-wasm.wasm"
+    ],
+    "files": [
+      "**/*"
+    ],
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}

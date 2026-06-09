@@ -1,0 +1,24 @@
+{
+  "version": "pgy_v1_default",
+  "platform": "pgy",
+  "mode": "safe_dom",
+  "resolveNoteUrlByClick": true,
+  "tabTexts": ["数据概览", "笔记数据", "粉丝分析"],
+  "pages": [
+    { "name": "creator_detail", "tabText": null },
+    { "name": "overview", "tabText": "数据概览" },
+    { "name": "notes", "tabText": "笔记数据" },
+    { "name": "fans", "tabText": "粉丝分析" }
+  ],
+  "noteCardSelector": null,
+  "creator_summary": [
+    { "name": "platform", "selector": null, "value": "pgy" },
+    { "name": "creator_name", "selector": "h1, [class*='name']", "transform": "text" },
+    { "name": "creator_url", "selector": null, "transform": "url" },
+    { "name": "followers", "selector": "[class*='follower'],[class*='fans']", "transform": "number" }
+  ],
+  "note_detail": [
+    { "name": "note_title", "selector": "[class*='title'],h3,h4", "transform": "text" },
+    { "name": "note_url", "selector": "a[href*='/explore/']", "attr": "href", "transform": "url" }
+  ]
+}

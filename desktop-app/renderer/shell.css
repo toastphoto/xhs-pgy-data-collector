@@ -1,0 +1,122 @@
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: #0b0f14;
+  color: #e6edf3;
+}
+
+#topbar {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  background: rgba(20, 24, 28, 0.95);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+#topbar .left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand {
+  font-weight: 700;
+}
+
+.status {
+  font-size: 12px;
+  color: #9da7b3;
+}
+
+#topbar .right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#urlInput {
+  width: 420px;
+  max-width: 40vw;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.04);
+  color: #e6edf3;
+  outline: none;
+}
+
+button, select {
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.06);
+  color: #e6edf3;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+select {
+  max-width: 260px;
+}
+
+.divider {
+  width: 1px;
+  height: 22px;
+  background: rgba(255,255,255,0.10);
+  margin: 0 4px;
+}
+
+.muted {
+  font-size: 12px;
+  color: #9da7b3;
+  min-width: 16px;
+  text-align: right;
+}
+
+#layout {
+  height: calc(100% - 56px);
+  display: flex;
+}
+
+#leftPane {
+  width: 520px;
+  min-width: 420px;
+  border-right: 1px solid rgba(255,255,255,0.06);
+  background: #0f141b;
+}
+
+#appFrame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #0f141b;
+}
+
+#rightPane {
+  flex: 1;
+  position: relative;
+}
+
+.hint {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  max-width: 520px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: rgba(230, 237, 243, 0.75);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 12px 14px;
+  pointer-events: none;
+}
+

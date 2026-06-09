@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>小红书相关信息采集工具</title>
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar"></header>
+      <div id="body">
+        <!-- 左侧：原生控制台 UI -->
+        <div id="console">
+          <aside id="sidebar"></aside>
+          <div id="splitterSidebar" class="splitter" title="拖动调整侧边栏宽度"></div>
+          <section id="content"></section>
+        </div>
+
+        <div id="splitterMain" class="splitter" title="拖动调整左右区域宽度"></div>
+
+        <!-- 右侧：留空（真实浏览器由主进程 BrowserView 内嵌渲染在这块区域） -->
+        <div id="browserHost">
+          <div class="hint">
+            右侧为“真内嵌浏览器”（BrowserView）。<br />
+            你可以直接手工点击、登录、滚动。<br />
+            本区域仅作为 BrowserView 的占位底板。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        function renderErr(err) {
+          try {
+            var host = document.getElementById('console') || document.body;
+            var box = document.createElement('div');
+            box.style.margin = '12px';
+            box.style.padding = '12px';
+            box.style.borderRadius = '12px';
+            box.style.border = '1px solid rgba(255,123,114,0.35)';
+            box.style.background = 'rgba(255,123,114,0.10)';
+            box.style.color = '#ff7b72';
+            box.style.fontSize = '13px';
+            box.style.whiteSpace = 'pre-wrap';
+            var msg =
+              (err && (err.stack || err.message)) ? (err.stack || err.message) : String(err || 'unknown error');
+            box.textContent =
+              'UI 启动失败（app.js 执行异常）。\\n\\n' +
+              msg +
+              '\\n\\n建议：\\n' +
+              '1) 关闭应用后重新 npm run dev\\n' +
+              '2) 在 desktop-app 目录执行 npm install\\n' +
+              '3) 把终端输出最后 30 行发我';
+            host.prepend(box);
+          } catch (_) {}
+        }
+        window.addEventListener('error', function (e) { renderErr(e.error || e.message); }, true);
+        window.addEventListener('unhandledrejection', function (e) { renderErr(e.reason); }, true);
+        window.__renderAppError = renderErr;
+      })();
+    </script>
+    <script type="module">
+      import('./app.js').catch((err) => (window.__renderAppError ? window.__renderAppError(err) : null));
+    </script>
+  </body>
+</html>

@@ -135,6 +135,7 @@ class TaskRunner {
     } catch (_) {
       // ignore
     }
+    this._writeTaskState();
   }
 
   _writeMeta() {
@@ -162,6 +163,46 @@ class TaskRunner {
       );
     } catch (err) {
       this._log('warn', `写入 meta.json 失败：${String(err?.message || err)}`);
+    }
+  }
+
+  _writeTaskState() {
+    if (!this.state.runDir) return;
+    try {
+      const queue = Array.isArray(this.state.queue) ? this.state.queue : [];
+      const counts = queue.reduce((acc, item) => {
+        const key = item?.status || 'unknown';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      const payload = {
+        runId: this.state.runId,
+        runDir: this.state.runDir,
+        updatedAt: nowIso(),
+        running: Boolean(this.state.running),
+        paused: Boolean(this.state.paused),
+        pauseReason: this.state.pauseReason || '',
+        currentId: this.state.currentId || null,
+        presetKey: this.state.presetKey,
+        counts,
+        queue: queue.map((item) => ({
+          id: item.id,
+          url: item.url,
+          label: item.label || '',
+          status: item.status,
+          startedAt: item.startedAt || null,
+          finishedAt: item.finishedAt || null,
+          error: item.error || '',
+          subRunId: item.subRunId || '',
+          subRunDir: item.subRunDir || '',
+          jsonPath: item.jsonPath || ''
+        })),
+        logs: this.state.logs.slice(-80)
+      };
+      fs.mkdirSync(this.state.runDir, { recursive: true });
+      fs.writeFileSync(path.join(this.state.runDir, 'task_state.json'), JSON.stringify(payload, null, 2), 'utf-8');
+    } catch (_) {
+      // 状态文件是辅助产物，不能影响采集主流程。
     }
   }
 

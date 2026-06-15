@@ -15,6 +15,8 @@ try {
 const { extractFromTemplate } = require('./lib/extract_dom');
 const { saveEvidence, safeName } = require('./lib/evidence');
 const { TaskRunner } = require('./lib/task_runner');
+const { buildQualityReport } = require('./lib/quality_report');
+const { resolveInsideRoot, resolveInsideAny } = require('./lib/path_guard');
 const { openDb, initDb, dbGet, dbAll } = require('./lib/db/sqlite');
 const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
@@ -130,30 +132,15 @@ function setKbCacheFromDisk() {
 }
 
 function resolveInsideRuns(maybePath) {
-  const dir = getRunsDir();
-  const resolvedDir = path.resolve(dir);
-  const resolved = path.resolve(String(maybePath || ''));
-  const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
-  if (!resolved.startsWith(prefix)) return null;
-  return resolved;
+  return resolveInsideRoot(maybePath, getRunsDir());
 }
 
 function resolveInsideRecordings(maybePath) {
-  const dir = getRecordingsDir();
-  const resolvedDir = path.resolve(dir);
-  const resolved = path.resolve(String(maybePath || ''));
-  const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
-  if (!resolved.startsWith(prefix)) return null;
-  return resolved;
+  return resolveInsideRoot(maybePath, getRecordingsDir());
 }
 
 function resolveInsideTemplates(maybePath) {
-  const dir = getTemplatesDir();
-  const resolvedDir = path.resolve(dir);
-  const resolved = path.resolve(String(maybePath || ''));
-  const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
-  if (!resolved.startsWith(prefix)) return null;
-  return resolved;
+  return resolveInsideRoot(maybePath, getTemplatesDir());
 }
 
 function ensureDefaultTemplateInUserData() {
@@ -1731,14 +1718,21 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
       }
     } catch (_) {}
 
+    const qualityReport = buildQualityReport(rawResult);
+    rawResult.quality_report = qualityReport;
+
     const jsonPath = path.join(runDir, 'raw_result.json');
     fs.writeFileSync(jsonPath, JSON.stringify(rawResult, null, 2), 'utf-8');
+    const qualityPath = path.join(runDir, 'quality_report.json');
+    fs.writeFileSync(qualityPath, JSON.stringify(qualityReport, null, 2), 'utf-8');
 
     return {
       ok: true,
       runId,
       runDir,
       jsonPath,
+      qualityPath,
+      qualityReport,
       evidenceDir,
       debug: rawResult._debug,
       preview: {
@@ -2648,7 +2642,9 @@ ipcMain.handle('exports:openPath', async (_e, p) => {
   try {
     const t = String(p || '').trim();
     if (!t) return { ok: false, error: 'path 为空' };
-    const r = await shell.openPath(t);
+    const allowed = resolveInsideAny(t, [getRunsDir(), path.dirname(getColumnPresetPath())]);
+    if (!allowed) return { ok: false, error: '非法路径：只允许打开 runs/export 相关目录' };
+    const r = await shell.openPath(allowed);
     return r ? { ok: false, error: r } : { ok: true };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };

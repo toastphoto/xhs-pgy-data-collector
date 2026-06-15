@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "node ./scripts/run-electron.js",
     "start": "node ./scripts/run-electron.js",
-    "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
+    "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/path_guard.test.js && node tests/quality_report.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac"
   },

@@ -58,6 +58,30 @@ def _safe_output_file_path(filename: str, allowed_suffixes: set) -> Path:
         raise HTTPException(status_code=400, detail="无效文件路径")
     return file_path
 
+def _require_legacy_crawl_api_enabled() -> None:
+    if not Config.ENABLE_LEGACY_CRAWL_API:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "旧采集 API 默认禁用。请使用 Electron BrowserView 主流程；"
+                "如需隔离研究旧后端，显式设置 ENABLE_LEGACY_CRAWL_API=true。"
+            )
+        )
+
+def _validate_legacy_crawl_task(task: "CrawlTask") -> None:
+    if not task.urls:
+        raise HTTPException(status_code=400, detail="URL 列表为空")
+    if len(task.urls) > Config.LEGACY_CRAWL_MAX_URLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"旧采集 API 单次最多 {Config.LEGACY_CRAWL_MAX_URLS} 个 URL，请拆小批执行"
+        )
+    if task.max_contents < 1 or task.max_contents > Config.LEGACY_CRAWL_MAX_CONTENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"旧采集 API 每个账号最多 {Config.LEGACY_CRAWL_MAX_CONTENTS} 条内容"
+        )
+
 class CrawlTask(BaseModel):
     urls: List[str]
     max_contents: int = 10
@@ -146,6 +170,32 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """主页"""
+    if not Config.ENABLE_LEGACY_CRAWL_API:
+        return """
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>旧采集台已禁用</title>
+            <style>
+                body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;background:#f8fafc;color:#111827;}
+                main{max-width:720px;margin:12vh auto;padding:28px;border:1px solid #e5e7eb;border-radius:16px;background:#fff;box-shadow:0 18px 50px rgba(15,23,42,.08);}
+                h1{margin:0 0 12px;font-size:26px;}
+                p{margin:8px 0;color:#4b5563;line-height:1.7;}
+                code{padding:2px 6px;border-radius:6px;background:#f1f5f9;color:#0f172a;}
+            </style>
+        </head>
+        <body>
+            <main>
+                <h1>旧采集台已禁用</h1>
+                <p>当前产品主线是 Electron 内的蒲公英达人工作台，使用可见 BrowserView、人工登录、低频串行和风控暂停。</p>
+                <p>旧 FastAPI 采集/预登录入口默认关闭，避免绕过主工作台的安全边界。</p>
+                <p>隔离研究旧后端时，需显式设置 <code>ENABLE_LEGACY_CRAWL_API=true</code> 并重新评估风险。</p>
+            </main>
+        </body>
+        </html>
+        """
     return """
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -205,6 +255,9 @@ async def start_crawl(task: CrawlTask, background_tasks: BackgroundTasks):
     Returns:
         任务ID
     """
+    _require_legacy_crawl_api_enabled()
+    _validate_legacy_crawl_task(task)
+
     # 简单串行化：如果已有任务在跑，直接拒绝，避免共享浏览器并发混乱
     if _has_running_task() or _single_task_lock.locked():
         raise HTTPException(status_code=409, detail="已有采集任务正在运行，请等待当前任务完成后再启动")
@@ -388,6 +441,7 @@ async def start_prelogin():
     使用全局共享的爬虫实例，保持浏览器会话
     """
     global shared_crawlers
+    _require_legacy_crawl_api_enabled()
     
     task_id = f"prelogin_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
@@ -428,6 +482,7 @@ async def confirm_prelogin():
     不关闭浏览器，保持会话供后续采集使用
     """
     global shared_crawlers
+    _require_legacy_crawl_api_enabled()
     
     if "xiaohongshu" not in shared_crawlers or not shared_crawlers["xiaohongshu"].browser:
         return {"success": False, "message": "没有正在进行的预登录任务"}
@@ -460,12 +515,14 @@ async def cancel_prelogin():
     """
     取消预登录
     """
+    _require_legacy_crawl_api_enabled()
     # 只是重置状态，不关闭浏览器（因为可能还有其他任务在使用）
     return {"success": True, "message": "已取消预登录"}
 
 @app.get("/api/prelogin/status/{task_id}")
 async def get_prelogin_status(task_id: str):
     """获取预登录状态"""
+    _require_legacy_crawl_api_enabled()
     if task_id not in prelogin_status:
         raise HTTPException(status_code=404, detail="预登录任务不存在")
     
@@ -474,6 +531,7 @@ async def get_prelogin_status(task_id: str):
 @app.get("/api/prelogin/check-cookie")
 async def check_prelogin_cookie():
     """检查是否已有保存的Cookie"""
+    _require_legacy_crawl_api_enabled()
     cookie_file = Path(Config.DATA_DIR) / "pgy_cookies.json"
     
     if cookie_file.exists():
@@ -504,6 +562,7 @@ async def check_prelogin_cookie():
 @app.get("/api/prelogin/validate-login")
 async def validate_prelogin_login():
     global shared_crawlers
+    _require_legacy_crawl_api_enabled()
     cookie_file = Path(Config.DATA_DIR) / "pgy_cookies.json"
     if not cookie_file.exists():
         return {
@@ -539,14 +598,19 @@ async def get_config():
         "max_delay": Config.MAX_DELAY,
         "max_retries": Config.MAX_RETRIES,
         "use_proxy": Config.USE_PROXY,
-        "headless": Config.HEADLESS
+        "headless": Config.HEADLESS,
+        "legacy_crawl_api_enabled": Config.ENABLE_LEGACY_CRAWL_API,
+        "legacy_crawl_max_urls": Config.LEGACY_CRAWL_MAX_URLS,
+        "legacy_crawl_max_contents": Config.LEGACY_CRAWL_MAX_CONTENTS
     }
 
 @app.post("/api/config")
 async def update_config(config: CrawlConfig):
     """更新配置"""
-    # 这里可以实现配置更新逻辑
-    return {"message": "配置已更新", "config": config}
+    return {
+        "message": "运行时配置接口仅回显，不会修改采集安全边界；请通过环境变量和重启调整兼容层配置。",
+        "config": config
+    }
 
 
 # ==================== AI 分析 API ====================

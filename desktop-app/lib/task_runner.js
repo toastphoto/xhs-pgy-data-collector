@@ -1,34 +1,43 @@
 const fs = require('fs');
 const path = require('path');
 const { safeName } = require('./evidence');
+const { normalizeSigningTask } = require('./signing_task');
+
+const SAFE_BATCH_LIMIT = 50;
+const SAFE_RUN_COOLDOWN_MS = 5 * 60 * 1000;
+const SAFE_RUN_COOLDOWN_FILE = '.pgy_task_cooldown.json';
+const ALLOWED_TASK_HOSTS = Object.freeze(['pgy.xiaohongshu.com']);
 
 const TASK_PRESETS = {
   standard: {
     key: 'standard',
-    label: '标准',
-    pageWaitMs: 1200,
-    tabWaitMs: 1200,
+    label: '标准（保守）',
+    pageWaitMs: 4500,
+    pageWaitJitterMs: 2500,
+    tabWaitMs: 2500,
     // 本次实现（方案一）：不强求 note_url，默认不做“点击补全链接”
     resolveNoteUrlByClick: false,
     resolveLimit: 0
   },
   conservative: {
     key: 'conservative',
-    label: '保守',
-    pageWaitMs: 2200,
-    tabWaitMs: 2000,
-    resolveNoteUrlByClick: false,
-    resolveLimit: 0
-  },
-  fast: {
-    key: 'fast',
-    label: '加速',
-    pageWaitMs: 700,
-    tabWaitMs: 700,
+    label: '更保守',
+    pageWaitMs: 8000,
+    pageWaitJitterMs: 5000,
+    tabWaitMs: 4500,
     resolveNoteUrlByClick: false,
     resolveLimit: 0
   }
 };
+
+const LEGACY_PRESET_ALIASES = {
+  fast: 'standard'
+};
+
+function normalizePresetKey(value) {
+  const key = String(value || 'standard').trim();
+  return LEGACY_PRESET_ALIASES[key] || key;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -38,14 +47,42 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function jitteredDelayMs(baseMs, jitterMs = 0) {
+  const base = Math.max(0, Number(baseMs || 0));
+  const jitter = Math.max(0, Number(jitterMs || 0));
+  if (!jitter) return Math.round(base);
+  return Math.round(base + Math.random() * jitter);
+}
+
+function normalizeTaskUrl(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  const withProtocol = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  try {
+    const url = new URL(withProtocol);
+    url.protocol = 'https:';
+    return url.toString();
+  } catch (_) {
+    return withProtocol;
+  }
+}
+
+function isAllowedTaskUrl(value) {
+  try {
+    const url = new URL(normalizeTaskUrl(value));
+    return ALLOWED_TASK_HOSTS.includes(url.hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
 function normalizeUrlList(urls) {
   const list = Array.isArray(urls) ? urls : [];
   const out = [];
   const seen = new Set();
   for (const x of list) {
-    const s = String(x || '').trim();
-    if (!s) continue;
-    const u = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+    const u = normalizeTaskUrl(x);
+    if (!u) continue;
     if (seen.has(u)) continue;
     seen.add(u);
     out.push(u);
@@ -61,14 +98,17 @@ function normalizeItems(payload) {
 
   // 优先 items（允许携带 label/nickname）
   for (const it of items) {
-    const url = String(it?.pgy_url || it?.url || '').trim();
-    if (!url) continue;
-    const u = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const u = normalizeTaskUrl(it?.pgy_url || it?.url || '');
+    if (!u) continue;
     if (seen.has(u)) continue;
     seen.add(u);
     outItems.push({
       url: u,
-      label: String(it?.creator_name || it?.name || it?.label || '').trim()
+      label: String(it?.creator_name || it?.name || it?.label || '').trim(),
+      note: String(it?.note || '').trim(),
+      status: ['selected', 'excluded'].includes(String(it?.status || '').trim()) ? String(it.status).trim() : 'candidate',
+      priority: String(it?.priority || '').trim(),
+      excludeReason: String(it?.excludeReason || it?.exclude_reason || '').trim()
     });
   }
 
@@ -76,7 +116,7 @@ function normalizeItems(payload) {
   for (const u of urls) {
     if (seen.has(u)) continue;
     seen.add(u);
-    outItems.push({ url: u, label: '' });
+    outItems.push({ url: u, label: '', note: '', status: 'candidate', priority: '', excludeReason: '' });
   }
 
   return outItems;
@@ -103,6 +143,7 @@ class TaskRunner {
       presetKey: 'standard',
       templatePath: '',
       options: {},
+      signingTask: null,
       runId: '',
       runDir: '',
       queue: [],
@@ -114,6 +155,7 @@ class TaskRunner {
     this._pauseGate = null;
     this._pauseGateResolve = null;
     this._skipAfterCurrent = false;
+    this._lastFinishedAt = 0;
   }
 
   _log(level, message, extra) {
@@ -153,7 +195,15 @@ class TaskRunner {
             preset: TASK_PRESETS[this.state.presetKey] || TASK_PRESETS.standard,
             templatePath: this.state.templatePath,
             options: this.state.options,
-            items: this.state.queue.map((x) => ({ url: x.url, label: x.label || '' })),
+            signingTask: this.state.signingTask || null,
+            items: this.state.queue.map((x) => ({
+              url: x.url,
+              label: x.label || '',
+              note: x.note || '',
+              status: x.candidateStatus || 'candidate',
+              priority: x.priority || '',
+              excludeReason: x.excludeReason || ''
+            })),
             urls: this.state.queue.map((x) => x.url)
           },
           null,
@@ -184,6 +234,7 @@ class TaskRunner {
         pauseReason: this.state.pauseReason || '',
         currentId: this.state.currentId || null,
         presetKey: this.state.presetKey,
+        signingTask: this.state.signingTask || null,
         counts,
         queue: queue.map((item) => ({
           id: item.id,
@@ -213,27 +264,100 @@ class TaskRunner {
     return this._pauseGate;
   }
 
+  _getCooldownPath() {
+    try {
+      const runsDir = this.deps.getRunsDir();
+      fs.mkdirSync(runsDir, { recursive: true });
+      return path.join(runsDir, SAFE_RUN_COOLDOWN_FILE);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  _readLastFinishedAt() {
+    let fromFile = 0;
+    const cooldownPath = this._getCooldownPath();
+    if (cooldownPath && fs.existsSync(cooldownPath)) {
+      try {
+        const payload = JSON.parse(fs.readFileSync(cooldownPath, 'utf-8'));
+        fromFile = Number(payload?.lastFinishedAt || 0);
+      } catch (_) {
+        fromFile = 0;
+      }
+    }
+    const value = Math.max(Number(this._lastFinishedAt || 0), Number(fromFile || 0));
+    if (Number.isFinite(value) && value > 0) this._lastFinishedAt = value;
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  _writeLastFinishedAt(ts = Date.now()) {
+    const value = Number(ts || Date.now());
+    if (!Number.isFinite(value) || value <= 0) return;
+    this._lastFinishedAt = value;
+    const cooldownPath = this._getCooldownPath();
+    if (!cooldownPath) return;
+    try {
+      fs.writeFileSync(
+        cooldownPath,
+        JSON.stringify({ lastFinishedAt: value, lastFinishedAtIso: new Date(value).toISOString() }, null, 2),
+        'utf-8'
+      );
+    } catch (_) {
+      // 冷却文件写入失败时仍保留内存冷却，不能影响当前收尾。
+    }
+  }
+
   async start(payload) {
     if (this.state.running) return { ok: false, error: '任务正在运行中' };
 
     const templatePath = String(payload?.templatePath || '').trim();
     if (!templatePath) return { ok: false, error: '未选择模板（请先到「采集模板」里选择/保存一个模板）' };
 
-    const presetKey = String(payload?.presetKey || 'standard').trim();
+    const presetKey = normalizePresetKey(payload?.presetKey || 'standard');
     const preset = TASK_PRESETS[presetKey] || TASK_PRESETS.standard;
     const items = normalizeItems(payload || {});
     if (!items.length) return { ok: false, error: 'URL 列表为空' };
+    const invalidItems = items.filter((item) => !isAllowedTaskUrl(item.url));
+    if (invalidItems.length) {
+      const sample = invalidItems[0]?.url || '';
+      return {
+        ok: false,
+        code: 'PGY_TASK_URL_NOT_ALLOWED',
+        error: `为了降低误操作和平台风控风险，批量采集只允许蒲公英链接（${ALLOWED_TASK_HOSTS.join(', ')}）。请移除或修正：${sample}`
+      };
+    }
+    if (items.length > SAFE_BATCH_LIMIT) {
+      return {
+        ok: false,
+        error: `为了降低平台风控风险，单次最多采集 ${SAFE_BATCH_LIMIT} 个达人。请拆成多批，或先导出候选表分批执行。`
+      };
+    }
+    const lastFinishedAt = this._readLastFinishedAt();
+    const elapsedSinceLastRun = Date.now() - Number(lastFinishedAt || 0);
+    if (lastFinishedAt && elapsedSinceLastRun < SAFE_RUN_COOLDOWN_MS) {
+      const remainingMs = SAFE_RUN_COOLDOWN_MS - elapsedSinceLastRun;
+      const remainingMin = Math.max(1, Math.ceil(remainingMs / 60000));
+      return {
+        ok: false,
+        code: 'PGY_RUN_COOLDOWN',
+        error: `为降低平台风控风险，上一批结束后需要间隔至少 5 分钟再开始下一批。请休息约 ${remainingMin} 分钟后重试。`
+      };
+    }
+    const signingTask = normalizeSigningTask(payload?.signingTask || {});
 
     const runId = this.deps.makeRunId();
     const runDir = path.join(this.deps.getRunsDir(), runId);
     fs.mkdirSync(runDir, { recursive: true });
 
+    const requestedOptions = payload?.options && typeof payload.options === 'object' ? payload.options : {};
+    const requestedTabWaitMs = Number(requestedOptions.tabWaitMs || 0);
     const effectiveOptions = {
-      tabWaitMs: preset.tabWaitMs,
-      resolveNoteUrlByClick: preset.resolveNoteUrlByClick,
-      resolveLimit: preset.resolveLimit,
-      // 允许 UI 额外覆盖（但本次 Task 6 先不暴露太多）
-      ...(payload?.options || {})
+      ...requestedOptions,
+      tabWaitMs: Number.isFinite(requestedTabWaitMs) && requestedTabWaitMs > 0
+        ? Math.max(preset.tabWaitMs, requestedTabWaitMs)
+        : preset.tabWaitMs,
+      resolveNoteUrlByClick: false,
+      resolveLimit: 0
     };
 
     this.state = {
@@ -244,6 +368,7 @@ class TaskRunner {
       presetKey: preset.key,
       templatePath,
       options: effectiveOptions,
+      signingTask,
       runId,
       runDir,
       currentId: null,
@@ -251,6 +376,10 @@ class TaskRunner {
         id: `t${i + 1}`,
         url: it.url,
         label: it.label || '',
+        note: it.note || '',
+        candidateStatus: it.status || 'candidate',
+        priority: it.priority || '',
+        excludeReason: it.excludeReason || '',
         status: 'pending', // pending | running | paused | ok | fail | skipped
         startedAt: null,
         finishedAt: null,
@@ -263,7 +392,7 @@ class TaskRunner {
     };
 
     this._skipAfterCurrent = false;
-    this._log('info', `任务开始：${items.length} 条，预设=${preset.label}`);
+    this._log('info', `任务开始：${items.length} 条，预设=${preset.label}，签约任务=${signingTask.taskName}`);
     this._writeMeta();
     this._emitState();
 
@@ -272,6 +401,7 @@ class TaskRunner {
       this.state.running = false;
       this.state.paused = false;
       this.state.pauseReason = '';
+      this._writeLastFinishedAt(Date.now());
       this._emitState();
     });
 
@@ -377,7 +507,7 @@ class TaskRunner {
         try {
           this._log('info', `打开：${item.url}`);
           await this.deps.openUrl(item.url);
-          await sleep(preset.pageWaitMs);
+          await sleep(jitteredDelayMs(preset.pageWaitMs, preset.pageWaitJitterMs));
         } catch (err) {
           item.error = `打开失败：${String(err?.message || err)}`;
           const action = await this._pauseForManualIntervention(item.error, item);
@@ -409,6 +539,21 @@ class TaskRunner {
           }
 
           const login = await this.deps.checkLogin();
+          if (login?.ok && login?.riskDetected) {
+            const action = await this._pauseForManualIntervention(
+              `检测到页面可能触发安全验证/风控：${login.riskText || '请在右侧手工确认后继续'}`,
+              item
+            );
+            if (action === 'skip') {
+              item.status = 'skipped';
+              item.finishedAt = Date.now();
+              done = true;
+            } else {
+              item.status = 'running';
+            }
+            this._emitState();
+            continue;
+          }
           if (login?.ok && login?.loggedIn === false) {
             const action = await this._pauseForManualIntervention('检测到未登录（pgy:checkLogin loggedIn=false），请手工介入后继续', item);
             if (action === 'skip') {
@@ -444,7 +589,9 @@ class TaskRunner {
         }
 
         if (!r?.ok) {
-          item.error = `抽取失败：${r?.error || 'unknown error'}`;
+          item.error = r?.riskDetected
+            ? `检测到页面可能触发安全验证/风控：${r?.riskText || r?.error || '请在右侧手工确认后继续'}`
+            : `抽取失败：${r?.error || 'unknown error'}`;
           const action = await this._pauseForManualIntervention(item.error, item);
           if (action === 'skip') {
             item.status = 'skipped';
@@ -473,9 +620,21 @@ class TaskRunner {
     this.state.paused = false;
     this.state.pauseReason = '';
     this.state.currentId = null;
+    this._writeLastFinishedAt(Date.now());
     this._log('info', '任务队列已结束');
     this._emitState();
   }
 }
 
-module.exports = { TaskRunner, TASK_PRESETS };
+module.exports = {
+  TaskRunner,
+  TASK_PRESETS,
+  SAFE_BATCH_LIMIT,
+  SAFE_RUN_COOLDOWN_MS,
+  SAFE_RUN_COOLDOWN_FILE,
+  ALLOWED_TASK_HOSTS,
+  isAllowedTaskUrl,
+  jitteredDelayMs,
+  normalizePresetKey,
+  normalizeTaskUrl
+};

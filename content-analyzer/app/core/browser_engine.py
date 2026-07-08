@@ -22,7 +22,8 @@ class BrowserEngine:
     """浏览器引擎类 - 模拟真实用户行为"""
     
     def __init__(self, headless: bool = None):
-        self.headless = headless if headless is not None else Config.HEADLESS
+        requested_headless = headless if headless is not None else Config.HEADLESS
+        self.headless = Config.ALLOW_STEALTH_EVASION and bool(requested_headless)
         self.driver: Optional[webdriver.Chrome] = None
         self.delay = DelayController(Config.MIN_DELAY, Config.MAX_DELAY)
         self.wait: Optional[WebDriverWait] = None
@@ -43,19 +44,21 @@ class BrowserEngine:
             
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('--disable-web-security')
-            options.add_argument('--disable-features=IsolateOrigins,site-per-process')
             options.add_argument('--window-size=1920,1080')
             options.add_argument('--start-maximized')
+
+            if Config.ALLOW_STEALTH_EVASION:
+                options.add_argument('--disable-web-security')
+                options.add_argument('--disable-features=IsolateOrigins,site-per-process')
+                options.add_argument('--disable-blink-features=AutomationControlled')
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option('useAutomationExtension', False)
             
-            ua = ua_pool.get_random_ua()
-            options.add_argument(f'--user-agent={ua}')
+            if Config.ALLOW_STEALTH_EVASION:
+                ua = ua_pool.get_random_ua()
+                options.add_argument(f'--user-agent={ua}')
             options.add_argument('--lang=zh-CN')
             options.add_argument('--timezone=Asia/Shanghai')
-            
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option('useAutomationExtension', False)
             
             prefs = {
                 "credentials_enable_service": False,
@@ -71,20 +74,21 @@ class BrowserEngine:
             self.driver = webdriver.Chrome(options=options)
             self.wait = WebDriverWait(self.driver, Config.BROWSER_TIMEOUT)
             
-            # 执行CDP命令隐藏webdriver
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': '''
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
-                    window.chrome = {
-                        runtime: {}
-                    };
-                '''
-            })
+            if Config.ALLOW_STEALTH_EVASION:
+                # 旧兼容层研究开关：默认关闭，避免把产品误用成规避风控的自动化浏览器。
+                self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                    'source': '''
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                        Object.defineProperty(navigator, 'plugins', {
+                            get: () => [1, 2, 3, 4, 5]
+                        });
+                        window.chrome = {
+                            runtime: {}
+                        };
+                    '''
+                })
             
             logger.info("浏览器启动成功")
             print("[浏览器] ✓ Chrome 启动成功")

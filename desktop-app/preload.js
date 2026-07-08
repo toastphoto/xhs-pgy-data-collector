@@ -14,7 +14,11 @@ contextBridge.exposeInMainWorld('desktopAPI', {
   },
   pgy: {
     checkLogin: () => ipcRenderer.invoke('pgy:checkLogin'),
+    pickElement: (payload) => ipcRenderer.invoke('pgy:pickElement', payload),
+    scanPageBlocks: (payload) => ipcRenderer.invoke('pgy:scanPageBlocks', payload),
+    clearPageBlockHints: () => ipcRenderer.invoke('pgy:clearPageBlockHints'),
     suggestNoteCardSelector: () => ipcRenderer.invoke('pgy:suggestNoteCardSelector'),
+    extractSearchCandidates: () => ipcRenderer.invoke('pgy:extractSearchCandidates'),
     extractCurrentMultiPage: (templatePath, options) =>
       ipcRenderer.invoke('pgy:extractCurrentMultiPage', templatePath, options)
   },
@@ -40,14 +44,27 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     resume: () => ipcRenderer.invoke('tasks:resume'),
     skipCurrent: () => ipcRenderer.invoke('tasks:skipCurrent'),
     importExcel: () => ipcRenderer.invoke('tasks:importExcel'),
+    exportCandidateSheet: (payload) => ipcRenderer.invoke('tasks:exportCandidateSheet', payload),
     openRunDir: () => ipcRenderer.invoke('tasks:openRunDir'),
     openRunsDir: () => ipcRenderer.invoke('tasks:openRunsDir'),
     onState: (cb) => ipcRenderer.on('tasks:state', (_e, payload) => cb(payload))
+  },
+  signingTasks: {
+    list: () => ipcRenderer.invoke('signingTasks:list'),
+    save: (payload) => ipcRenderer.invoke('signingTasks:save', payload),
+    delete: (id) => ipcRenderer.invoke('signingTasks:delete', id),
+    executionRecords: () => ipcRenderer.invoke('signingTasks:executionRecords')
   },
   exports: {
     listRuns: () => ipcRenderer.invoke('exports:listRuns'),
     exportRun: (payload) => ipcRenderer.invoke('exports:exportRun', payload),
     exportResourceRun: (payload) => ipcRenderer.invoke('exports:exportResourceRun', payload),
+    exportContactRun: (payload) => ipcRenderer.invoke('exports:exportContactRun', payload),
+    exportContactSelection: (payload) => ipcRenderer.invoke('exports:exportContactSelection', payload),
+    getContactPreview: (payload) => ipcRenderer.invoke('exports:getContactPreview', payload),
+    loadContactReview: (payload) => ipcRenderer.invoke('exports:loadContactReview', payload),
+    saveContactReview: (payload) => ipcRenderer.invoke('exports:saveContactReview', payload),
+    importContactReviewWorkbook: () => ipcRenderer.invoke('exports:importContactReviewWorkbook'),
     getResourceColumns: () => ipcRenderer.invoke('exports:getResourceColumns'),
     loadColumnPreset: () => ipcRenderer.invoke('exports:loadColumnPreset'),
     saveColumnPreset: (cols) => ipcRenderer.invoke('exports:saveColumnPreset', cols),

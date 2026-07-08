@@ -1,17 +1,72 @@
 import { store } from '../state/store.js';
+import { createAdvancedSection, createStatusPill, createStepCard } from '../ui/components.js';
 
 const PRESETS = [
-  { key: 'standard', label: '标准（推荐）' },
-  { key: 'conservative', label: '保守（更稳）' },
-  { key: 'fast', label: '加速（更快）' }
+  { key: 'standard', label: '标准（保守）' },
+  { key: 'conservative', label: '更保守（更慢）' }
+];
+
+const PGY_DISCOVERY_URL = 'https://pgy.xiaohongshu.com/solar/pre-trade/note/kol';
+const SAFE_BATCH_LIMIT = 50;
+const RECOMMENDED_BATCH_TEXT = '建议 10-30 人/批，上限 50 人/批，批次间隔至少 5 分钟';
+
+const SOURCE_MODE_OPTIONS = [
+  ['import', '已有达人表/链接'],
+  ['search', '蒲公英搜索发现'],
+  ['mixed', '导入 + 搜索']
 ];
 
 let _draftText = '';
 let _draftUrls = [];
 let _draftItems = []; // {pgy_url, creator_name}[]
+let _candidateQuery = '';
+let _candidateStatusFilter = 'all';
+let _collectionScope = 'active';
 let _presetKey = 'standard';
 let _selectedTemplatePath = '';
 let _importPreview = null; // {stats, items, filePath} | null
+let _signingDataLoaded = false;
+let _savedSigningTasks = [];
+let _executionRecords = [];
+let _selectedSigningTaskId = '';
+let _lastPgyLoginCheck = null;
+let _lastSearchSnapshot = null;
+let _candidateDirty = false;
+let _taskSetupOpen = false;
+let _searchAdvancedOpen = false;
+let _candidateBulkOpen = false;
+let _signingTaskDraft = {
+  taskName: '',
+  sourceMode: 'import',
+  note: '',
+  channels: { pgy: true, xhs: false },
+  contactPlan: { pgyInvite: false, wechat: false, email: false },
+  searchCriteria: {
+    track: '',
+    followersMinWan: '',
+    followersMaxWan: '',
+    priceMin: '',
+    priceMax: '',
+    orders90dMin: '',
+    readUnitPriceMax: '',
+    noteUpdate30dMin: '',
+    readMedian90dMin: '',
+    interactMedian90dMin: ''
+  }
+};
+
+const CRITERIA_FIELDS = [
+  ['track', '赛道类型', '中外生活'],
+  ['followersMinWan', '粉丝量下限(万)', '20'],
+  ['followersMaxWan', '粉丝量上限(万)', '30'],
+  ['priceMin', '报价下限', '1000'],
+  ['priceMax', '报价上限', '30000'],
+  ['orders90dMin', '近90天商单数下限', '1'],
+  ['readUnitPriceMax', '阅读单价上限', '3'],
+  ['noteUpdate30dMin', '近30天笔记更新频次下限', '3'],
+  ['readMedian90dMin', '近90天阅读中位数下限', '300'],
+  ['interactMedian90dMin', '近90天互动中位数下限', '100']
+];
 
 function parseUrls(rawText) {
   const text = String(rawText || '');
@@ -34,6 +89,201 @@ function parseUrls(rawText) {
     out.push(u);
   }
   return out;
+}
+
+function addDraftUrls(urls) {
+  const normalized = parseUrls((Array.isArray(urls) ? urls : [urls]).filter(Boolean).join('\n'));
+  if (!normalized.length) return 0;
+  const before = _draftUrls.length;
+  _draftUrls = parseUrls([..._draftUrls, ...normalized].join('\n'));
+  _draftText = _draftUrls.join('\n');
+  const added = _draftUrls.length - before;
+  if (added) _candidateDirty = true;
+  return added;
+}
+
+function normalizeDraftUrl(url) {
+  const s = String(url || '').trim();
+  if (!s) return '';
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+}
+
+function syncDraftText() {
+  _draftText = _draftUrls.join('\n');
+}
+
+function getDraftItem(url) {
+  const normalized = normalizeDraftUrl(url);
+  return _draftItems.find((item) => normalizeDraftUrl(item?.pgy_url) === normalized) || null;
+}
+
+function setDraftItemLabel(url, label) {
+  const normalized = normalizeDraftUrl(url);
+  if (!normalized) return;
+  let item = getDraftItem(normalized);
+  if (!item) {
+    item = { pgy_url: normalized, creator_name: '' };
+    _draftItems.push(item);
+  }
+  item.pgy_url = normalized;
+  item.creator_name = String(label || '').trim();
+  _candidateDirty = true;
+}
+
+function updateDraftItem(url, patch = {}) {
+  const normalized = normalizeDraftUrl(url);
+  if (!normalized) return;
+  let item = getDraftItem(normalized);
+  if (!item) {
+    item = { pgy_url: normalized, creator_name: '' };
+    _draftItems.push(item);
+  }
+  item.pgy_url = normalized;
+  if (Object.prototype.hasOwnProperty.call(patch, 'creator_name')) item.creator_name = String(patch.creator_name || '').trim();
+  if (Object.prototype.hasOwnProperty.call(patch, 'note')) item.note = String(patch.note || '').trim();
+  if (Object.prototype.hasOwnProperty.call(patch, 'priority')) item.priority = String(patch.priority || '').trim();
+  if (Object.prototype.hasOwnProperty.call(patch, 'excludeReason')) item.excludeReason = String(patch.excludeReason || '').trim();
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
+    const status = String(patch.status || '').trim();
+    item.status = ['selected', 'excluded'].includes(status) ? status : 'candidate';
+  }
+  _candidateDirty = true;
+}
+
+function removeDraftUrl(url) {
+  const normalized = normalizeDraftUrl(url);
+  _draftUrls = _draftUrls.filter((u) => normalizeDraftUrl(u) !== normalized);
+  _draftItems = _draftItems.filter((item) => normalizeDraftUrl(item?.pgy_url) !== normalized);
+  syncDraftText();
+  _candidateDirty = true;
+}
+
+function getFilteredDraftUrls() {
+  const query = String(_candidateQuery || '').trim().toLowerCase();
+  const statusFilter = String(_candidateStatusFilter || 'all');
+  return _draftUrls.filter((url) => {
+    const item = getDraftItem(url);
+    const status = String(item?.status || 'candidate').trim() || 'candidate';
+    if (statusFilter !== 'all' && status !== statusFilter) return false;
+    if (!query) return true;
+    const hay = [url, item?.creator_name, item?.note, item?.priority, item?.excludeReason, item?.status].map((x) => String(x || '').toLowerCase()).join(' ');
+    return hay.includes(query);
+  });
+}
+
+function markDraftUrls(urls, patch = {}) {
+  const list = Array.isArray(urls) ? urls : [];
+  list.forEach((url) => updateDraftItem(url, patch));
+}
+
+function normalizeImportedCandidateItem(item) {
+  return {
+    pgy_url: normalizeDraftUrl(item?.pgy_url || item?.url || ''),
+    creator_name: String(item?.creator_name || item?.creatorName || item?.name || '').trim(),
+    note: String(item?.note || '').trim(),
+    status: ['selected', 'excluded'].includes(String(item?.status || '').trim()) ? String(item.status).trim() : 'candidate',
+    priority: String(item?.priority || '').trim(),
+    excludeReason: String(item?.excludeReason || item?.exclude_reason || '').trim()
+  };
+}
+
+function summarizeSearchFilters(filters) {
+  const groups = Array.isArray(filters?.groups) ? filters.groups : [];
+  const selected = Array.isArray(filters?.selected) ? filters.selected : [];
+  const lines = [];
+  if (selected.length) lines.push(`已选：${selected.slice(0, 12).join('、')}`);
+  groups.slice(0, 8).forEach((group) => {
+    const options = Array.isArray(group?.options) ? group.options : [];
+    if (!options.length) return;
+    lines.push(`${group.group || '筛选'}：${options.slice(0, 18).join('、')}${options.length > 18 ? ` 等 ${options.length} 项` : ''}`);
+  });
+  return lines.join('\n');
+}
+
+function applyImportedCandidateItems(items, { merge = false } = {}) {
+  const imported = (Array.isArray(items) ? items : [])
+    .map(normalizeImportedCandidateItem)
+    .filter((item) => item.pgy_url);
+  if (!merge) {
+    _draftUrls = parseUrls(imported.map((x) => x.pgy_url).join('\n'));
+    _draftItems = imported;
+    syncDraftText();
+    _candidateDirty = true;
+    return { imported: imported.length, added: imported.length, updated: 0 };
+  }
+
+  let added = 0;
+  let updated = 0;
+  imported.forEach((item) => {
+    const exists = getDraftItem(item.pgy_url);
+    if (exists) updated += 1;
+    else added += 1;
+    updateDraftItem(item.pgy_url, {
+      creator_name: item.creator_name,
+      note: item.note,
+      status: item.status,
+      priority: item.priority,
+      excludeReason: item.excludeReason
+    });
+  });
+  _draftUrls = parseUrls([..._draftUrls, ...imported.map((x) => x.pgy_url)].join('\n'));
+  syncDraftText();
+  _candidateDirty = true;
+  return { imported: imported.length, added, updated };
+}
+
+function countDraftItemsWithLabel() {
+  return _draftUrls.filter((url) => String(getDraftItem(url)?.creator_name || '').trim()).length;
+}
+
+function candidateDecisionStats() {
+  return _draftUrls.reduce((acc, url) => {
+    const status = String(getDraftItem(url)?.status || 'candidate').trim();
+    if (status === 'selected') acc.selected += 1;
+    else if (status === 'excluded') acc.excluded += 1;
+    else acc.candidate += 1;
+    return acc;
+  }, { candidate: 0, selected: 0, excluded: 0 });
+}
+
+function buildCandidateItems() {
+  return _draftUrls.map((url) => {
+    const item = getDraftItem(url);
+    return {
+      pgy_url: normalizeDraftUrl(url),
+      creator_name: String(item?.creator_name || '').trim(),
+      note: String(item?.note || '').trim(),
+      status: ['selected', 'excluded'].includes(String(item?.status || '').trim()) ? String(item.status).trim() : 'candidate',
+      priority: String(item?.priority || '').trim(),
+      excludeReason: String(item?.excludeReason || '').trim()
+    };
+  });
+}
+
+function getCollectionUrls() {
+  const urls = _draftUrls.length ? _draftUrls : parseUrls(_draftText);
+  if (!_draftUrls.length) return urls;
+  return urls.filter((url) => {
+    const status = String(getDraftItem(url)?.status || 'candidate').trim() || 'candidate';
+    if (_collectionScope === 'selected') return status === 'selected';
+    if (_collectionScope === 'all') return true;
+    return status !== 'excluded';
+  });
+}
+
+function collectionScopeLabel() {
+  const map = {
+    active: '优先 + 待复核',
+    selected: '只采优先',
+    all: '全部候选'
+  };
+  return map[_collectionScope] || map.active;
+}
+
+function looksLikePgyCreatorUrl(url) {
+  const text = String(url || '').trim();
+  if (!/^https?:\/\/pgy\.xiaohongshu\.com\//i.test(text)) return false;
+  return /blogger|kol|creator|note\/kol|pre-trade/i.test(text);
 }
 
 function statusBadge(status) {
@@ -78,11 +328,323 @@ function statCard(label, value, tone = '') {
   return card;
 }
 
+function goToExportRun(runDir) {
+  if (!runDir) return;
+  store.set({
+    view: 'exports',
+    exports: {
+      ...(store.state.exports || {}),
+      selectedRunDir: runDir,
+      _loadedOnce: false,
+      _t: Date.now()
+    }
+  });
+}
+
+function buildSigningTaskPayload() {
+  return {
+    id: _selectedSigningTaskId || undefined,
+    ...JSON.parse(JSON.stringify(_signingTaskDraft)),
+    collectionScope: _collectionScope,
+    candidates: buildCandidateItems()
+  };
+}
+
+function buildCriteriaText() {
+  const lines = [];
+  CRITERIA_FIELDS.forEach(([key, label]) => {
+    const value = String(_signingTaskDraft.searchCriteria?.[key] ?? '').trim();
+    if (value) lines.push(`${label}: ${value}`);
+  });
+  return lines.join('\n');
+}
+
+function taskBriefItems() {
+  const sourceMode = _signingTaskDraft.sourceMode || 'import';
+  const sourceLabel = SOURCE_MODE_OPTIONS.find(([value]) => value === sourceMode)?.[1] || '已有达人表/链接';
+  const criteriaCount = buildCriteriaText().split('\n').filter(Boolean).length;
+  const channels = [
+    _signingTaskDraft.channels?.pgy !== false ? '蒲公英搜索' : '',
+    _signingTaskDraft.channels?.xhs ? '小红书站内搜索' : ''
+  ].filter(Boolean).join(' / ') || '蒲公英搜索';
+  const contact = [
+    _signingTaskDraft.contactPlan?.pgyInvite ? '蒲公英邀约' : '',
+    _signingTaskDraft.contactPlan?.wechat ? '微信建联' : '',
+    _signingTaskDraft.contactPlan?.email ? '邮件建联' : ''
+  ].filter(Boolean).join(' / ') || '先生成建联表';
+  return [
+    ['任务', String(_signingTaskDraft.taskName || '').trim() || '未命名任务'],
+    ['来源', sourceLabel],
+    ['搜索', channels],
+    ['筛选', criteriaCount ? `${criteriaCount} 条要求` : '未填写'],
+    ['建联', contact],
+    ['候选', `${_draftUrls.length} 人`]
+  ];
+}
+
+function buildDiscoveryBrief() {
+  const taskName = String(_signingTaskDraft.taskName || '').trim() || '未命名签约任务';
+  const sourceMode = _signingTaskDraft.sourceMode || 'import';
+  const sourceLabel = SOURCE_MODE_OPTIONS.find(([value]) => value === sourceMode)?.[1] || '已有达人表/链接';
+  const criteria = buildCriteriaText() || '暂未填写筛选条件';
+  const channels = [
+    _signingTaskDraft.channels?.pgy !== false ? '蒲公英搜索' : '',
+    _signingTaskDraft.channels?.xhs ? '小红书站内搜索' : ''
+  ].filter(Boolean).join(' / ') || '蒲公英搜索';
+  const contact = [
+    _signingTaskDraft.contactPlan?.pgyInvite ? '蒲公英邀约' : '',
+    _signingTaskDraft.contactPlan?.wechat ? '微信建联' : '',
+    _signingTaskDraft.contactPlan?.email ? '邮件建联' : ''
+  ].filter(Boolean).join(' / ') || '先生成建联表';
+  const note = String(_signingTaskDraft.note || '').trim();
+
+  return [
+    `任务: ${taskName}`,
+    `任务来源: ${sourceLabel}`,
+    `搜索渠道: ${channels}`,
+    `建联计划: ${contact}`,
+    '',
+    '筛选条件:',
+    criteria,
+    '',
+    '操作:',
+    sourceMode === 'import'
+      ? '1. 导入或粘贴已有达人表/蒲公英链接。'
+      : '1. 登录蒲公英达人广场，先用平台自带筛选条件搜索达人。',
+    sourceMode === 'import'
+      ? '2. 在候选队列里标记优先/待复核/排除。'
+      : '2. 打开候选达人详情页，确认符合要求后点击“当前页加入候选”。',
+    '3. 候选列表确认无误后点击“开始”进行串行采集。',
+    '4. 采集完成后到“结果&导出”复核并生成建联表。',
+    note ? `\n备注:\n${note}` : ''
+  ].filter((line) => line !== '').join('\n');
+}
+
+function buildPreRunSummary({ loginCheck } = {}) {
+  const criteriaCount = buildCriteriaText().split('\n').filter(Boolean).length;
+  const withLabel = countDraftItemsWithLabel();
+  const decisionStats = candidateDecisionStats();
+  const collectionCount = getCollectionUrls().length;
+  const login = loginCheck || _lastPgyLoginCheck;
+  const loginText = login
+    ? (login.ok ? (login.loggedIn ? '已登录' : '未确认登录') : `检查失败: ${login.error || 'unknown error'}`)
+    : '未检查';
+  return [
+    `任务来源: ${SOURCE_MODE_OPTIONS.find(([value]) => value === (_signingTaskDraft.sourceMode || 'import'))?.[1] || '已有达人表/链接'}`,
+    `候选达人: ${_draftUrls.length}`,
+    `候选判断: 优先 ${decisionStats.selected} / 排除 ${decisionStats.excluded} / 待复核 ${decisionStats.candidate}`,
+    `采集范围: ${collectionScopeLabel()}（${collectionCount} 条）`,
+    `已填达人/备注: ${withLabel}/${_draftUrls.length}`,
+    `采集模板: ${_selectedTemplatePath ? '已选择' : '未选择'}`,
+    `筛选条件: ${criteriaCount ? `${criteriaCount} 项` : '未填写'}`,
+    `蒲公英登录态: ${loginText}`,
+    `采集模式: ${PRESETS.find((p) => p.key === _presetKey)?.label || _presetKey}`
+  ].join('\n');
+}
+
+async function runPgyLoginCheck() {
+  try {
+    const r = await window.desktopAPI.pgy.checkLogin();
+    _lastPgyLoginCheck = r || { ok: false, error: 'empty response' };
+    return _lastPgyLoginCheck;
+  } catch (e) {
+    _lastPgyLoginCheck = { ok: false, error: e?.message || String(e) };
+    return _lastPgyLoginCheck;
+  }
+}
+
+function checkbox(label, checked, onChange) {
+  const wrap = document.createElement('label');
+  wrap.className = 'inline-check';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = Boolean(checked);
+  input.addEventListener('change', () => onChange(input.checked));
+  const span = document.createElement('span');
+  span.textContent = label;
+  wrap.appendChild(input);
+  wrap.appendChild(span);
+  return wrap;
+}
+
+function applySigningTask(task) {
+  if (!task) return;
+  _selectedSigningTaskId = String(task.id || '');
+  const candidates = Array.isArray(task.candidates) ? task.candidates : [];
+  _draftUrls = parseUrls(candidates.map((x) => x?.pgy_url || x?.url || '').filter(Boolean).join('\n'));
+  _draftItems = candidates
+    .map((x) => ({
+      pgy_url: normalizeDraftUrl(x?.pgy_url || x?.url || ''),
+      creator_name: String(x?.creator_name || x?.creatorName || x?.name || '').trim(),
+      note: String(x?.note || '').trim(),
+      status: ['selected', 'excluded'].includes(String(x?.status || '').trim()) ? String(x.status).trim() : 'candidate',
+      priority: String(x?.priority || '').trim(),
+      excludeReason: String(x?.excludeReason || x?.exclude_reason || '').trim()
+    }))
+    .filter((x) => x.pgy_url);
+  _candidateQuery = '';
+  _candidateStatusFilter = 'all';
+  _collectionScope = ['active', 'selected', 'all'].includes(String(task.collectionScope || '')) ? task.collectionScope : 'active';
+  _importPreview = null;
+  _candidateDirty = false;
+  syncDraftText();
+  _signingTaskDraft = {
+    taskName: task.taskName || '',
+    sourceMode: ['search', 'mixed'].includes(String(task.sourceMode || '')) ? String(task.sourceMode) : 'import',
+    note: task.note || '',
+    channels: {
+      pgy: task.channels?.pgy !== false,
+      xhs: Boolean(task.channels?.xhs)
+    },
+    contactPlan: {
+      pgyInvite: Boolean(task.contactPlan?.pgyInvite),
+      wechat: Boolean(task.contactPlan?.wechat),
+      email: Boolean(task.contactPlan?.email)
+    },
+    searchCriteria: {
+      ..._signingTaskDraft.searchCriteria,
+      ...(task.searchCriteria || {})
+    }
+  };
+}
+
+async function refreshSigningData() {
+  try {
+    const [tasks, records] = await Promise.all([
+      window.desktopAPI.signingTasks.list(),
+      window.desktopAPI.signingTasks.executionRecords()
+    ]);
+    if (tasks?.ok) _savedSigningTasks = tasks.items || [];
+    if (records?.ok) _executionRecords = records.records || [];
+    _signingDataLoaded = true;
+    store.set({ tasks: { ...store.state.tasks } });
+  } catch (_) {
+    _signingDataLoaded = true;
+  }
+}
+
+function renderExecutionRecords(root) {
+  const label = document.createElement('div');
+  label.className = 'section-label';
+  label.textContent = '执行记录';
+  root.appendChild(label);
+
+  const table = document.createElement('table');
+  table.className = 'task-table execution-table';
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th style="width: 150px;">时间</th>
+        <th>任务</th>
+        <th style="width: 100px;">队列</th>
+        <th style="width: 150px;">结果</th>
+        <th style="width: 150px;">质量</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+  const tbody = table.querySelector('tbody');
+  const records = (_executionRecords || []).slice(0, 8);
+  if (!records.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="5" class="empty-row">暂无执行记录。保存任务并启动采集后会自动记录。</td>`;
+    tbody.appendChild(tr);
+  } else {
+    records.forEach((record) => {
+      const counts = record.taskState?.counts || {};
+      const quality = record.qualitySummary || {};
+      const result = [
+        counts.ok != null ? `成功 ${counts.ok}` : '',
+        counts.fail != null ? `失败 ${counts.fail}` : '',
+        counts.skipped != null ? `跳过 ${counts.skipped}` : '',
+        record.taskState?.running ? '运行中' : ''
+      ].filter(Boolean).join(' / ') || '-';
+      const qualityText = quality.reportCount
+        ? `报告 ${quality.reportCount} / 问题 ${quality.issueCount || 0} / 最低分 ${quality.minScore ?? '-'}`
+        : '暂无质量报告';
+      const issues = [];
+      if (quality.missingFieldCount) issues.push(`缺字段 ${quality.missingFieldCount}`);
+      if (quality.failedPageCount) issues.push(`失败页面 ${quality.failedPageCount}`);
+      if (quality.warningCount) issues.push(`提示 ${quality.warningCount}`);
+
+      const tr = document.createElement('tr');
+      const timeTd = document.createElement('td');
+      timeTd.textContent = String(record.createdAt || '').replace('T', ' ').slice(0, 16);
+
+      const taskTd = document.createElement('td');
+      taskTd.textContent = record.signingTask?.taskName || '未命名签约任务';
+      const runLine = document.createElement('div');
+      runLine.className = 'muted-line';
+      runLine.textContent = record.runId || '';
+      taskTd.appendChild(runLine);
+      if (record.runDir) {
+        const reviewBtn = document.createElement('button');
+        reviewBtn.className = 'mini-link-btn';
+        reviewBtn.textContent = '复核导出';
+        reviewBtn.addEventListener('click', () => goToExportRun(record.runDir));
+        taskTd.appendChild(reviewBtn);
+
+        const openBtn = document.createElement('button');
+        openBtn.className = 'mini-link-btn';
+        openBtn.textContent = '打开目录';
+        openBtn.addEventListener('click', async () => {
+          const r = await window.desktopAPI.exports.openPath(record.runDir);
+          if (!r?.ok) alert(`打开失败：${r?.error || 'unknown error'}`);
+        });
+        taskTd.appendChild(openBtn);
+      }
+
+      const queueTd = document.createElement('td');
+      queueTd.textContent = `${record.queueCount || 0} 条`;
+
+      const resultTd = document.createElement('td');
+      resultTd.textContent = result;
+
+      const qualityTd = document.createElement('td');
+      qualityTd.textContent = qualityText;
+      if (issues.length) {
+        const issueLine = document.createElement('div');
+        issueLine.className = 'quality-issues';
+        issueLine.textContent = issues.join(' / ');
+        qualityTd.appendChild(issueLine);
+      }
+
+      tr.appendChild(timeTd);
+      tr.appendChild(taskTd);
+      tr.appendChild(queueTd);
+      tr.appendChild(resultTd);
+      tr.appendChild(qualityTd);
+      tbody.appendChild(tr);
+
+      const worst = Array.isArray(quality.worstReports) ? quality.worstReports.filter((x) => x && x.ok === false) : [];
+      if (worst.length) {
+        const detailTr = document.createElement('tr');
+        const detailTd = document.createElement('td');
+        detailTd.colSpan = 5;
+        detailTd.className = 'quality-detail-cell';
+        const lines = [];
+        worst.slice(0, 3).forEach((item, idx) => {
+          const fields = Array.isArray(item.missingFields) ? item.missingFields.filter(Boolean).join('、') : '';
+          const pages = Array.isArray(item.failedPages) ? item.failedPages.filter(Boolean).join('、') : '';
+          lines.push(`${idx + 1}. 分数 ${item.score ?? '-'}；缺字段：${fields || '无'}；失败页面：${pages || '无'}`);
+        });
+        detailTd.textContent = lines.join('\n');
+        detailTr.appendChild(detailTd);
+        tbody.appendChild(detailTr);
+      }
+    });
+  }
+  root.appendChild(table);
+}
+
 export function renderTasks(state) {
+  if (!_signingDataLoaded && window.desktopAPI?.signingTasks) {
+    refreshSigningData();
+  }
+
   const root = document.createElement('div');
   root.className = 'view';
 
-  const runId = state.tasks?.runId || '';
   const runDir = state.tasks?.runDir || '';
   const queue = (state.tasks?.queue && state.tasks.queue.length)
     ? state.tasks.queue
@@ -97,15 +659,22 @@ export function renderTasks(state) {
   hero.className = 'task-hero';
   const heroMain = document.createElement('div');
   const title = document.createElement('h2');
-  title.textContent = '批量任务';
+  title.textContent = '找达人';
   const desc = document.createElement('p');
-  desc.textContent = '导入或粘贴蒲公英达人链接，按模板串行采集；遇到登录、风控或抽取失败时会暂停等待人工处理。';
+  desc.textContent = '从已有名单导入，或在蒲公英搜索后把合适达人加入候选。确认候选后再开始采集。';
   heroMain.appendChild(title);
   heroMain.appendChild(desc);
 
   const heroMeta = document.createElement('div');
   heroMeta.className = 'run-meta';
-  heroMeta.innerHTML = `<div>状态：<b>${stText}</b></div><div>runId：<b>${runId || '-'}</b></div><div title="${runDir || ''}">runDir：${runDir || '-'}</div>`;
+  const statusLine = document.createElement('div');
+  statusLine.appendChild(document.createTextNode('当前状态：'));
+  statusLine.appendChild(createStatusPill(stText, state.tasks?.running ? 'live' : runDir ? 'good' : 'neutral'));
+  heroMeta.appendChild(statusLine);
+  const resultLine = document.createElement('div');
+  resultLine.title = runDir || '';
+  resultLine.innerHTML = `本次结果：<b>${runDir ? '已有结果，可进入复核' : '还没有开始采集'}</b>`;
+  heroMeta.appendChild(resultLine);
 
   const btnRow = document.createElement('div');
   btnRow.className = 'task-actions';
@@ -129,10 +698,46 @@ export function renderTasks(state) {
 
   btnRow.appendChild(btnOpenRun);
   btnRow.appendChild(btnOpenRuns);
+  if (runDir) {
+    const btnReviewExport = document.createElement('button');
+    btnReviewExport.className = 'btn primary';
+    btnReviewExport.textContent = '去复核建联';
+    btnReviewExport.addEventListener('click', () => goToExportRun(runDir));
+    btnRow.appendChild(btnReviewExport);
+  }
   heroMeta.appendChild(btnRow);
   hero.appendChild(heroMain);
   hero.appendChild(heroMeta);
   root.appendChild(hero);
+
+  const decisionStatsForSteps = candidateDecisionStats();
+  const collectionCountForSteps = getCollectionUrls().length;
+  const steps = document.createElement('div');
+  steps.className = 'workflow-steps';
+  steps.appendChild(createStepCard({
+    index: '1',
+    title: '选择来源',
+    description: '导入 Excel、粘贴链接，或在蒲公英搜索后加入当前达人。',
+    meta: (_signingTaskDraft.sourceMode || 'import') === 'search' ? '当前：蒲公英搜索发现' : '当前：已有名单/链接',
+    active: !_draftUrls.length
+  }));
+  steps.appendChild(createStepCard({
+    index: '2',
+    title: '整理候选',
+    description: '只保留值得采集的人，标优先、待复核或排除。',
+    meta: `候选 ${_draftUrls.length}，优先 ${decisionStatsForSteps.selected}，排除 ${decisionStatsForSteps.excluded}`,
+    active: _draftUrls.length > 0 && !state.tasks?.running,
+    done: collectionCountForSteps > 0
+  }));
+  steps.appendChild(createStepCard({
+    index: '3',
+    title: '开始采集',
+    description: '确认登录、采集范围和规则状态，然后串行采集。',
+    meta: `本次采集 ${collectionCountForSteps} 人`,
+    active: collectionCountForSteps > 0 && !state.tasks?.running,
+    done: Boolean(runDir)
+  }));
+  root.appendChild(steps);
 
   const statGrid = document.createElement('div');
   statGrid.className = 'stat-grid';
@@ -189,7 +794,7 @@ export function renderTasks(state) {
   const btnTplRefresh = document.createElement('button');
   btnTplRefresh.className = 'btn';
   btnTplRefresh.style.height = '34px';
-  btnTplRefresh.textContent = '刷新模板';
+  btnTplRefresh.textContent = '刷新规则';
   btnTplRefresh.addEventListener('click', async () => {
     try {
       const r = await window.desktopAPI.template.list();
@@ -214,14 +819,333 @@ export function renderTasks(state) {
   header.appendChild(templateSel);
   header.appendChild(btnTplRefresh);
   header.appendChild(presetSel);
-  root.appendChild(header);
+  const setupDetails = createAdvancedSection({
+    title: `采集设置：${templates.length ? '已选择规则' : '未选择规则'} · ${PRESETS.find((p) => p.key === _presetKey)?.label || '标准'}`,
+    open: _taskSetupOpen,
+    onToggle: (open) => { _taskSetupOpen = open; },
+    children: [header]
+  });
+  setupDetails.classList.add('task-advanced-section');
+  root.appendChild(setupDetails);
 
   if (templates.length === 0) {
   const tip = document.createElement('div');
     tip.className = 'task-note';
-    tip.textContent = '模板下拉为空：请先到「采集模板」页保存一个模板，或点击上方“刷新模板”。';
+    tip.textContent = '还没有可用的采集校准规则。请先到「采集校准」页点选一次，或点击上方“刷新规则”。';
     root.appendChild(tip);
   }
+
+  const signingPanel = document.createElement('div');
+  signingPanel.className = 'task-panel signing-panel';
+
+  const signingHead = document.createElement('div');
+  signingHead.className = 'panel-title-row';
+  const signingTitle = document.createElement('div');
+  signingTitle.className = 'section-label compact';
+  signingTitle.textContent = '任务简报';
+  const copyCriteria = document.createElement('button');
+  copyCriteria.className = 'btn';
+  copyCriteria.textContent = '复制任务简报';
+  copyCriteria.addEventListener('click', async () => {
+    const text = buildDiscoveryBrief();
+    if (!text) {
+      alert('请先填写任务简报');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      window.prompt('复制失败，请手工复制：', text);
+    }
+  });
+  signingHead.appendChild(signingTitle);
+  signingHead.appendChild(copyCriteria);
+  signingPanel.appendChild(signingHead);
+
+  const briefGrid = document.createElement('div');
+  briefGrid.className = 'task-brief-grid';
+  taskBriefItems().forEach(([label, value]) => {
+    const item = document.createElement('div');
+    item.className = 'task-brief-item';
+    const k = document.createElement('div');
+    k.className = 'task-brief-label';
+    k.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'task-brief-value';
+    v.textContent = value;
+    item.appendChild(k);
+    item.appendChild(v);
+    briefGrid.appendChild(item);
+  });
+  signingPanel.appendChild(briefGrid);
+
+  const discoveryRow = document.createElement('div');
+  discoveryRow.className = 'task-actions discovery-actions';
+
+  const openPgyBtn = document.createElement('button');
+  openPgyBtn.className = 'btn';
+  openPgyBtn.textContent = '打开蒲公英搜索';
+  openPgyBtn.addEventListener('click', async () => {
+    try {
+      const r = await window.desktopAPI.browser.open(PGY_DISCOVERY_URL);
+      if (!r?.ok) alert(`打开失败：${r?.error || 'unknown error'}`);
+    } catch (e) {
+      alert(`打开异常：${e?.message || String(e)}`);
+    }
+  });
+
+  const copyBriefBtn = document.createElement('button');
+  copyBriefBtn.className = 'btn';
+  copyBriefBtn.textContent = '复制筛选清单';
+  copyBriefBtn.addEventListener('click', async () => {
+    const text = buildDiscoveryBrief();
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      window.prompt('复制失败，请手工复制：', text);
+    }
+  });
+
+  const readSearchBtn = document.createElement('button');
+  readSearchBtn.className = 'btn primary';
+  readSearchBtn.textContent = '读取当前结果';
+  readSearchBtn.disabled = !!state.tasks?.running;
+  readSearchBtn.addEventListener('click', async () => {
+    try {
+      const r = await window.desktopAPI.pgy.extractSearchCandidates();
+      if (!r?.ok) {
+        alert(`读取失败：${r?.error || 'unknown error'}`);
+        return;
+      }
+      const items = Array.isArray(r.items) ? r.items : [];
+      const mergeResult = applyImportedCandidateItems(items, { merge: true });
+      _lastSearchSnapshot = {
+        url: r.url || '',
+        filters: r.filters || null,
+        stats: r.stats || {},
+        capturedAt: Date.now()
+      };
+      _importPreview = {
+        filePath: '当前蒲公英搜索页',
+        stats: {
+          ...(r.stats || {}),
+          mode: 'search-page',
+          imported: mergeResult.imported,
+          added: mergeResult.added,
+          updated: mergeResult.updated,
+          filterGroups: Array.isArray(r.filters?.groups) ? r.filters.groups.length : 0
+        },
+        filters: r.filters || null,
+        items: items.slice(0, 10)
+      };
+      store.set({ tasks: { ...store.state.tasks } });
+      const filterText = summarizeSearchFilters(r.filters);
+      alert([
+        r.message || '读取完成。',
+        `本次读取 ${items.length} 个可见达人，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
+        filterText ? `\n已记录当前筛选结构：\n${filterText.slice(0, 500)}` : ''
+      ].filter(Boolean).join('\n'));
+    } catch (e) {
+      alert(`读取当前搜索结果异常：${e?.message || String(e)}`);
+    }
+  });
+
+  const addCurrentBtn = document.createElement('button');
+  addCurrentBtn.className = 'btn';
+  addCurrentBtn.textContent = '加入当前达人';
+  addCurrentBtn.disabled = !!state.tasks?.running;
+  addCurrentBtn.addEventListener('click', async () => {
+    try {
+      const current = await window.desktopAPI.browser.getUrl();
+      if (!current?.ok) {
+        alert(`读取当前页面失败：${current?.error || 'unknown error'}`);
+        return;
+      }
+      const currentUrl = current.url || '';
+      if (!looksLikePgyCreatorUrl(currentUrl)) {
+        alert('当前右侧浏览器不是蒲公英达人相关页面。请先打开候选达人详情页。');
+        return;
+      }
+      const added = addDraftUrls([currentUrl]);
+      store.set({ tasks: { ...store.state.tasks } });
+      if (!added) alert('当前页面已在候选队列中。');
+    } catch (e) {
+      alert(`加入候选异常：${e?.message || String(e)}`);
+    }
+  });
+
+  const discoveryHint = document.createElement('div');
+  discoveryHint.className = 'muted-line discovery-hint';
+  discoveryHint.textContent = (_signingTaskDraft.sourceMode || 'import') === 'import'
+    ? '已有达人表流程：可直接导入 Excel 或粘贴链接；如临时需要补充达人，也可打开蒲公英搜索后加入候选。'
+    : '搜索发现流程：先在右侧用蒲公英筛选条件找达人，点“读取当前结果”把当前可见结果加入候选；打开详情页时也可单独加入当前达人。';
+
+  discoveryRow.appendChild(openPgyBtn);
+  discoveryRow.appendChild(copyBriefBtn);
+  discoveryRow.appendChild(readSearchBtn);
+  discoveryRow.appendChild(addCurrentBtn);
+  discoveryRow.appendChild(discoveryHint);
+  signingPanel.appendChild(discoveryRow);
+
+  const savedRow = document.createElement('div');
+  savedRow.className = 'saved-task-row';
+  const savedSel = document.createElement('select');
+  savedSel.className = 'tpl-input';
+  const emptyOpt = document.createElement('option');
+  emptyOpt.value = '';
+  emptyOpt.textContent = '选择历史任务';
+  savedSel.appendChild(emptyOpt);
+  _savedSigningTasks.forEach((task) => {
+    const opt = document.createElement('option');
+    opt.value = task.id;
+    const candidateCount = Array.isArray(task.candidates) ? task.candidates.length : 0;
+    opt.textContent = `${task.taskName || '未命名签约任务'}${candidateCount ? ` · ${candidateCount} 个候选` : ''}`;
+    if (task.id === _selectedSigningTaskId) opt.selected = true;
+    savedSel.appendChild(opt);
+  });
+  savedSel.addEventListener('change', () => {
+    const id = savedSel.value;
+    const task = _savedSigningTasks.find((x) => x.id === id);
+    if (task) {
+      applySigningTask(task);
+      store.set({ tasks: { ...store.state.tasks } });
+    } else {
+      _selectedSigningTaskId = '';
+    }
+  });
+
+  const saveTaskBtn = document.createElement('button');
+  saveTaskBtn.className = 'btn';
+  saveTaskBtn.textContent = '保存当前任务';
+  saveTaskBtn.addEventListener('click', async () => {
+    try {
+      const r = await window.desktopAPI.signingTasks.save(buildSigningTaskPayload());
+      if (!r?.ok) {
+        alert(`保存失败：${r?.error || 'unknown error'}`);
+        return;
+      }
+      _savedSigningTasks = r.items || [];
+      _selectedSigningTaskId = r.item?.id || _selectedSigningTaskId;
+      applySigningTask(r.item);
+      _candidateDirty = false;
+      store.set({ tasks: { ...store.state.tasks } });
+    } catch (e) {
+      alert(`保存异常：${e?.message || String(e)}`);
+    }
+  });
+
+  const deleteTaskBtn = document.createElement('button');
+  deleteTaskBtn.className = 'btn ghost';
+  deleteTaskBtn.textContent = '删除';
+  deleteTaskBtn.disabled = !_selectedSigningTaskId;
+  deleteTaskBtn.addEventListener('click', async () => {
+    if (!_selectedSigningTaskId) return;
+    if (!window.confirm('确定删除当前保存的签约任务吗？不会删除历史运行结果。')) return;
+    const r = await window.desktopAPI.signingTasks.delete(_selectedSigningTaskId);
+    if (!r?.ok) {
+      alert(`删除失败：${r?.error || 'unknown error'}`);
+      return;
+    }
+    _savedSigningTasks = r.items || [];
+    _selectedSigningTaskId = '';
+    store.set({ tasks: { ...store.state.tasks } });
+  });
+
+  const refreshTaskBtn = document.createElement('button');
+  refreshTaskBtn.className = 'btn';
+  refreshTaskBtn.textContent = '刷新';
+  refreshTaskBtn.addEventListener('click', refreshSigningData);
+
+  savedRow.appendChild(savedSel);
+  savedRow.appendChild(saveTaskBtn);
+  savedRow.appendChild(deleteTaskBtn);
+  savedRow.appendChild(refreshTaskBtn);
+
+  const advancedSearchChildren = [savedRow];
+  if (_candidateDirty) {
+    const dirtyHint = document.createElement('div');
+    dirtyHint.className = 'task-note';
+    dirtyHint.textContent = '当前候选名单有未保存改动；需要长期保留时请点击“保存当前任务”。';
+    advancedSearchChildren.push(dirtyHint);
+  }
+
+  const taskName = document.createElement('input');
+  taskName.className = 'tpl-input';
+  taskName.placeholder = '任务名称，例如：FILA 中外生活 20-30w 蒲公英搜索';
+  taskName.value = _signingTaskDraft.taskName;
+  taskName.addEventListener('input', () => {
+    _signingTaskDraft.taskName = taskName.value;
+  });
+  advancedSearchChildren.push(taskName);
+
+  const sourceRow = document.createElement('label');
+  sourceRow.className = 'criteria-field';
+  const sourceLabel = document.createElement('span');
+  sourceLabel.textContent = '达人来源';
+  const sourceSelect = document.createElement('select');
+  sourceSelect.className = 'tpl-input';
+  SOURCE_MODE_OPTIONS.forEach(([value, label]) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    if ((_signingTaskDraft.sourceMode || 'import') === value) opt.selected = true;
+    sourceSelect.appendChild(opt);
+  });
+  sourceSelect.addEventListener('change', () => {
+    _signingTaskDraft.sourceMode = sourceSelect.value;
+  });
+  sourceRow.appendChild(sourceLabel);
+  sourceRow.appendChild(sourceSelect);
+  advancedSearchChildren.push(sourceRow);
+
+  const channelRow = document.createElement('div');
+  channelRow.className = 'check-row';
+  channelRow.appendChild(checkbox('蒲公英搜索', _signingTaskDraft.channels.pgy, (v) => { _signingTaskDraft.channels.pgy = v; }));
+  channelRow.appendChild(checkbox('小红书站内搜索', _signingTaskDraft.channels.xhs, (v) => { _signingTaskDraft.channels.xhs = v; }));
+  channelRow.appendChild(checkbox('蒲公英邀约', _signingTaskDraft.contactPlan.pgyInvite, (v) => { _signingTaskDraft.contactPlan.pgyInvite = v; }));
+  channelRow.appendChild(checkbox('微信建联', _signingTaskDraft.contactPlan.wechat, (v) => { _signingTaskDraft.contactPlan.wechat = v; }));
+  channelRow.appendChild(checkbox('邮件建联', _signingTaskDraft.contactPlan.email, (v) => { _signingTaskDraft.contactPlan.email = v; }));
+  advancedSearchChildren.push(channelRow);
+
+  const criteriaGrid = document.createElement('div');
+  criteriaGrid.className = 'criteria-grid';
+  CRITERIA_FIELDS.forEach(([key, label, placeholder]) => {
+    const field = document.createElement('label');
+    field.className = 'criteria-field';
+    const span = document.createElement('span');
+    span.textContent = label;
+    const input = document.createElement('input');
+    input.className = 'tpl-input';
+    input.placeholder = placeholder || '';
+    input.value = _signingTaskDraft.searchCriteria[key] ?? '';
+    input.addEventListener('input', () => {
+      _signingTaskDraft.searchCriteria[key] = input.value;
+    });
+    field.appendChild(span);
+    field.appendChild(input);
+    criteriaGrid.appendChild(field);
+  });
+  advancedSearchChildren.push(criteriaGrid);
+
+  const taskNote = document.createElement('textarea');
+  taskNote.className = 'tpl-input task-note-input';
+  taskNote.placeholder = '任务备注，可记录品牌、产品、排除规则或建联口径';
+  taskNote.value = _signingTaskDraft.note;
+  taskNote.addEventListener('input', () => {
+    _signingTaskDraft.note = taskNote.value;
+  });
+  advancedSearchChildren.push(taskNote);
+
+  const advancedSearch = createAdvancedSection({
+    title: '不常用：历史任务、详细筛选和建联口径',
+    open: _searchAdvancedOpen,
+    onToggle: (open) => { _searchAdvancedOpen = open; },
+    children: advancedSearchChildren
+  });
+  advancedSearch.classList.add('task-advanced-section');
+  signingPanel.appendChild(advancedSearch);
+
+  root.appendChild(signingPanel);
 
   // 手工介入提示
   if (state.tasks?.paused) {
@@ -235,13 +1159,23 @@ export function renderTasks(state) {
   // URL 输入
   const inputWrap = document.createElement('div');
   inputWrap.className = 'task-panel';
+  const inputHead = document.createElement('div');
+  inputHead.className = 'panel-title-row';
+  const inputTitle = document.createElement('div');
+  inputTitle.className = 'section-label compact';
+  inputTitle.textContent = '导入或粘贴达人链接';
+  const inputHint = document.createElement('div');
+  inputHint.className = 'muted-line';
+  inputHint.textContent = '已有达人表、手工粘贴和蒲公英搜索结果，都会先进入候选池再采集。';
+  inputHead.appendChild(inputTitle);
+  inputHead.appendChild(inputHint);
 
   const textarea = document.createElement('textarea');
   textarea.className = 'tpl-input';
   textarea.style.height = '110px';
   textarea.style.padding = '10px 10px';
   textarea.style.resize = 'vertical';
-  textarea.placeholder = '粘贴 creator_url（每行一个，或 CSV/逗号分隔）';
+  textarea.placeholder = '每行一个蒲公英达人链接，也可以直接粘贴 Excel 里复制出来的一列。';
   textarea.value = _draftText;
   textarea.addEventListener('input', () => {
     _draftText = textarea.value;
@@ -252,7 +1186,7 @@ export function renderTasks(state) {
 
   const btnParse = document.createElement('button');
   btnParse.className = 'btn';
-  btnParse.textContent = '解析并加入队列';
+  btnParse.textContent = '加入候选';
   btnParse.disabled = !!state.tasks?.running;
   btnParse.addEventListener('click', () => {
     const urls = parseUrls(_draftText);
@@ -260,6 +1194,7 @@ export function renderTasks(state) {
     _draftUrls = parseUrls(merged.join('\n')); // 去重
     _draftText = _draftUrls.join('\n');
     textarea.value = _draftText;
+    if (urls.length) _candidateDirty = true;
     // 触发一次 re-render（复用 store）
     store.set({ tasks: { ...store.state.tasks } });
   });
@@ -285,7 +1220,7 @@ export function renderTasks(state) {
 
   const btnImportExcel = document.createElement('button');
   btnImportExcel.className = 'btn';
-  btnImportExcel.textContent = '导入Excel';
+  btnImportExcel.textContent = '导入 Excel';
   btnImportExcel.disabled = !!state.tasks?.running;
   btnImportExcel.addEventListener('click', async () => {
     try {
@@ -296,17 +1231,31 @@ export function renderTasks(state) {
         return;
       }
       const items = Array.isArray(r.items) ? r.items : [];
-      const urls = items.map((x) => x?.pgy_url).filter(Boolean);
-      _draftUrls = parseUrls(urls.join('\n'));
-      _draftText = _draftUrls.join('\n');
+      const mergeResult = applyImportedCandidateItems(items, { merge: false });
       textarea.value = _draftText;
-      _draftItems = items
-        .map((x) => ({
-          pgy_url: x?.pgy_url || '',
-          creator_name: x?.creator_name || ''
-        }))
-        .filter((x) => x.pgy_url);
-      _importPreview = { filePath: r.filePath || '', stats: r.stats || {}, items: items.slice(0, 10) };
+      _importPreview = { filePath: r.filePath || '', stats: { ...(r.stats || {}), mode: 'replace', ...mergeResult }, items: items.slice(0, 10) };
+      store.set({ tasks: { ...store.state.tasks } });
+    } catch (e) {
+      alert(`导入异常：${e?.message || String(e)}`);
+    }
+  });
+
+  const btnMergeExcel = document.createElement('button');
+  btnMergeExcel.className = 'btn';
+  btnMergeExcel.textContent = '合并 Excel';
+  btnMergeExcel.disabled = !!state.tasks?.running;
+  btnMergeExcel.addEventListener('click', async () => {
+    try {
+      const r = await window.desktopAPI.tasks.importExcel();
+      if (r?.canceled) return;
+      if (!r?.ok) {
+        alert(`导入失败：${r?.error || 'unknown error'}`);
+        return;
+      }
+      const items = Array.isArray(r.items) ? r.items : [];
+      const mergeResult = applyImportedCandidateItems(items, { merge: true });
+      textarea.value = _draftText;
+      _importPreview = { filePath: r.filePath || '', stats: { ...(r.stats || {}), mode: 'merge', ...mergeResult }, items: items.slice(0, 10) };
       store.set({ tasks: { ...store.state.tasks } });
     } catch (e) {
       alert(`导入异常：${e?.message || String(e)}`);
@@ -322,6 +1271,7 @@ export function renderTasks(state) {
     _draftUrls = [];
     _draftItems = [];
     _importPreview = null;
+    _candidateDirty = true;
     textarea.value = '';
     store.set({ tasks: { ...store.state.tasks } });
   });
@@ -329,8 +1279,10 @@ export function renderTasks(state) {
   inputBtns.appendChild(btnParse);
   inputBtns.appendChild(btnPaste);
   inputBtns.appendChild(btnImportExcel);
+  inputBtns.appendChild(btnMergeExcel);
   inputBtns.appendChild(btnClear);
 
+  inputWrap.appendChild(inputHead);
   inputWrap.appendChild(textarea);
   inputWrap.appendChild(inputBtns);
   root.appendChild(inputWrap);
@@ -342,16 +1294,438 @@ export function renderTasks(state) {
     const lines = [];
     lines.push(`导入文件：${_importPreview.filePath || ''}`);
     lines.push(`统计：sheet=${s.sheets ?? '-'}，扫描行=${s.rows ?? '-'}，提取=${s.extracted ?? '-'}，去重后=${s.deduped ?? _draftUrls.length}`);
+    if (s.mode) {
+      const modeLabel = s.mode === 'merge' ? '合并' : (s.mode === 'search-page' ? '蒲公英搜索页读取' : '替换');
+      lines.push(`模式：${modeLabel}，本次导入=${s.imported ?? '-'}，新增=${s.added ?? '-'}，更新=${s.updated ?? '-'}`);
+    }
+    const filterText = summarizeSearchFilters(_importPreview.filters);
+    if (filterText) {
+      lines.push('');
+      lines.push('当前筛选快照：');
+      lines.push(filterText);
+    }
     lines.push('');
     lines.push('预览（前10条）：');
     (_importPreview.items || []).forEach((it, idx) => {
       const name = (it?.creator_name || '').trim() || '(无昵称)';
       const url = it?.pgy_url || '';
-      lines.push(`${idx + 1}. ${name}  ${url}`);
+      const status = String(it?.status || 'candidate');
+      const statusLabel = status === 'selected' ? '优先' : (status === 'excluded' ? '排除' : '待复核');
+      const meta = [
+        statusLabel,
+        it?.priority ? `优先级 ${it.priority}` : '',
+        it?.excludeReason ? `排除原因 ${it.excludeReason}` : ''
+      ].filter(Boolean).join(' / ');
+      lines.push(`${idx + 1}. ${name}  ${meta}  ${url}`);
     });
     box.textContent = lines.join('\n');
     root.appendChild(box);
   }
+
+  if (_draftUrls.length) {
+    const candidatePanel = document.createElement('div');
+    candidatePanel.className = 'task-panel candidate-panel';
+
+    const candidateHead = document.createElement('div');
+    candidateHead.className = 'panel-title-row';
+    const candidateTitle = document.createElement('div');
+    candidateTitle.className = 'section-label compact';
+    const filteredDraftUrls = getFilteredDraftUrls();
+    const decisionStats = candidateDecisionStats();
+    candidateTitle.textContent = `候选达人队列（${filteredDraftUrls.length}/${_draftUrls.length}） · 优先 ${decisionStats.selected} / 排除 ${decisionStats.excluded}`;
+
+    const candidateFilters = document.createElement('div');
+    candidateFilters.className = 'candidate-filters';
+
+    const statusFilter = document.createElement('select');
+    statusFilter.className = 'tpl-input';
+    statusFilter.style.maxWidth = '120px';
+    statusFilter.style.height = '34px';
+    [
+      ['all', '全部状态'],
+      ['candidate', '待复核'],
+      ['selected', '优先'],
+      ['excluded', '排除']
+    ].forEach(([value, label]) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      if (_candidateStatusFilter === value) opt.selected = true;
+      statusFilter.appendChild(opt);
+    });
+    statusFilter.addEventListener('change', () => {
+      _candidateStatusFilter = statusFilter.value;
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
+    const candidateSearch = document.createElement('input');
+    candidateSearch.className = 'tpl-input';
+    candidateSearch.placeholder = '搜索 URL / 达人备注 / 原因';
+    candidateSearch.style.maxWidth = '260px';
+    candidateSearch.value = _candidateQuery;
+    candidateSearch.addEventListener('input', () => {
+      _candidateQuery = candidateSearch.value;
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+    candidateFilters.appendChild(statusFilter);
+    candidateFilters.appendChild(candidateSearch);
+    candidateHead.appendChild(candidateTitle);
+    candidateHead.appendChild(candidateFilters);
+    candidatePanel.appendChild(candidateHead);
+
+    const candidateTools = document.createElement('div');
+    candidateTools.className = 'task-actions';
+
+    const copyCandidates = document.createElement('button');
+    copyCandidates.className = 'btn';
+    copyCandidates.textContent = '复制全部URL';
+    copyCandidates.addEventListener('click', async () => {
+      const text = _draftUrls.join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        window.prompt('复制失败，请手工复制：', text);
+      }
+    });
+
+    const copyFilteredCandidates = document.createElement('button');
+    copyFilteredCandidates.className = 'btn';
+    copyFilteredCandidates.textContent = '复制当前显示';
+    copyFilteredCandidates.disabled = !filteredDraftUrls.length;
+    copyFilteredCandidates.addEventListener('click', async () => {
+      const text = filteredDraftUrls.join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        window.prompt('复制失败，请手工复制：', text);
+      }
+    });
+
+    const exportCandidateSheet = document.createElement('button');
+    exportCandidateSheet.className = 'btn';
+    exportCandidateSheet.textContent = '导出候选表';
+    exportCandidateSheet.disabled = !_draftUrls.length;
+    exportCandidateSheet.addEventListener('click', async () => {
+      try {
+        const r = await window.desktopAPI.tasks.exportCandidateSheet(buildSigningTaskPayload());
+        if (r?.canceled) return;
+        if (!r?.ok) {
+          alert(`导出失败：${r?.error || 'unknown error'}`);
+          return;
+        }
+        alert(`导出成功：\n${r.outPath}\n\n统计：候选 ${r.candidates}，本次采集范围 ${r.inScope}，优先 ${r.selected}，排除 ${r.excluded}`);
+      } catch (e) {
+        alert(`导出异常：${e?.message || String(e)}`);
+      }
+    });
+
+    const markSelected = document.createElement('button');
+    markSelected.className = 'btn';
+    markSelected.textContent = '当前设为优先';
+    markSelected.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
+    markSelected.addEventListener('click', () => {
+      markDraftUrls(filteredDraftUrls, { status: 'selected' });
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
+    const markCandidate = document.createElement('button');
+    markCandidate.className = 'btn';
+    markCandidate.textContent = '当前设为待复核';
+    markCandidate.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
+    markCandidate.addEventListener('click', () => {
+      markDraftUrls(filteredDraftUrls, { status: 'candidate' });
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
+    const markExcluded = document.createElement('button');
+    markExcluded.className = 'btn ghost';
+    markExcluded.textContent = '当前设为排除';
+    markExcluded.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
+    markExcluded.addEventListener('click', () => {
+      const reason = window.prompt(`给当前 ${filteredDraftUrls.length} 条候选填写排除原因（可留空）：`, '');
+      if (reason === null) return;
+      markDraftUrls(filteredDraftUrls, { status: 'excluded', excludeReason: reason });
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
+    const clearFiltered = document.createElement('button');
+    clearFiltered.className = 'btn ghost';
+    clearFiltered.textContent = '移除当前筛选结果';
+    clearFiltered.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
+    clearFiltered.addEventListener('click', () => {
+      if (!window.confirm(`确定移除当前筛选出的 ${filteredDraftUrls.length} 条候选吗？`)) return;
+      filteredDraftUrls.forEach((url) => removeDraftUrl(url));
+      textarea.value = _draftText;
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
+    candidateTools.appendChild(copyCandidates);
+    candidateTools.appendChild(copyFilteredCandidates);
+    candidateTools.appendChild(exportCandidateSheet);
+    candidateTools.appendChild(markSelected);
+    candidateTools.appendChild(markCandidate);
+    candidateTools.appendChild(markExcluded);
+    candidateTools.appendChild(clearFiltered);
+    const candidateBulk = createAdvancedSection({
+      title: `批量处理候选（当前显示 ${filteredDraftUrls.length} 人）`,
+      open: _candidateBulkOpen,
+      onToggle: (open) => { _candidateBulkOpen = open; },
+      children: [candidateTools]
+    });
+    candidateBulk.classList.add('task-advanced-section');
+    candidatePanel.appendChild(candidateBulk);
+
+    const candidateList = document.createElement('div');
+    candidateList.className = 'candidate-list';
+    if (!filteredDraftUrls.length) {
+      const empty = document.createElement('div');
+      empty.className = 'contact-review-empty';
+      empty.textContent = '当前搜索下没有候选达人。';
+      candidateList.appendChild(empty);
+    } else {
+      filteredDraftUrls.forEach((url) => {
+        const originalIndex = _draftUrls.findIndex((u) => normalizeDraftUrl(u) === normalizeDraftUrl(url));
+        const item = getDraftItem(url);
+        const card = document.createElement('div');
+        card.className = `candidate-card candidate-${item?.status || 'candidate'}`;
+
+        const cardMain = document.createElement('div');
+        cardMain.className = 'candidate-card-main';
+
+        const rank = document.createElement('div');
+        rank.className = 'candidate-rank';
+        rank.textContent = String(originalIndex + 1);
+
+        const info = document.createElement('div');
+        info.className = 'candidate-info';
+        const name = document.createElement('div');
+        name.className = 'candidate-name';
+        name.textContent = item?.creator_name || '待命名达人';
+        const link = document.createElement('div');
+        link.className = 'candidate-url';
+        link.textContent = url;
+        info.appendChild(name);
+        info.appendChild(link);
+
+        const quick = document.createElement('div');
+        quick.className = 'candidate-quick';
+        const statusLabel = {
+          selected: '优先',
+          candidate: '待复核',
+          excluded: '排除'
+        }[item?.status || 'candidate'] || '待复核';
+        const statusChip = document.createElement('span');
+        statusChip.className = `contact-chip ${item?.status === 'selected' ? 'good' : item?.status === 'excluded' ? 'warn' : ''}`.trim();
+        statusChip.textContent = statusLabel;
+        quick.appendChild(statusChip);
+        if (item?.priority) {
+          const priorityChip = document.createElement('span');
+          priorityChip.className = 'contact-chip strong';
+          priorityChip.textContent = `优先级：${item.priority}`;
+          quick.appendChild(priorityChip);
+        }
+        if (item?.excludeReason) {
+          const excludeChip = document.createElement('span');
+          excludeChip.className = 'contact-chip warn';
+          excludeChip.textContent = `排除：${item.excludeReason}`;
+          quick.appendChild(excludeChip);
+        }
+
+        cardMain.appendChild(rank);
+        cardMain.appendChild(info);
+        cardMain.appendChild(quick);
+        card.appendChild(cardMain);
+
+        const details = document.createElement('details');
+        details.className = 'candidate-detail';
+        const summary = document.createElement('summary');
+        summary.textContent = '编辑候选信息';
+        details.appendChild(summary);
+
+        const fields = document.createElement('div');
+        fields.className = 'candidate-fields';
+
+        const statusField = document.createElement('label');
+        statusField.className = 'field-label compact';
+        statusField.textContent = '状态';
+        const statusSel = document.createElement('select');
+        statusSel.className = 'tpl-input';
+        statusSel.style.height = '30px';
+        [
+          ['candidate', '待复核'],
+          ['selected', '优先'],
+          ['excluded', '排除']
+        ].forEach(([value, label]) => {
+          const opt = document.createElement('option');
+          opt.value = value;
+          opt.textContent = label;
+          if ((item?.status || 'candidate') === value) opt.selected = true;
+          statusSel.appendChild(opt);
+        });
+        statusSel.disabled = !!state.tasks?.running;
+        statusSel.addEventListener('change', () => {
+          updateDraftItem(url, { status: statusSel.value });
+          store.set({ tasks: { ...store.state.tasks } });
+        });
+        statusField.appendChild(statusSel);
+
+        const noteField = document.createElement('label');
+        noteField.className = 'field-label compact wide';
+        noteField.textContent = '达人/备注';
+        const noteInput = document.createElement('input');
+        noteInput.className = 'tpl-input';
+        noteInput.style.height = '30px';
+        noteInput.placeholder = '达人昵称或备注';
+        noteInput.value = item?.creator_name || '';
+        noteInput.disabled = !!state.tasks?.running;
+        noteInput.addEventListener('input', () => {
+          setDraftItemLabel(url, noteInput.value);
+        });
+        noteField.appendChild(noteInput);
+
+        const priorityField = document.createElement('label');
+        priorityField.className = 'field-label compact';
+        priorityField.textContent = '优先级';
+        const priorityInput = document.createElement('input');
+        priorityInput.className = 'tpl-input';
+        priorityInput.style.height = '30px';
+        priorityInput.placeholder = 'P1/P2';
+        priorityInput.value = item?.priority || '';
+        priorityInput.disabled = !!state.tasks?.running;
+        priorityInput.addEventListener('input', () => {
+          updateDraftItem(url, { priority: priorityInput.value });
+        });
+        priorityField.appendChild(priorityInput);
+
+        const excludeField = document.createElement('label');
+        excludeField.className = 'field-label compact wide';
+        excludeField.textContent = '排除原因';
+        const excludeInput = document.createElement('input');
+        excludeInput.className = 'tpl-input';
+        excludeInput.style.height = '30px';
+        excludeInput.placeholder = '不匹配/报价高';
+        excludeInput.value = item?.excludeReason || '';
+        excludeInput.disabled = !!state.tasks?.running;
+        excludeInput.addEventListener('input', () => {
+          updateDraftItem(url, { excludeReason: excludeInput.value });
+        });
+        excludeField.appendChild(excludeInput);
+
+        const actionField = document.createElement('div');
+        actionField.className = 'candidate-card-actions';
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'btn ghost';
+        removeBtn.style.height = '30px';
+        removeBtn.textContent = '删除';
+        removeBtn.disabled = !!state.tasks?.running;
+        removeBtn.addEventListener('click', () => {
+          removeDraftUrl(url);
+          textarea.value = _draftText;
+          store.set({ tasks: { ...store.state.tasks } });
+        });
+        actionField.appendChild(removeBtn);
+
+        fields.appendChild(statusField);
+        fields.appendChild(noteField);
+        fields.appendChild(priorityField);
+        fields.appendChild(excludeField);
+        fields.appendChild(actionField);
+        details.appendChild(fields);
+        card.appendChild(details);
+        candidateList.appendChild(card);
+      });
+    }
+    candidatePanel.appendChild(candidateList);
+    root.appendChild(candidatePanel);
+  }
+
+  const preRunPanel = document.createElement('div');
+  preRunPanel.className = 'task-panel pre-run-panel';
+  const preRunHead = document.createElement('div');
+  preRunHead.className = 'panel-title-row';
+  const preRunTitle = document.createElement('div');
+  preRunTitle.className = 'section-label compact';
+  preRunTitle.textContent = '开始采集前';
+  const checkLoginBtn = document.createElement('button');
+  checkLoginBtn.className = 'btn';
+  checkLoginBtn.textContent = '检查蒲公英登录';
+  checkLoginBtn.addEventListener('click', async () => {
+    await runPgyLoginCheck();
+    store.set({ tasks: { ...store.state.tasks } });
+  });
+  preRunHead.appendChild(preRunTitle);
+  preRunHead.appendChild(checkLoginBtn);
+  preRunPanel.appendChild(preRunHead);
+
+  const scopeRow = document.createElement('div');
+  scopeRow.className = 'task-actions';
+  const scopeLabel = document.createElement('span');
+  scopeLabel.className = 'muted-line';
+  scopeLabel.textContent = '采集范围';
+  const scopeSel = document.createElement('select');
+  scopeSel.className = 'tpl-input';
+  scopeSel.style.width = '180px';
+  scopeSel.style.height = '34px';
+  [
+    ['active', '优先 + 待复核'],
+    ['selected', '只采优先'],
+    ['all', '全部候选']
+  ].forEach(([value, label]) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    if (_collectionScope === value) opt.selected = true;
+    scopeSel.appendChild(opt);
+  });
+  scopeSel.disabled = !!state.tasks?.running;
+  scopeSel.addEventListener('change', () => {
+    _collectionScope = scopeSel.value;
+    _candidateDirty = true;
+    store.set({ tasks: { ...store.state.tasks } });
+  });
+  const scopeHint = document.createElement('span');
+  scopeHint.className = 'muted-line';
+  scopeHint.textContent = '默认不采集已排除达人。';
+  scopeRow.appendChild(scopeLabel);
+  scopeRow.appendChild(scopeSel);
+  scopeRow.appendChild(scopeHint);
+  preRunPanel.appendChild(scopeRow);
+
+  const safetyNotice = document.createElement('div');
+  safetyNotice.className = 'task-safety-notice';
+  safetyNotice.innerHTML = [
+    '<b>安全运行提示：</b>',
+    RECOMMENDED_BATCH_TEXT,
+    '；系统会串行采集并加入随机等待。',
+    '如果页面出现登录、验证码、安全验证、人机验证、访问异常或操作频繁提示，队列会暂停，必须人工处理后再继续。'
+  ].join('');
+  preRunPanel.appendChild(safetyNotice);
+
+  const preRunGrid = document.createElement('div');
+  preRunGrid.className = 'pre-run-grid';
+  const criteriaCount = buildCriteriaText().split('\n').filter(Boolean).length;
+  const withLabel = countDraftItemsWithLabel();
+  const decisionStats = candidateDecisionStats();
+  const collectionCount = getCollectionUrls().length;
+  const loginLabel = _lastPgyLoginCheck
+    ? (_lastPgyLoginCheck.ok ? (_lastPgyLoginCheck.loggedIn ? '已登录' : '未确认') : '检查失败')
+    : '未检查';
+  preRunGrid.appendChild(statCard('候选达人', _draftUrls.length));
+  preRunGrid.appendChild(statCard('本次采集', collectionCount, collectionCount ? 'ok' : 'bad'));
+  preRunGrid.appendChild(statCard('优先/排除', `${decisionStats.selected}/${decisionStats.excluded}`, decisionStats.selected || decisionStats.excluded ? 'ok' : 'warn'));
+  preRunGrid.appendChild(statCard('备注覆盖', `${withLabel}/${_draftUrls.length}`, withLabel === _draftUrls.length && _draftUrls.length ? 'ok' : 'warn'));
+  preRunGrid.appendChild(statCard('筛选条件', criteriaCount, criteriaCount ? 'ok' : 'warn'));
+  preRunGrid.appendChild(statCard('登录态', loginLabel, _lastPgyLoginCheck?.loggedIn ? 'ok' : 'warn'));
+  preRunGrid.appendChild(statCard('安全上限', `${collectionCount}/${SAFE_BATCH_LIMIT}`, collectionCount <= SAFE_BATCH_LIMIT ? 'ok' : 'bad'));
+  preRunPanel.appendChild(preRunGrid);
+
+  const preRunHint = document.createElement('div');
+  preRunHint.className = 'muted-line';
+  preRunHint.textContent = _selectedTemplatePath
+    ? '启动前会再次汇总候选、模板、筛选条件和登录态。'
+    : '尚未选择采集模板，请先选择模板。';
+  preRunPanel.appendChild(preRunHint);
+  root.appendChild(preRunPanel);
 
   // 控制按钮
   const ctrl = document.createElement('div');
@@ -359,37 +1733,55 @@ export function renderTasks(state) {
 
   const btnStart = document.createElement('button');
   btnStart.className = 'btn primary';
-  btnStart.textContent = '开始';
+  btnStart.textContent = '开始采集';
   btnStart.disabled = !!state.tasks?.running;
   btnStart.addEventListener('click', async () => {
-    const urls = _draftUrls.length ? _draftUrls : parseUrls(_draftText);
+    const urls = getCollectionUrls();
     if (!urls.length) {
-      alert('URL 列表为空');
+      alert('当前采集范围内没有可采集的 URL。请调整候选状态或采集范围。');
+      return;
+    }
+    if (urls.length > SAFE_BATCH_LIMIT) {
+      alert(`为了降低平台风控风险，单次最多采集 ${SAFE_BATCH_LIMIT} 个达人。请拆成多批执行。`);
       return;
     }
     if (!_selectedTemplatePath) {
-      alert('未选择模板。请先到「采集模板」里选择/保存一个模板');
+      alert('还没有选择采集校准规则。请先到「采集校准」里点选或保存一份规则。');
       return;
     }
     try {
+      const loginCheck = await runPgyLoginCheck();
+      const summary = buildPreRunSummary({ loginCheck });
+      const warnings = [];
+      if (!loginCheck?.loggedIn) warnings.push('蒲公英登录态未确认，采集可能暂停等待人工处理。');
+      if (!buildCriteriaText()) warnings.push('当前签约任务没有填写筛选条件。');
+      if (countDraftItemsWithLabel() < urls.length) warnings.push('部分候选没有填写达人/备注。');
+      if (_collectionScope !== 'all' && candidateDecisionStats().excluded) warnings.push('已排除达人不会进入本次采集，但会保留在任务和建联判断里。');
+      if (_candidateDirty) warnings.push('候选队列或采集范围有未保存改动；本次采集会使用当前页面状态，但下次打开历史任务前请先保存任务和候选。');
+      const ok = window.confirm([
+        '确认开始采集？',
+        '',
+        summary,
+        warnings.length ? `\n提醒:\n${warnings.map((x) => `- ${x}`).join('\n')}` : ''
+      ].join('\n'));
+      if (!ok) return;
+
       // 如果是从 Excel 导入的，并且 items 覆盖了这些 url，则优先传 items（便于队列显示昵称/导出元信息）
       const items =
-        Array.isArray(_draftItems) && _draftItems.length
-          ? _draftItems.filter((x) => urls.includes(/^https?:\/\//i.test(x.pgy_url) ? x.pgy_url : `https://${x.pgy_url}`))
-          : [];
+        buildCandidateItems().filter((x) => urls.includes(normalizeDraftUrl(x.pgy_url)));
       const r = await window.desktopAPI.tasks.start({
         urls,
         items,
         templatePath: _selectedTemplatePath,
-        presetKey: _presetKey
+        presetKey: _presetKey,
+        signingTask: buildSigningTaskPayload()
       });
       if (!r?.ok) {
         alert(`启动失败：${r?.error || 'unknown error'}`);
         return;
       }
       // 启动后，队列状态由 tasks:state 推送覆盖，这里只保留草稿
-      _draftUrls = urls;
-      _draftText = urls.join('\n');
+      _draftText = _draftUrls.join('\n');
       textarea.value = _draftText;
     } catch (e) {
       alert(`启动异常：${e?.message || String(e)}`);
@@ -447,7 +1839,7 @@ export function renderTasks(state) {
   // 队列表格
   const tableTitle = document.createElement('div');
   tableTitle.className = 'section-label';
-  tableTitle.textContent = '队列';
+  tableTitle.textContent = '采集队列';
   root.appendChild(tableTitle);
 
   const table = document.createElement('table');
@@ -489,10 +1881,12 @@ export function renderTasks(state) {
 
   root.appendChild(table);
 
+  renderExecutionRecords(root);
+
   // 日志
   const logTitle = document.createElement('div');
   logTitle.className = 'section-label';
-  logTitle.textContent = '日志（最近 200 行）';
+  logTitle.textContent = '运行日志';
   root.appendChild(logTitle);
 
   const pre = document.createElement('pre');

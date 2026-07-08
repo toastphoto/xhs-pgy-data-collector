@@ -5,10 +5,16 @@ import re
 import time
 import random
 from urllib.parse import urlparse, parse_qs
-from fake_useragent import UserAgent
+from .config import Config
 from .logger import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_BROWSER_UA = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/120.0.0.0 Safari/537.36'
+)
 
 class ProxyPool:
     """代理池管理"""
@@ -20,6 +26,9 @@ class ProxyPool:
     
     def get_proxy(self) -> dict:
         """获取一个可用代理"""
+        if not Config.ALLOW_STEALTH_EVASION:
+            logger.warning("代理池默认禁用；如为隔离研究环境，需显式设置 ALLOW_STEALTH_EVASION=true")
+            return None
         if not self.proxies:
             return None
         
@@ -45,14 +54,19 @@ class UserAgentPool:
     """User-Agent池"""
     
     def __init__(self):
-        self.ua = UserAgent(fallback='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        self.ua = None
     
     def get_random_ua(self) -> str:
         """获取随机User-Agent"""
+        if not Config.ALLOW_STEALTH_EVASION:
+            return DEFAULT_BROWSER_UA
         try:
+            if self.ua is None:
+                from fake_useragent import UserAgent
+                self.ua = UserAgent(fallback=DEFAULT_BROWSER_UA)
             return self.ua.random
         except:
-            return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            return DEFAULT_BROWSER_UA
 
 class DelayController:
     """延迟控制器"""

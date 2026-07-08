@@ -27,7 +27,8 @@ class BaseCrawler(ABC):
     base_url = ""
     
     def __init__(self, use_proxy: bool = None):
-        self.use_proxy = use_proxy if use_proxy is not None else Config.USE_PROXY
+        requested_proxy = use_proxy if use_proxy is not None else Config.USE_PROXY
+        self.use_proxy = Config.ALLOW_STEALTH_EVASION and bool(requested_proxy)
         self.proxy_pool = ProxyPool(Config.PROXY_LIST) if self.use_proxy else None
         self.delay = DelayController(Config.MIN_DELAY, Config.MAX_DELAY)
         self.session = requests.Session()
@@ -51,7 +52,8 @@ class BaseCrawler(ABC):
         """更新请求头"""
         if headers:
             self.session.headers.update(headers)
-        self.session.headers['User-Agent'] = ua_pool.get_random_ua()
+        if Config.ALLOW_STEALTH_EVASION:
+            self.session.headers['User-Agent'] = ua_pool.get_random_ua()
     
     def _make_request(
         self, 

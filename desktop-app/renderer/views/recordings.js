@@ -1,4 +1,5 @@
 import { store } from '../state/store.js';
+import { createAdvancedSection, createNotice, createPageIntro } from '../ui/components.js';
 
 let _loadedOnce = false;
 let _opsDocBound = false;
@@ -42,30 +43,40 @@ export function renderRecordings(state) {
   const root = document.createElement('div');
   root.className = 'view';
 
-  const title = document.createElement('h2');
-  title.textContent = '录制 & 回放';
-  root.appendChild(title);
+  root.appendChild(createPageIntro({
+    title: '录制回放',
+    description: '低频排查工具。日常找达人、采集和导出建联表一般不用打开这里。'
+  }));
+  root.appendChild(createNotice({
+    tone: 'warning',
+    html: '<b>安全边界：</b>录制和回放只允许蒲公英页面。非蒲公英导航、点击或输入不会进入录制/回放；出现验证码、人机验证、访问异常或操作频繁提示也会停止。'
+  }));
 
-  const desc = document.createElement('p');
-  desc.textContent = '在右侧 BrowserView 中操作；左侧负责开始/停止录制、管理与回放录制文件。';
-  root.appendChild(desc);
+  const summary = document.createElement('div');
+  summary.className = 'recording-summary-card';
+  summary.innerHTML = `
+    <div>
+      <div class="rule-summary-title">当前状态</div>
+      <div class="rule-summary-name">${state.recording.isRecording ? '正在录制' : '未录制'}</div>
+      <div class="rule-summary-meta">动作数：${state.recording.count || 0}</div>
+    </div>
+    <div class="rule-summary-status">${state.recording.isRecording ? '记录中' : '备用工具'}</div>
+  `;
+  root.appendChild(summary);
 
   const msg = document.createElement('div');
   msg.style.margin = '10px 0 12px 0';
   msg.style.fontSize = '13px';
   msg.style.whiteSpace = 'pre-wrap';
-  msg.style.color = 'rgba(230, 237, 243, 0.85)';
+  msg.style.color = 'var(--text)';
   msg.textContent = '';
 
   const toolbar = document.createElement('div');
-  toolbar.style.display = 'flex';
-  toolbar.style.gap = '10px';
-  toolbar.style.flexWrap = 'wrap';
-  toolbar.style.alignItems = 'center';
+  toolbar.className = 'tool-strip recording-actions';
 
   const counter = document.createElement('div');
+  counter.className = 'muted-line';
   counter.style.fontSize = '13px';
-  counter.style.color = 'rgba(230, 237, 243, 0.85)';
   counter.innerHTML = `当前录制动作数：<b>${state.recording.count}</b>`;
 
   const setMsg = (s) => {
@@ -90,7 +101,7 @@ export function renderRecordings(state) {
   };
 
   const btnStart = document.createElement('button');
-  btnStart.className = 'btn';
+  btnStart.className = 'btn primary';
   btnStart.textContent = '开始录制';
   btnStart.disabled = !!state.recording.isRecording;
   btnStart.addEventListener('click', async () => {
@@ -104,14 +115,14 @@ export function renderRecordings(state) {
       store.set({
         recording: { ...store.state.recording, isRecording: true, count: 0 }
       });
-      setMsg('已开始录制。请在右侧进行操作。');
+      setMsg('已开始录制。请只在右侧蒲公英页面进行排查操作；离开蒲公英后的动作不会写入录制文件。');
     } catch (e) {
       setMsg(`开始异常：${e?.message || String(e)}`);
     }
   });
 
   const btnStop = document.createElement('button');
-  btnStop.className = 'btn';
+  btnStop.className = 'btn ghost';
   btnStop.textContent = '停止并保存';
   btnStop.disabled = !state.recording.isRecording;
   btnStop.addEventListener('click', async () => {
@@ -133,13 +144,13 @@ export function renderRecordings(state) {
   });
 
   const btnRefresh = document.createElement('button');
-  btnRefresh.className = 'btn';
+  btnRefresh.className = 'btn ghost';
   btnRefresh.textContent = '刷新列表';
   btnRefresh.addEventListener('click', refreshList);
 
   const btnOpenFolder = document.createElement('button');
-  btnOpenFolder.className = 'btn';
-  btnOpenFolder.textContent = '打开 recordings 文件夹';
+  btnOpenFolder.className = 'btn ghost';
+  btnOpenFolder.textContent = '打开文件夹';
   btnOpenFolder.addEventListener('click', async () => {
     setMsg('打开文件夹...');
     try {
@@ -184,7 +195,7 @@ export function renderRecordings(state) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td colspan="4" style="padding:10px 6px; color: rgba(230,237,243,0.7);">
-        暂无录制文件。点击“开始录制”，操作后再“停止并保存”。
+        暂无录制文件。仅在需要排查蒲公英页面操作时使用录制。
       </td>
     `;
     tbody.appendChild(tr);
@@ -304,7 +315,13 @@ export function renderRecordings(state) {
   }
 
   table.appendChild(tbody);
-  root.appendChild(table);
+  const filesSection = createAdvancedSection({
+    title: `录制文件（${files.length}）`,
+    open: files.length > 0,
+    children: [table]
+  });
+  filesSection.classList.add('recording-files-section');
+  root.appendChild(filesSection);
 
   // 首次进入页面时自动刷新一次
   if (!_loadedOnce) {

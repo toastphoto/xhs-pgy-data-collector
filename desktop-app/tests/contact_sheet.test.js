@@ -1,0 +1,264 @@
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const XLSX = require('xlsx');
+
+const {
+  buildContactRowsFromRun,
+  exportContactRowsWorkbook,
+  exportContactWorkbook,
+  getContactPreview,
+  summarizeContactWorkbookRows,
+  timestampForFilename
+} = require('../lib/contact_sheet');
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-contact-sheet-'));
+const runDir = path.join(tmp, 'run_2026-06-30T00-00-00-000Z');
+const childDir = path.join(runDir, '1_creator');
+fs.mkdirSync(childDir, { recursive: true });
+
+fs.writeFileSync(
+  path.join(runDir, 'meta.json'),
+  JSON.stringify(
+    {
+      signingTask: {
+        candidates: [
+          {
+            pgy_url: 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/abc',
+            creator_name: '候选达人',
+            status: 'excluded',
+            priority: 'P2',
+            excludeReason: '候选阶段排除',
+            note: '候选备注'
+          }
+        ]
+      }
+    },
+    null,
+    2
+  ),
+  'utf-8'
+);
+
+fs.writeFileSync(
+  path.join(childDir, 'raw_result.json'),
+  JSON.stringify(
+    {
+      platform: 'pgy',
+      creator_url: 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/abc',
+      creator_summary: {
+        creator_name: '测试达人',
+        xhs_id: 'xhs_001',
+        creator_url: 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/abc',
+        tags: '家居, 好物',
+        location: '上海'
+      },
+      metrics: {
+        '粉丝数': '4.2w',
+        '图文笔记一口价': '¥3,000',
+        '视频笔记一口价': '¥8,000',
+        '近90天笔记阅读中位数': '12,000'
+      },
+      quality_report: { score: 92 }
+    },
+    null,
+    2
+  ),
+  'utf-8'
+);
+
+const rows = buildContactRowsFromRun(runDir, {
+  defaultGroupTag: 'FILA',
+  defaultGreeting: '您好，想沟通一下合作。'
+});
+
+assert.strictEqual(rows.files, 1);
+assert.strictEqual(rows.contactRows.length, 1);
+assert.strictEqual(rows.contactRows[0]['达人昵称'], '测试达人');
+assert.strictEqual(rows.contactRows[0]['跟进状态'], '不建联');
+assert.strictEqual(rows.contactRows[0]['微信分组标签'], 'FILA');
+assert.strictEqual(rows.contactRows[0]['打招呼内容'], '您好，想沟通一下合作。');
+assert.ok(rows.contactRows[0]['推荐理由'].includes('采集质量 92'));
+assert.strictEqual(rows.contactRows[0]['选择建联'], '否');
+assert.strictEqual(rows.contactRows[0]['排除原因'], '候选阶段排除');
+assert.strictEqual(rows.xiaomifengRows.length, 0);
+assert.strictEqual(rows.pendingContactRows.length, 0);
+assert.strictEqual(rows.summary.total, 1);
+assert.strictEqual(rows.summary.selected, 0);
+assert.strictEqual(rows.summary.excluded, 1);
+assert.strictEqual(rows.summary.followupStatusCounts['不建联'], 1);
+
+const preview = getContactPreview(runDir);
+assert.strictEqual(preview.summary.total, 1);
+assert.strictEqual(preview.summary.selected, 0);
+assert.strictEqual(preview.rawFiles, 1);
+assert.ok(preview.rows[0].rowId);
+assert.strictEqual(preview.rows[0].priority, 'P2');
+assert.strictEqual(preview.rows[0].excludeReason, '候选阶段排除');
+assert.strictEqual(preview.rows[0].note, '候选备注');
+
+const reviewed = buildContactRowsFromRun(runDir, {
+  defaultGroupTag: 'FILA',
+  defaultGreeting: '您好，想沟通一下合作。',
+  reviewRows: [
+    {
+      rowId: preview.rows[0].rowId,
+      selected: false,
+      followupStatus: '已拒绝',
+      priority: 'P1',
+      excludeReason: '报价偏高',
+      note: '先不联系',
+      wechatId: 'wx_test'
+    }
+  ]
+});
+assert.strictEqual(reviewed.contactRows[0]['选择建联'], '否');
+assert.strictEqual(reviewed.contactRows[0]['跟进状态'], '已拒绝');
+assert.strictEqual(reviewed.contactRows[0]['优先级'], 'P1');
+assert.strictEqual(reviewed.contactRows[0]['排除原因'], '报价偏高');
+assert.strictEqual(reviewed.contactRows[0]['备注'], '先不联系');
+assert.strictEqual(reviewed.contactRows[0]['微信号'], 'wx_test');
+assert.strictEqual(reviewed.xiaomifengRows.length, 0);
+assert.strictEqual(reviewed.pendingContactRows.length, 0);
+assert.strictEqual(reviewed.summary.followupStatusCounts['已拒绝'], 1);
+
+const directSummary = summarizeContactWorkbookRows(reviewed.previewRows);
+assert.strictEqual(directSummary.total, 1);
+assert.strictEqual(directSummary.followupStatusCounts['已拒绝'], 1);
+
+const pendingExported = exportContactWorkbook(runDir, {
+  defaultGroupTag: 'FILA',
+  defaultGreeting: '您好，想沟通一下合作。',
+  reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }]
+});
+assert.ok(fs.existsSync(pendingExported.outPath));
+assert.strictEqual(pendingExported.creators, 1);
+assert.strictEqual(pendingExported.xiaomifengRows, 0);
+assert.strictEqual(pendingExported.pendingContactRows, 1);
+
+const pendingWb = XLSX.readFile(pendingExported.outPath);
+assert.ok(pendingWb.SheetNames.includes('建联表'));
+assert.ok(pendingWb.SheetNames.includes('蒲公英邀约表'));
+assert.ok(pendingWb.SheetNames.includes('邮件建联表'));
+assert.ok(pendingWb.SheetNames.includes('小蜜蜂导入表'));
+assert.ok(pendingWb.SheetNames.includes('待补联系方式'));
+assert.strictEqual(pendingWb.SheetNames[0], '建联概览');
+
+const pendingSummary = XLSX.utils.sheet_to_json(pendingWb.Sheets['建联概览']);
+assert.strictEqual(pendingSummary.find((row) => row['指标'] === '总达人')['数量'], 1);
+assert.strictEqual(pendingSummary.find((row) => row['指标'] === '待补联系方式')['数量'], 1);
+assert.strictEqual(pendingSummary.find((row) => row['指标'] === '小蜜蜂导入行')['数量'], 0);
+assert.strictEqual(pendingSummary.find((row) => row['指标'] === '跟进状态：待建联')['数量'], 1);
+const pendingContact = XLSX.utils.sheet_to_json(pendingWb.Sheets['建联表']);
+assert.strictEqual(pendingContact[0]['达人昵称'], '测试达人');
+assert.strictEqual(pendingContact[0]['选择建联'], '是');
+const pendingXmf = XLSX.utils.sheet_to_json(pendingWb.Sheets['小蜜蜂导入表']);
+assert.strictEqual(pendingXmf.length, 0);
+const pendingPgyInvite = XLSX.utils.sheet_to_json(pendingWb.Sheets['蒲公英邀约表']);
+assert.strictEqual(pendingPgyInvite.length, 0);
+const pendingEmail = XLSX.utils.sheet_to_json(pendingWb.Sheets['邮件建联表']);
+assert.strictEqual(pendingEmail.length, 0);
+const pendingRows = XLSX.utils.sheet_to_json(pendingWb.Sheets['待补联系方式'], { defval: '' });
+assert.strictEqual(pendingRows[0]['达人昵称'], '测试达人');
+assert.ok(Object.prototype.hasOwnProperty.call(pendingRows[0], '微信号'));
+assert.ok(Object.prototype.hasOwnProperty.call(pendingRows[0], '手机号'));
+assert.strictEqual(pendingRows[0]['跟进状态'], '待建联');
+
+const exported = exportContactWorkbook(runDir, {
+  defaultGroupTag: 'FILA',
+  defaultGreeting: '您好，想沟通一下合作。',
+  reviewRows: [{ rowId: preview.rows[0].rowId, selected: true, wechatId: 'wx_test' }]
+});
+assert.ok(fs.existsSync(exported.outPath));
+assert.strictEqual(exported.creators, 1);
+assert.strictEqual(exported.xiaomifengRows, 1);
+assert.strictEqual(exported.pendingContactRows, 0);
+assert.strictEqual(exported.summary.selectedWithContact, 1);
+assert.strictEqual(exported.summary.selectedMissingContact, 0);
+
+const wb = XLSX.readFile(exported.outPath);
+assert.ok(wb.SheetNames.includes('建联概览'));
+assert.ok(wb.SheetNames.includes('建联表'));
+assert.ok(wb.SheetNames.includes('蒲公英邀约表'));
+assert.ok(wb.SheetNames.includes('邮件建联表'));
+assert.ok(wb.SheetNames.includes('小蜜蜂导入表'));
+assert.ok(wb.SheetNames.includes('待补联系方式'));
+
+const contact = XLSX.utils.sheet_to_json(wb.Sheets['建联表']);
+assert.strictEqual(contact[0]['达人昵称'], '测试达人');
+assert.strictEqual(contact[0]['选择建联'], '是');
+assert.strictEqual(contact[0]['跟进状态'], '待建联');
+const xmf = XLSX.utils.sheet_to_json(wb.Sheets['小蜜蜂导入表']);
+assert.strictEqual(xmf[0]['备注名'], '测试达人');
+assert.strictEqual(xmf[0]['微信号'], 'wx_test');
+
+const routedExported = exportContactRowsWorkbook(runDir, [
+  {
+    ...preview.rows[0],
+    selected: true,
+    contactChannel: '自动分流',
+    email: 'creator@example.com',
+    wechatId: '',
+    phone: ''
+  },
+  {
+    ...preview.rows[0],
+    rowId: `${preview.rows[0].rowId}_pgy`,
+    creatorName: '无联系方式达人',
+    selected: true,
+    contactChannel: '自动分流',
+    email: '',
+    wechatId: '',
+    phone: ''
+  }
+], {
+  suffix: '自动分流',
+  timestamp: '20260630-130000',
+  emailSubject: '合作沟通',
+  emailBody: '您好，想沟通一下合作。',
+  pgyBrandName: '品牌A',
+  pgyProductName: '产品A'
+});
+assert.strictEqual(routedExported.emailContactRows, 1);
+assert.strictEqual(routedExported.pgyInviteRows, 1);
+assert.strictEqual(routedExported.xiaomifengRows, 0);
+assert.strictEqual(routedExported.pendingContactRows, 0);
+const routedWb = XLSX.readFile(routedExported.outPath);
+const routedEmailRows = XLSX.utils.sheet_to_json(routedWb.Sheets['邮件建联表']);
+assert.strictEqual(routedEmailRows[0]['邮箱'], 'creator@example.com');
+assert.strictEqual(routedEmailRows[0]['邮件标题'], '合作沟通');
+const routedInviteRows = XLSX.utils.sheet_to_json(routedWb.Sheets['蒲公英邀约表']);
+assert.strictEqual(routedInviteRows[0]['达人昵称'], '无联系方式达人');
+assert.strictEqual(routedInviteRows[0]['品牌名'], '品牌A');
+
+const filteredExported = exportContactRowsWorkbook(runDir, [
+  {
+    ...preview.rows[0],
+    selected: true,
+    followupStatus: '需二次跟进',
+    priority: 'P1',
+    wechatId: '',
+    phone: '',
+    note: '单独导出给同事补联系方式'
+  }
+], { suffix: '当前筛选', timestamp: '20260630-120000' });
+assert.ok(fs.existsSync(filteredExported.outPath));
+assert.ok(path.basename(filteredExported.outPath).includes('当前筛选'));
+assert.ok(path.basename(filteredExported.outPath).includes('20260630-120000'));
+assert.strictEqual(filteredExported.creators, 1);
+assert.strictEqual(filteredExported.xiaomifengRows, 0);
+assert.strictEqual(filteredExported.pendingContactRows, 1);
+assert.strictEqual(filteredExported.summary.followupStatusCounts['需二次跟进'], 1);
+
+const filteredWb = XLSX.readFile(filteredExported.outPath);
+assert.strictEqual(filteredWb.SheetNames[0], '建联概览');
+const filteredContact = XLSX.utils.sheet_to_json(filteredWb.Sheets['建联表']);
+assert.strictEqual(filteredContact[0]['跟进状态'], '需二次跟进');
+assert.strictEqual(filteredContact[0]['优先级'], 'P1');
+const filteredPending = XLSX.utils.sheet_to_json(filteredWb.Sheets['待补联系方式'], { defval: '' });
+assert.strictEqual(filteredPending[0]['备注'], '单独导出给同事补联系方式');
+
+assert.strictEqual(timestampForFilename(new Date(2026, 5, 30, 9, 8, 7)), '20260630-090807');
+
+console.log('contact_sheet.test.js OK');

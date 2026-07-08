@@ -2,7 +2,7 @@
   "version": "pgy_v1_default",
   "platform": "pgy",
   "mode": "safe_dom",
-  "resolveNoteUrlByClick": true,
+  "resolveNoteUrlByClick": false,
   "tabTexts": ["数据概览", "笔记数据", "粉丝分析"],
   "pages": [
     { "name": "creator_detail", "tabText": null },

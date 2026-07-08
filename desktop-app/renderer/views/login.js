@@ -1,41 +1,60 @@
+import { store } from '../state/store.js';
+import {
+  createButton,
+  createPageIntro,
+  createStatusPill,
+  createSummaryCard
+} from '../ui/components.js';
+
 export function renderLogin(_state) {
   const root = document.createElement('div');
   root.className = 'view';
-  root.innerHTML = `
-    <h2>登录态 / 账号</h2>
-    <p>v1：在右侧 BrowserView 中手工完成登录后，可在此检测登录态（基于当前页面 URL 与 DOM 经验性判断）。</p>
-    <p style="color: var(--muted); font-size: 13px; line-height: 1.6;">
-      建议从 <b>蒲公英官网入口</b> 进入再点“账号登录”，比直接打开站内 /login 或某个内页更稳定（可避免“页面不见了/需要返回上一页”的情况）。
-    </p>
-  `;
+  root.appendChild(createPageIntro({
+    title: '开始',
+    description: '先把右侧蒲公英账号准备好，然后进入找达人和建联表流程。'
+  }));
 
-  const actions = document.createElement('div');
-  actions.style.display = 'flex';
-  actions.style.gap = '10px';
-  actions.style.flexWrap = 'wrap';
-
-  const btnOpen = document.createElement('button');
-  btnOpen.className = 'btn primary';
-  btnOpen.textContent = '在右侧打开蒲公英入口';
-  btnOpen.addEventListener('click', async () => {
+  const btnOpen = createButton('在右侧打开蒲公英入口', async () => {
     try {
       await window.desktopAPI.browser.open('https://pgy.xiaohongshu.com/');
     } catch (_) {}
-  });
+  }, { primary: true });
 
-  const btnHome = document.createElement('button');
-  btnHome.className = 'btn ghost';
-  btnHome.textContent = '打开工作台（已登录）';
-  btnHome.disabled = true;
-  btnHome.addEventListener('click', async () => {
+  const btnHome = createButton('打开工作台（已登录）', async () => {
     try {
       await window.desktopAPI.browser.open('https://pgy.xiaohongshu.com/solar/pre-trade/home');
     } catch (_) {}
-  });
+  }, { ghost: true });
+  btnHome.disabled = true;
 
-  const btnCheck = document.createElement('button');
-  btnCheck.className = 'btn ghost';
-  btnCheck.textContent = '检测登录态';
+  const btnCheck = createButton('检测登录态', null, { ghost: true });
+
+  const btnGoTasks = createButton('开始找达人', () => store.set({ view: 'tasks' }), { primary: true });
+
+  const btnGoExports = createButton('复核建联表', () => store.set({ view: 'exports' }), { ghost: true });
+
+  const startGrid = document.createElement('div');
+  startGrid.className = 'start-action-grid';
+  startGrid.appendChild(createSummaryCard({
+    title: '1. 打开蒲公英',
+    description: '在右侧网页区完成人工登录和搜索准备。',
+    meta: '不托管账号，不绕过平台登录',
+    tone: 'accent',
+    actions: [btnOpen, btnHome]
+  }));
+  startGrid.appendChild(createSummaryCard({
+    title: '2. 找达人',
+    description: '导入名单，或在蒲公英搜索后把合适达人加入候选池。',
+    meta: '候选确认后再开始采集',
+    actions: [btnGoTasks]
+  }));
+  startGrid.appendChild(createSummaryCard({
+    title: '3. 复核建联',
+    description: '复核采集结果，补充联系方式，导出建联表和待补联系方式表。',
+    meta: '小蜜蜂表作为下游结果，不打断主流程',
+    actions: [btnGoExports]
+  }));
+  root.appendChild(startGrid);
 
   const result = document.createElement('div');
   result.style.marginTop = '12px';
@@ -55,19 +74,29 @@ export function renderLogin(_state) {
       }
       btnHome.disabled = !r.loggedIn;
       result.textContent =
-        `loggedIn: ${r.loggedIn}\n` +
-        `isLoginPage: ${r.isLoginPage}\n` +
-        `url: ${r.url}`;
+        `${r.loggedIn ? '已检测到登录状态' : '还没有检测到登录状态'}\n` +
+        `当前页面：${r.url}`;
     } catch (e) {
       result.textContent = `检测异常：${e?.message || String(e)}`;
       btnHome.disabled = true;
     }
   });
 
-  actions.appendChild(btnOpen);
-  actions.appendChild(btnHome);
-  actions.appendChild(btnCheck);
-  root.appendChild(actions);
-  root.appendChild(result);
+  const statusPanel = document.createElement('div');
+  statusPanel.className = 'start-status-panel';
+  const statusHead = document.createElement('div');
+  statusHead.className = 'panel-title-row';
+  const statusTitle = document.createElement('div');
+  statusTitle.className = 'section-label compact';
+  statusTitle.textContent = '登录状态';
+  statusHead.appendChild(statusTitle);
+  statusHead.appendChild(createStatusPill('人工登录', 'neutral'));
+  statusPanel.appendChild(statusHead);
+  const statusActions = document.createElement('div');
+  statusActions.className = 'tool-strip compact';
+  statusActions.appendChild(btnCheck);
+  statusPanel.appendChild(statusActions);
+  statusPanel.appendChild(result);
+  root.appendChild(statusPanel);
   return root;
 }

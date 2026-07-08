@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-增强版浏览器引擎 - 整合GitHub参考方案的安全策略
+旧兼容浏览器引擎。
+
+默认保持可见、保守浏览器形态；反指纹、随机 UA、代理、禁图等规避型行为
+只允许在显式 ALLOW_STEALTH_EVASION=true 的隔离研究环境中启用。
 """
 import json
 import random
@@ -34,22 +37,27 @@ class EnhancedBrowserEngine:
         """配置Chrome选项 - 参考GitHub方案的反指纹配置"""
         options = Options()
         
-        # ===== 反自动化检测配置 =====
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
+        # ===== 旧兼容层研究开关 =====
+        # 默认关闭 webdriver 隐藏/自动化特征改写，避免产品误用成规避风控的自动化浏览器。
+        if Config.ALLOW_STEALTH_EVASION:
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
         
-        # ===== 禁用可能暴露自动化的服务 =====
-        options.add_experimental_option("prefs", {
+        # ===== 基础偏好 =====
+        prefs = {
             "gcm": {"enabled": False},
             "push_messaging": {"enabled": False},
             "service_worker": {"enabled": False},
-            "profile.managed_default_content_settings.images": 2,  # 可选：禁用图片加速加载
-        })
+        }
+        if Config.ALLOW_STEALTH_EVASION:
+            prefs["profile.managed_default_content_settings.images"] = 2
+        options.add_experimental_option("prefs", prefs)
         
         # ===== 证书和日志配置 =====
-        options.add_argument("--ignore-certificate-errors")
-        options.add_argument("--ignore-ssl-errors")
+        if Config.ALLOW_STEALTH_EVASION:
+            options.add_argument("--ignore-certificate-errors")
+            options.add_argument("--ignore-ssl-errors")
         options.add_experimental_option("excludeSwitches", ["enable-logging"])
         
         # ===== 基础配置 =====
@@ -65,12 +73,13 @@ class EnhancedBrowserEngine:
         options.add_argument("--window-size=800,600")
         
         # ===== User-Agent =====
-        user_agents = [
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-        options.add_argument(f"--user-agent={random.choice(user_agents)}")
+        if Config.ALLOW_STEALTH_EVASION:
+            user_agents = [
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ]
+            options.add_argument(f"--user-agent={random.choice(user_agents)}")
         
         # ===== 代理配置 =====
         if Config.USE_PROXY and Config.PROXY_LIST:
@@ -98,17 +107,17 @@ class EnhancedBrowserEngine:
         # 设置显式等待
         self.wait = WebDriverWait(self.driver, Config.BROWSER_TIMEOUT)
         
-        # 执行CDP命令隐藏webdriver属性
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-            """
-        })
+        if Config.ALLOW_STEALTH_EVASION:
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                """
+            })
         
         logger.info("浏览器引擎初始化完成")
         return self.driver

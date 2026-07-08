@@ -1,4 +1,5 @@
 import { store } from '../state/store.js';
+import { createAdvancedSection } from '../ui/components.js';
 
 let _runs = [];
 let _selectedRunDir = '';
@@ -9,9 +10,45 @@ let _checked = new Set();
 let _query = '';
 let _colsLoadedOnce = false;
 let _activeGroup = '';
+let _contactGroupTag = '';
+let _contactGreeting = '您好，我们想和您沟通一下品牌合作，方便的话可以通过一下好友吗？';
+let _contactChannelStrategy = '自动分流';
+let _contactEmailSubject = '';
+let _contactEmailBody = '';
+let _contactPgyCooperationType = '图文';
+let _contactPgyBrandName = '';
+let _contactPgyProductName = '';
+let _contactPgyContactWay = '';
+let _contactPgyIntro = '';
+let _contactPgyPublishStart = '';
+let _contactPgyPublishEnd = '';
+let _contactPreviewRows = [];
+let _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
+let _contactReviewMap = new Map();
+let _contactPreviewRunDir = '';
+let _contactLoadedRunDir = '';
+let _contactSaveTimer = null;
+let _contactSearch = '';
+let _contactStatusFilter = 'all';
+let _contactContactFilter = 'all';
+let _contactPriorityFilter = 'all';
+let _contactFollowupFilter = 'all';
+let _contactChannelFilter = 'all';
+let _contactBatchFollowupStatus = '待建联';
+let _autoPreviewRequestedRunDir = '';
+let _contactSaveStatus = '';
+let _lastContactExportPath = '';
+
+const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
+const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
 
 function setMsg(s) {
   _msg = s || '';
+  store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+}
+
+function setContactSaveStatus(s) {
+  _contactSaveStatus = s || '';
   store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
 }
 
@@ -25,6 +62,10 @@ async function refreshRuns() {
     }
     _runs = Array.isArray(r.runs) ? r.runs : [];
     if (!_selectedRunDir) _selectedRunDir = _runs?.[0]?.path || '';
+    if (_selectedRunDir && _autoPreviewRequestedRunDir !== _selectedRunDir && !_contactPreviewRows.length) {
+      _autoPreviewRequestedRunDir = _selectedRunDir;
+      setTimeout(() => refreshContactPreview().then(() => store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } })), 0);
+    }
     setMsg('');
   } catch (e) {
     setMsg(`刷新异常：${e?.message || String(e)}`);
@@ -68,16 +109,447 @@ function _filteredColumns(cols) {
   return cols.filter((c) => String(c).includes(q));
 }
 
+function getReviewRows() {
+  return Array.from(_contactReviewMap.values()).map((row) => ({ ...row }));
+}
+
+function normalizeContactUrl(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+}
+
+function formatFollowupStatusCounts(counts) {
+  const entries = Object.entries(counts || {}).filter(([, count]) => Number(count || 0) > 0);
+  if (!entries.length) return '';
+  return entries
+    .sort(([a], [b]) => a.localeCompare(b, 'zh-Hans-CN'))
+    .map(([status, count]) => `${status}${count}`)
+    .join('，');
+}
+
+async function copyTextWithFallback(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    window.prompt('复制失败，请手工复制：', text);
+    return false;
+  }
+}
+
+function buildContactReviewSummaryText(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row, index) => {
+    const review = ensureReviewRow(row);
+    const parts = [
+      `${index + 1}. ${row.creatorName || '(无昵称)'}`,
+      row.xhsId ? `小红书号：${row.xhsId}` : '',
+      `状态：${defaultFollowupStatus(review)}`,
+      `方式：${getContactExecutionChannel(review)}`,
+      review?.priority ? `优先级：${review.priority}` : '',
+      review?.email ? `邮箱：${review.email}` : '',
+      review?.wechatId ? `微信：${review.wechatId}` : '',
+      review?.phone ? `手机：${review.phone}` : '',
+      review?.note ? `备注：${review.note}` : '',
+      row.creatorUrl || ''
+    ].filter(Boolean);
+    return parts.join(' | ');
+  }).join('\n');
+}
+
+function buildExportRowsFromContactRows(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const review = ensureReviewRow(row) || {};
+    return {
+      ...row,
+      selected: review.selected !== false,
+      followupStatus: defaultFollowupStatus(review),
+      priority: review.priority || '',
+      excludeReason: review.excludeReason || '',
+      note: review.note || '',
+      email: review.email || row.email || '',
+      wechatId: review.wechatId || '',
+      phone: review.phone || '',
+      contactChannel: normalizeContactChannel(review.contactChannel || row.contactChannel || _contactChannelStrategy),
+      pgyInvite: row.pgyInvite || getPgyInviteSettings(),
+      emailTemplate: row.emailTemplate || getEmailTemplateSettings()
+    };
+  });
+}
+
+function safeSuffixPart(value) {
+  return String(value || '').trim().replace(/[\\/:*?"<>|\s]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 24);
+}
+
+function buildContactSelectionExportSuffix() {
+  const parts = ['当前筛选'];
+  const statusLabels = { selected: '已选建联', excluded: '已排除' };
+  const contactLabels = { missing: '缺联系方式', filled: '已有联系方式' };
+  const priorityLabels = { priority: '有优先级', none: '无优先级' };
+  if (_contactStatusFilter !== 'all') parts.push(statusLabels[_contactStatusFilter] || _contactStatusFilter);
+  if (_contactContactFilter !== 'all') parts.push(contactLabels[_contactContactFilter] || _contactContactFilter);
+  if (_contactPriorityFilter !== 'all') parts.push(priorityLabels[_contactPriorityFilter] || _contactPriorityFilter);
+  if (_contactFollowupFilter !== 'all') parts.push(_contactFollowupFilter);
+  const search = safeSuffixPart(_contactSearch);
+  if (search) parts.push(`搜索_${search}`);
+  return parts.map(safeSuffixPart).filter(Boolean).slice(0, 6).join('_') || '当前筛选';
+}
+
+function summarizeContactReviewRows(rows) {
+  return (Array.isArray(rows) ? rows : []).reduce(
+    (acc, row) => {
+      const review = ensureReviewRow(row);
+      const selected = review?.selected !== false;
+      const hasWechat = Boolean(String(review?.wechatId || '').trim() || String(review?.phone || '').trim());
+      const hasEmail = Boolean(String(review?.email || row?.email || '').trim());
+      const channel = getContactExecutionChannel(review);
+      acc.total += 1;
+      if (selected) acc.selected += 1;
+      if (selected && channel === '蒲公英邀约') acc.pgyInvite += 1;
+      if (selected && channel === '邮件建联' && hasEmail) acc.email += 1;
+      if (selected && channel === '微信建联' && hasWechat) acc.wechat += 1;
+      if (selected && (
+        channel === '待补联系方式' ||
+        (channel === '邮件建联' && !hasEmail) ||
+        (channel === '微信建联' && !hasWechat)
+      )) acc.pending += 1;
+      return acc;
+    },
+    { total: 0, selected: 0, pgyInvite: 0, email: 0, wechat: 0, pending: 0 }
+  );
+}
+
+function setStyles(el, styles) {
+  Object.assign(el.style, styles);
+  return el;
+}
+
+function makeSoftButton(label, onClick, { primary = false, disabled = false } = {}) {
+  const b = document.createElement('button');
+  b.className = primary ? 'btn primary' : 'btn ghost';
+  b.textContent = label;
+  b.disabled = disabled;
+  setStyles(b, { height: '36px' });
+  if (onClick) b.addEventListener('click', onClick);
+  return b;
+}
+
+function makeMetricCard(label, value, tone = '') {
+  const card = document.createElement('div');
+  card.className = `export-metric ${tone}`.trim();
+  const k = document.createElement('div');
+  k.className = 'export-metric-label';
+  k.textContent = label;
+  const v = document.createElement('div');
+  v.className = 'export-metric-value';
+  v.textContent = value;
+  card.appendChild(k);
+  card.appendChild(v);
+  return card;
+}
+
+function getContactSettings() {
+  return {
+    defaultGroupTag: _contactGroupTag,
+    defaultGreeting: _contactGreeting,
+    contactChannel: _contactChannelStrategy,
+    emailSubject: _contactEmailSubject,
+    emailBody: _contactEmailBody,
+    pgyCooperationType: _contactPgyCooperationType,
+    pgyBrandName: _contactPgyBrandName,
+    pgyProductName: _contactPgyProductName,
+    pgyContactWay: _contactPgyContactWay,
+    pgyIntro: _contactPgyIntro,
+    pgyPublishStart: _contactPgyPublishStart,
+    pgyPublishEnd: _contactPgyPublishEnd
+  };
+}
+
+function getPgyInviteSettings() {
+  return {
+    cooperationType: _contactPgyCooperationType,
+    brandName: _contactPgyBrandName,
+    productName: _contactPgyProductName,
+    contactWay: _contactPgyContactWay,
+    intro: _contactPgyIntro,
+    publishStart: _contactPgyPublishStart,
+    publishEnd: _contactPgyPublishEnd
+  };
+}
+
+function getEmailTemplateSettings() {
+  return {
+    subject: _contactEmailSubject,
+    body: _contactEmailBody
+  };
+}
+
+function normalizeContactChannel(value, fallback = '自动分流') {
+  const text = String(value || '').trim();
+  if (!text) return fallback;
+  if (/自动|auto/i.test(text)) return '自动分流';
+  if (/蒲公英|邀约|pgy/i.test(text)) return '蒲公英邀约';
+  if (/邮件|邮箱|email|mail/i.test(text)) return '邮件建联';
+  if (/微信|小蜜蜂|wechat|xmf/i.test(text)) return '微信建联';
+  if (/待补|pending/i.test(text)) return '待补联系方式';
+  return CONTACT_CHANNEL_OPTIONS.includes(text) ? text : fallback;
+}
+
+function getContactExecutionChannel(review) {
+  const channel = normalizeContactChannel(review?.contactChannel || _contactChannelStrategy);
+  if (channel !== '自动分流') return channel;
+  if (String(review?.wechatId || '').trim() || String(review?.phone || '').trim()) return '微信建联';
+  if (String(review?.email || '').trim()) return '邮件建联';
+  return '蒲公英邀约';
+}
+
+function defaultFollowupStatus(review) {
+  const status = String(review?.followupStatus || '').trim();
+  if (status) return status;
+  return review?.selected === false ? '不建联' : '待建联';
+}
+
+function markReviewSelected(review) {
+  if (!review) return;
+  review.selected = true;
+  if (!String(review.followupStatus || '').trim() || review.followupStatus === '不建联') {
+    review.followupStatus = '待建联';
+  }
+  review.excludeReason = '';
+}
+
+function markReviewExcluded(review) {
+  if (!review) return;
+  review.selected = false;
+  review.followupStatus = '不建联';
+}
+
+function ensureReviewRow(row) {
+  const id = String(row?.rowId || '');
+  if (!id) return null;
+  if (!_contactReviewMap.has(id)) {
+    _contactReviewMap.set(id, {
+      rowId: id,
+      selected: row?.selected !== false,
+      followupStatus: row?.followupStatus || (row?.selected === false ? '不建联' : '待建联'),
+      priority: row?.priority || '',
+      excludeReason: row?.excludeReason || '',
+      note: row?.note || '',
+      email: row?.email || '',
+      wechatId: row?.wechatId || '',
+      phone: row?.phone || '',
+      contactChannel: normalizeContactChannel(row?.contactChannel || _contactChannelStrategy)
+    });
+  }
+  return _contactReviewMap.get(id);
+}
+
+function getContactFilteredRows() {
+  const search = String(_contactSearch || '').trim().toLowerCase();
+  return (_contactPreviewRows || []).filter((row) => {
+    const review = ensureReviewRow(row);
+    const selected = review?.selected !== false;
+    const hasContact = Boolean(String(review?.wechatId || '').trim() || String(review?.phone || '').trim() || String(review?.email || row?.email || '').trim());
+    const hasPriority = Boolean(String(review?.priority || '').trim());
+    const followupStatus = defaultFollowupStatus(review);
+    const channel = getContactExecutionChannel(review);
+
+    if (_contactStatusFilter === 'selected' && !selected) return false;
+    if (_contactStatusFilter === 'excluded' && selected) return false;
+    if (_contactContactFilter === 'missing' && hasContact) return false;
+    if (_contactContactFilter === 'filled' && !hasContact) return false;
+    if (_contactPriorityFilter === 'priority' && !hasPriority) return false;
+    if (_contactPriorityFilter === 'none' && hasPriority) return false;
+    if (_contactFollowupFilter !== 'all' && followupStatus !== _contactFollowupFilter) return false;
+    if (_contactChannelFilter !== 'all' && channel !== _contactChannelFilter) return false;
+    if (search) {
+      const hay = [
+        row.creatorName,
+        row.xhsId,
+        row.creatorUrl,
+        row.tags,
+        row.region,
+        row.recommendation,
+        review?.priority,
+        review?.followupStatus,
+        review?.excludeReason,
+        review?.note,
+        review?.email,
+        review?.wechatId,
+        review?.phone,
+        channel
+      ].map((x) => String(x || '').toLowerCase()).join(' ');
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function resetContactPreviewState({ keepMeta = false } = {}) {
+  _contactPreviewRows = [];
+  _contactPreviewRunDir = '';
+  _contactLoadedRunDir = '';
+  _contactReviewMap = new Map();
+  _contactSaveStatus = '';
+  if (!keepMeta) _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
+}
+
+async function loadContactReviewForRun(force = false) {
+  if (!_selectedRunDir) return;
+  if (!force && _contactLoadedRunDir === _selectedRunDir) return;
+  try {
+    const r = await window.desktopAPI.exports.loadContactReview({ runDir: _selectedRunDir });
+    if (!r?.ok) return;
+    _contactReviewMap = new Map();
+    (Array.isArray(r.reviewRows) ? r.reviewRows : []).forEach((row) => {
+      const rowId = String(row?.rowId || '');
+      if (rowId) _contactReviewMap.set(rowId, { ...row });
+    });
+    if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
+    if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
+    if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
+    if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
+    if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
+    if (r.settings?.pgyCooperationType) _contactPgyCooperationType = r.settings.pgyCooperationType;
+    if (r.settings?.pgyBrandName !== undefined) _contactPgyBrandName = r.settings.pgyBrandName;
+    if (r.settings?.pgyProductName !== undefined) _contactPgyProductName = r.settings.pgyProductName;
+    if (r.settings?.pgyContactWay !== undefined) _contactPgyContactWay = r.settings.pgyContactWay;
+    if (r.settings?.pgyIntro !== undefined) _contactPgyIntro = r.settings.pgyIntro;
+    if (r.settings?.pgyPublishStart !== undefined) _contactPgyPublishStart = r.settings.pgyPublishStart;
+    if (r.settings?.pgyPublishEnd !== undefined) _contactPgyPublishEnd = r.settings.pgyPublishEnd;
+    _contactLoadedRunDir = _selectedRunDir;
+  } catch (_) {
+    // keep unsaved in-memory edits if load fails
+  }
+}
+
+async function saveContactReviewNow() {
+  if (!_selectedRunDir) return null;
+  return window.desktopAPI.exports.saveContactReview({
+    runDir: _selectedRunDir,
+    reviewRows: getReviewRows(),
+    settings: getContactSettings()
+  });
+}
+
+async function importContactReviewWorkbookNow() {
+  if (!_contactPreviewRows.length) {
+    setMsg('请先刷新复核预览，再导入建联复核表。');
+    return;
+  }
+  const r = await window.desktopAPI.exports.importContactReviewWorkbook();
+  if (r?.canceled) return;
+  if (!r?.ok) {
+    setMsg(`导入复核表失败：${r?.error || 'unknown error'}`);
+    return;
+  }
+  const byUrl = new Map();
+  _contactPreviewRows.forEach((row) => {
+    const url = normalizeContactUrl(row.creatorUrl);
+    if (url) byUrl.set(url, row);
+  });
+  let updated = 0;
+  const unmatchedRows = [];
+  (Array.isArray(r.rows) ? r.rows : []).forEach((row) => {
+    const preview = byUrl.get(normalizeContactUrl(row.creatorUrl));
+    if (!preview) {
+      unmatchedRows.push(row);
+      return;
+    }
+    const review = ensureReviewRow(preview);
+    if (!review) return;
+    review.selected = row.selected !== false;
+    review.followupStatus = row.followupStatus || defaultFollowupStatus(review);
+    review.priority = row.priority || '';
+    review.excludeReason = row.excludeReason || '';
+    review.note = row.note || '';
+    review.email = row.email || '';
+    review.wechatId = row.wechatId || '';
+    review.phone = row.phone || '';
+    review.contactChannel = normalizeContactChannel(row.contactChannel || review.contactChannel || _contactChannelStrategy);
+    updated += 1;
+  });
+  await saveContactReviewNow();
+  setContactSaveStatus(`已导入并保存 ${new Date().toLocaleTimeString()}`);
+  const unmatchedHint = unmatchedRows.length
+    ? `\n\n未匹配示例：\n${unmatchedRows.slice(0, 5).map((row) => `- 第${row.rowIndex || '?'}行 ${row.creatorName || ''} ${row.creatorUrl || ''}`).join('\n')}`
+    : '';
+  const sheets = Array.isArray(r.sheetNames) && r.sheetNames.length ? r.sheetNames.join('、') : (r.sheetName || '未知工作表');
+  setMsg(`导入复核表完成：工作表 ${sheets}，读取 ${r.stats?.matchedRows ?? 0} 行，更新 ${updated} 行，未匹配 ${unmatchedRows.length} 行。${unmatchedHint}`);
+}
+
+function scheduleContactReviewSave() {
+  if (!_selectedRunDir) return;
+  if (_contactSaveTimer) clearTimeout(_contactSaveTimer);
+  _contactSaveStatus = '等待自动保存';
+  _contactSaveTimer = setTimeout(async () => {
+    _contactSaveTimer = null;
+    try {
+      setContactSaveStatus('保存中...');
+      await saveContactReviewNow();
+      setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
+    } catch (_) {
+      setContactSaveStatus('自动保存失败，请手动保存复核');
+    }
+  }, 500);
+}
+
+async function refreshContactPreview() {
+  if (!_selectedRunDir) {
+    _contactPreviewRows = [];
+    _contactPreviewRunDir = '';
+    _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
+    return;
+  }
+  setMsg('加载建联复核预览中...');
+  try {
+    await loadContactReviewForRun();
+    const r = await window.desktopAPI.exports.getContactPreview({
+      runDir: _selectedRunDir,
+      defaultGroupTag: _contactGroupTag,
+      defaultGreeting: _contactGreeting,
+      ...getContactSettings(),
+      reviewRows: getReviewRows()
+    });
+    if (!r?.ok) {
+      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: r?.error || 'unknown error' };
+      setMsg(`加载复核预览失败：${r?.error || 'unknown error'}`);
+      return;
+    }
+    _contactPreviewRows = Array.isArray(r.rows) ? r.rows : [];
+    _contactPreviewMeta = {
+      rawFiles: Number(r.rawFiles || 0),
+      files: Number(r.files || _contactPreviewRows.length || 0),
+      loaded: true,
+      error: ''
+    };
+    _contactPreviewRunDir = _selectedRunDir;
+    _contactPreviewRows.forEach((row) => ensureReviewRow(row));
+    _contactSaveStatus = '';
+    setMsg('');
+  } catch (e) {
+    _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: e?.message || String(e) };
+    setMsg(`加载复核预览异常：${e?.message || String(e)}`);
+  }
+}
+
 export function renderExports(state) {
+  const requestedRunDir = state.exports?.selectedRunDir || '';
+  if (requestedRunDir && requestedRunDir !== _selectedRunDir) {
+    _selectedRunDir = requestedRunDir;
+    resetContactPreviewState();
+    _autoPreviewRequestedRunDir = '';
+  }
+
   const root = document.createElement('div');
   root.className = 'view';
 
   const title = document.createElement('h2');
-  title.textContent = '结果 & 导出';
+  title.textContent = '建联工作台';
   root.appendChild(title);
 
   const desc = document.createElement('p');
-  desc.textContent = '选择一个 runs/run_* 目录，将其下所有子任务的 raw_result.json 汇总导出为 Excel。支持：①媒介资源表（达人一行，Top10 笔记列）②达人汇总+笔记明细（两张表）。';
+  desc.textContent = '选一批采集结果，先复核哪些达人要建联，再导出给团队或小蜜蜂使用的 Excel。';
   root.appendChild(desc);
 
   // 首次进入：加载 runs + 列定义/上次选择
@@ -88,18 +560,17 @@ export function renderExports(state) {
   if (!_colsLoadedOnce) {
     setTimeout(() => ensureColumnsLoaded().then(() => store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } })), 0);
   }
+  if (_selectedRunDir && _contactPreviewRunDir !== _selectedRunDir && _autoPreviewRequestedRunDir !== _selectedRunDir) {
+    _autoPreviewRequestedRunDir = _selectedRunDir;
+    setTimeout(() => refreshContactPreview().then(() => store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } })), 0);
+  }
 
   const bar = document.createElement('div');
-  bar.style.display = 'flex';
-  bar.style.flexWrap = 'wrap';
-  bar.style.gap = '10px';
-  bar.style.alignItems = 'center';
-  bar.style.margin = '10px 0 10px 0';
+  bar.className = 'export-run-card';
 
   const sel = document.createElement('select');
   sel.className = 'tpl-input';
-  sel.style.maxWidth = '560px';
-  sel.style.height = '34px';
+  sel.style.height = '38px';
   (_runs || []).forEach((it) => {
     const opt = document.createElement('option');
     opt.value = it.path;
@@ -109,12 +580,14 @@ export function renderExports(state) {
   });
   sel.addEventListener('change', () => {
     _selectedRunDir = sel.value;
+    resetContactPreviewState();
+    _autoPreviewRequestedRunDir = '';
   });
 
   const btnRefresh = document.createElement('button');
   btnRefresh.className = 'btn ghost';
-  btnRefresh.style.height = '34px';
-  btnRefresh.textContent = '刷新';
+  btnRefresh.style.height = '38px';
+  btnRefresh.textContent = '刷新结果';
   btnRefresh.addEventListener('click', async () => {
     await refreshRuns();
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -122,8 +595,8 @@ export function renderExports(state) {
 
   const btnExport = document.createElement('button');
   btnExport.className = 'btn ghost';
-  btnExport.style.height = '34px';
-  btnExport.textContent = '导出 Excel（两张表）';
+  btnExport.style.height = '38px';
+  btnExport.textContent = '导出原始明细';
   btnExport.addEventListener('click', async () => {
     setMsg('导出中...');
     try {
@@ -140,8 +613,8 @@ export function renderExports(state) {
 
   const btnExportResource = document.createElement('button');
   btnExportResource.className = 'btn primary';
-  btnExportResource.style.height = '34px';
-  btnExportResource.textContent = '导出媒介资源表（达人一行）';
+  btnExportResource.style.height = '38px';
+  btnExportResource.textContent = '导出达人资源表';
   btnExportResource.addEventListener('click', async () => {
     setMsg('导出中...');
     try {
@@ -159,20 +632,778 @@ export function renderExports(state) {
 
   const btnOpenRun = document.createElement('button');
   btnOpenRun.className = 'btn ghost';
-  btnOpenRun.style.height = '34px';
-  btnOpenRun.textContent = '打开 run 目录';
+  btnOpenRun.style.height = '38px';
+  btnOpenRun.textContent = '打开文件夹';
   btnOpenRun.disabled = !_selectedRunDir;
   btnOpenRun.addEventListener('click', async () => {
     const r = await window.desktopAPI.exports.openPath(_selectedRunDir);
     if (!r?.ok) alert(`打开失败：${r?.error || 'unknown error'}`);
   });
 
-  bar.appendChild(sel);
-  bar.appendChild(btnRefresh);
-  bar.appendChild(btnExportResource);
-  bar.appendChild(btnExport);
-  bar.appendChild(btnOpenRun);
+  const runMain = document.createElement('div');
+  runMain.className = 'export-run-main';
+  const runLabel = document.createElement('div');
+  runLabel.className = 'export-section-kicker';
+  runLabel.textContent = '当前结果';
+  runMain.appendChild(runLabel);
+  runMain.appendChild(sel);
+
+  const runActions = document.createElement('div');
+  runActions.className = 'export-run-actions';
+  runActions.appendChild(btnRefresh);
+  runActions.appendChild(btnExportResource);
+  runActions.appendChild(btnExport);
+  runActions.appendChild(btnOpenRun);
+
+  bar.appendChild(runMain);
+  bar.appendChild(runActions);
   root.appendChild(bar);
+
+  const contactSec = document.createElement('div');
+  contactSec.className = 'card export-workbench';
+  contactSec.style.marginTop = '14px';
+
+  const contactHead = document.createElement('div');
+  contactHead.className = 'export-workbench-head';
+
+  const contactTitle = document.createElement('div');
+  contactTitle.className = 'export-workbench-title';
+  contactTitle.textContent = '达人复核与建联表';
+  const contactHint = document.createElement('div');
+  contactHint.className = 'export-workbench-hint';
+  contactHint.textContent = '勾选要建联的人，选择执行通道。系统会把名单分成蒲公英邀约、邮件建联、小蜜蜂导入和待补联系方式。';
+  contactHead.appendChild(contactTitle);
+  contactHead.appendChild(contactHint);
+  contactSec.appendChild(contactHead);
+
+  const contactGrid = document.createElement('div');
+  contactGrid.className = 'export-settings-grid';
+
+  const strategyWrap = document.createElement('label');
+  strategyWrap.className = 'field-label';
+  strategyWrap.textContent = '默认建联方式';
+  const strategySelect = document.createElement('select');
+  strategySelect.className = 'tpl-input';
+  CONTACT_CHANNEL_OPTIONS.forEach((value) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = value;
+    if (value === _contactChannelStrategy) opt.selected = true;
+    strategySelect.appendChild(opt);
+  });
+  strategySelect.addEventListener('change', () => {
+    _contactChannelStrategy = normalizeContactChannel(strategySelect.value);
+    _contactPreviewRows.forEach((row) => {
+      const review = ensureReviewRow(row);
+      if (review && normalizeContactChannel(review.contactChannel) === '自动分流') {
+        review.contactChannel = _contactChannelStrategy;
+      }
+    });
+    scheduleContactReviewSave();
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+  strategyWrap.appendChild(strategySelect);
+
+  const groupWrap = document.createElement('label');
+  groupWrap.className = 'field-label';
+  groupWrap.textContent = '微信分组标签';
+  const groupInput = document.createElement('input');
+  groupInput.className = 'tpl-input';
+  groupInput.placeholder = '例如 FILA';
+  groupInput.value = _contactGroupTag;
+  groupInput.addEventListener('input', () => {
+    _contactGroupTag = groupInput.value;
+    scheduleContactReviewSave();
+  });
+  groupWrap.appendChild(groupInput);
+
+  const greetingWrap = document.createElement('label');
+  greetingWrap.className = 'field-label';
+  greetingWrap.textContent = '默认打招呼内容';
+  const greetingInput = document.createElement('input');
+  greetingInput.className = 'tpl-input';
+  greetingInput.placeholder = '用于建联表和小蜜蜂导入表';
+  greetingInput.value = _contactGreeting;
+  greetingInput.addEventListener('input', () => {
+    _contactGreeting = greetingInput.value;
+    scheduleContactReviewSave();
+  });
+  greetingWrap.appendChild(greetingInput);
+
+  const btnExportContact = document.createElement('button');
+  btnExportContact.className = 'btn primary';
+  btnExportContact.className = 'btn primary export-main-cta';
+  btnExportContact.textContent = '导出建联表';
+  btnExportContact.addEventListener('click', async () => {
+    setMsg('导出建联表中...');
+    try {
+      await saveContactReviewNow();
+      const r = await window.desktopAPI.exports.exportContactRun({
+        runDir: _selectedRunDir,
+        ...getContactSettings(),
+        reviewRows: getReviewRows()
+      });
+      if (!r?.ok) {
+        setMsg(`导出失败：${r?.error || 'unknown error'}`);
+        return;
+      }
+      _lastContactExportPath = r.outPath || '';
+      const statusCounts = formatFollowupStatusCounts(r.summary?.followupStatusCounts);
+      const statusLine = statusCounts ? `\n跟进状态：${statusCounts}` : '';
+      setMsg(`导出成功：\n${r.outPath}\n\n统计：raw_result.json=${r.files}，建联达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}${statusLine}`);
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    } catch (e) {
+      setMsg(`导出异常：${e?.message || String(e)}`);
+    }
+  });
+
+  contactGrid.appendChild(strategyWrap);
+  contactGrid.appendChild(groupWrap);
+  contactGrid.appendChild(greetingWrap);
+
+  const emailWrap = document.createElement('label');
+  emailWrap.className = 'field-label';
+  emailWrap.textContent = '邮件标题';
+  const emailSubjectInput = document.createElement('input');
+  emailSubjectInput.className = 'tpl-input';
+  emailSubjectInput.placeholder = '例如 品牌合作沟通';
+  emailSubjectInput.value = _contactEmailSubject;
+  emailSubjectInput.addEventListener('input', () => {
+    _contactEmailSubject = emailSubjectInput.value;
+    scheduleContactReviewSave();
+  });
+  emailWrap.appendChild(emailSubjectInput);
+
+  const emailBodyWrap = document.createElement('label');
+  emailBodyWrap.className = 'field-label wide';
+  emailBodyWrap.textContent = '邮件正文';
+  const emailBodyInput = document.createElement('textarea');
+  emailBodyInput.className = 'tpl-input';
+  emailBodyInput.placeholder = '导出到邮件建联表，暂不自动发送。';
+  emailBodyInput.value = _contactEmailBody;
+  emailBodyInput.addEventListener('input', () => {
+    _contactEmailBody = emailBodyInput.value;
+    scheduleContactReviewSave();
+  });
+  emailBodyWrap.appendChild(emailBodyInput);
+
+  const pgyGrid = document.createElement('div');
+  pgyGrid.className = 'contact-strategy-grid';
+  const pgyFields = [
+    ['合作类型', _contactPgyCooperationType, (v) => { _contactPgyCooperationType = v; }, '图文 / 视频'],
+    ['品牌名', _contactPgyBrandName, (v) => { _contactPgyBrandName = v; }, '例如 多芬'],
+    ['产品名称', _contactPgyProductName, (v) => { _contactPgyProductName = v; }, '例如 沐浴露'],
+    ['联系方式', _contactPgyContactWay, (v) => { _contactPgyContactWay = v; }, '微信 / 邮箱'],
+    ['开始时间', _contactPgyPublishStart, (v) => { _contactPgyPublishStart = v; }, 'YYYY-MM-DD'],
+    ['结束时间', _contactPgyPublishEnd, (v) => { _contactPgyPublishEnd = v; }, 'YYYY-MM-DD']
+  ];
+  pgyFields.forEach(([label, value, setter, placeholder]) => {
+    const wrap = document.createElement('label');
+    wrap.className = 'field-label compact';
+    wrap.textContent = label;
+    const input = document.createElement('input');
+    input.className = 'tpl-input';
+    input.placeholder = placeholder;
+    input.value = value;
+    input.addEventListener('input', () => {
+      setter(input.value);
+      scheduleContactReviewSave();
+    });
+    wrap.appendChild(input);
+    pgyGrid.appendChild(wrap);
+  });
+  const pgyIntroWrap = document.createElement('label');
+  pgyIntroWrap.className = 'field-label compact wide';
+  pgyIntroWrap.textContent = '蒲公英邀约内容';
+  const pgyIntroInput = document.createElement('textarea');
+  pgyIntroInput.className = 'tpl-input';
+  pgyIntroInput.placeholder = '导出到蒲公英邀约表，人工复制或后续交给 RPA。';
+  pgyIntroInput.value = _contactPgyIntro;
+  pgyIntroInput.addEventListener('input', () => {
+    _contactPgyIntro = pgyIntroInput.value;
+    scheduleContactReviewSave();
+  });
+  pgyIntroWrap.appendChild(pgyIntroInput);
+  pgyGrid.appendChild(pgyIntroWrap);
+  pgyGrid.appendChild(emailWrap);
+  pgyGrid.appendChild(emailBodyWrap);
+
+  const filteredContactRows = getContactFilteredRows();
+  const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
+  const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
+
+  const metrics = document.createElement('div');
+  metrics.className = 'export-metrics';
+  metrics.appendChild(makeMetricCard('已选建联', _contactPreviewRows.length ? `${allReviewSummary.selected}/${_contactPreviewRows.length}` : '-'));
+  metrics.appendChild(makeMetricCard('蒲公英邀约', _contactPreviewRows.length ? String(allReviewSummary.pgyInvite) : '-', 'good'));
+  metrics.appendChild(makeMetricCard('邮件建联', _contactPreviewRows.length ? String(allReviewSummary.email) : '-', 'good'));
+  metrics.appendChild(makeMetricCard('小蜜蜂导入', _contactPreviewRows.length ? String(allReviewSummary.wechat) : '-', 'good'));
+  metrics.appendChild(makeMetricCard('待补联系方式', _contactPreviewRows.length ? String(allReviewSummary.pending) : '-', allReviewSummary.pending ? 'warn' : ''));
+  contactSec.appendChild(metrics);
+
+  const contactSettings = createAdvancedSection({
+    title: '建联策略与话术',
+    children: [contactGrid, pgyGrid]
+  });
+  contactSettings.classList.add('contact-settings-section');
+  contactSec.appendChild(contactSettings);
+
+  const reviewTop = document.createElement('div');
+  reviewTop.className = 'export-review-toolbar';
+
+  const reviewStat = document.createElement('div');
+  reviewStat.className = 'export-review-summary';
+  reviewStat.textContent = _contactPreviewRows.length
+    ? `当前筛选：${filteredReviewSummary.total} 人，蒲公英邀约 ${filteredReviewSummary.pgyInvite} 人，邮件 ${filteredReviewSummary.email} 人，小蜜蜂 ${filteredReviewSummary.wechat} 人，待补 ${filteredReviewSummary.pending} 人`
+    : '还没有复核名单。点击“刷新名单”后可以逐个决定是否建联。';
+
+  const btnPreview = document.createElement('button');
+  btnPreview.className = 'btn ghost';
+  btnPreview.style.height = '34px';
+  btnPreview.textContent = '刷新名单';
+  btnPreview.addEventListener('click', async () => {
+    await refreshContactPreview();
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+
+  const btnSaveReview = document.createElement('button');
+  btnSaveReview.className = 'btn ghost';
+  btnSaveReview.style.height = '34px';
+  btnSaveReview.textContent = '保存';
+  btnSaveReview.disabled = !_contactPreviewRows.length;
+  btnSaveReview.addEventListener('click', async () => {
+    try {
+      setContactSaveStatus('保存中...');
+      await saveContactReviewNow();
+      setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
+    } catch (e) {
+      setContactSaveStatus(`保存失败：${e?.message || String(e)}`);
+    }
+  });
+
+  const btnImportReview = document.createElement('button');
+  btnImportReview.className = 'btn ghost';
+  btnImportReview.style.height = '34px';
+  btnImportReview.textContent = '导入修改后的表';
+  btnImportReview.disabled = !_contactPreviewRows.length;
+  btnImportReview.addEventListener('click', async () => {
+    try {
+      setContactSaveStatus('导入复核表中...');
+      await importContactReviewWorkbookNow();
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    } catch (e) {
+      setContactSaveStatus(`导入失败：${e?.message || String(e)}`);
+    }
+  });
+
+  const btnSelectAllContact = document.createElement('button');
+  btnSelectAllContact.className = 'btn ghost';
+  btnSelectAllContact.style.height = '34px';
+  btnSelectAllContact.textContent = '全部要建联';
+  btnSelectAllContact.disabled = !_contactPreviewRows.length;
+  btnSelectAllContact.addEventListener('click', () => {
+    _contactPreviewRows.forEach((row) => {
+      const review = ensureReviewRow(row);
+      if (review) {
+        markReviewSelected(review);
+      }
+    });
+    scheduleContactReviewSave();
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+
+  const btnUnselectAllContact = document.createElement('button');
+  btnUnselectAllContact.className = 'btn ghost';
+  btnUnselectAllContact.style.height = '34px';
+  btnUnselectAllContact.textContent = '全部暂不建联';
+  btnUnselectAllContact.disabled = !_contactPreviewRows.length;
+  btnUnselectAllContact.addEventListener('click', () => {
+    _contactPreviewRows.forEach((row) => {
+      const review = ensureReviewRow(row);
+      markReviewExcluded(review);
+    });
+    scheduleContactReviewSave();
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+
+  reviewTop.appendChild(reviewStat);
+  reviewTop.appendChild(btnExportContact);
+  reviewTop.appendChild(btnPreview);
+  reviewTop.appendChild(btnSaveReview);
+  const btnOpenLastContact = document.createElement('button');
+  btnOpenLastContact.className = 'btn ghost';
+  btnOpenLastContact.style.height = '34px';
+  btnOpenLastContact.textContent = '打开最近建联表';
+  btnOpenLastContact.disabled = !_lastContactExportPath;
+  btnOpenLastContact.addEventListener('click', async () => {
+    const r = await window.desktopAPI.exports.openPath(_lastContactExportPath);
+    if (!r?.ok) setMsg(`打开最近建联表失败：${r?.error || 'unknown error'}`);
+  });
+  reviewTop.appendChild(btnOpenLastContact);
+  if (_contactSaveStatus) {
+    const saveStatus = document.createElement('div');
+    saveStatus.className = 'muted-line';
+    saveStatus.textContent = _contactSaveStatus;
+    reviewTop.appendChild(saveStatus);
+  }
+  contactSec.appendChild(reviewTop);
+
+  if (_contactPreviewRows.length) {
+    const reviewBatchActions = document.createElement('div');
+    reviewBatchActions.className = 'export-filter-actions';
+    reviewBatchActions.appendChild(btnImportReview);
+    reviewBatchActions.appendChild(btnSelectAllContact);
+    reviewBatchActions.appendChild(btnUnselectAllContact);
+    const reviewBatchDetails = createAdvancedSection({
+      title: '整张名单批量处理',
+      children: [reviewBatchActions]
+    });
+    reviewBatchDetails.classList.add('bulk-actions-section');
+    contactSec.appendChild(reviewBatchDetails);
+  }
+
+  if (_contactPreviewRows.length) {
+    const filterBar = document.createElement('div');
+    filterBar.className = 'export-filter-bar';
+
+    const searchInput = document.createElement('input');
+    searchInput.className = 'tpl-input';
+    searchInput.style.height = '36px';
+    searchInput.placeholder = '搜索昵称 / 小红书号 / 标签 / 备注';
+    searchInput.value = _contactSearch;
+    searchInput.addEventListener('input', () => {
+      _contactSearch = searchInput.value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    });
+
+    const mkSelect = (value, options, onChange) => {
+      const selFilter = document.createElement('select');
+      selFilter.className = 'tpl-input';
+      selFilter.style.height = '36px';
+      options.forEach(([v, label]) => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = label;
+        if (v === value) opt.selected = true;
+        selFilter.appendChild(opt);
+      });
+      selFilter.addEventListener('change', () => onChange(selFilter.value));
+      return selFilter;
+    };
+
+    filterBar.appendChild(searchInput);
+    filterBar.appendChild(mkSelect(_contactStatusFilter, [
+      ['all', '全部状态'],
+      ['selected', '已选建联'],
+      ['excluded', '已排除']
+    ], (value) => {
+      _contactStatusFilter = value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterBar.appendChild(mkSelect(_contactContactFilter, [
+      ['all', '全部联系方式'],
+      ['missing', '缺联系方式'],
+      ['filled', '已有联系方式']
+    ], (value) => {
+      _contactContactFilter = value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterBar.appendChild(mkSelect(_contactPriorityFilter, [
+      ['all', '全部优先级'],
+      ['priority', '有优先级'],
+      ['none', '无优先级']
+    ], (value) => {
+      _contactPriorityFilter = value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterBar.appendChild(mkSelect(_contactFollowupFilter, [
+      ['all', '全部跟进状态'],
+      ...FOLLOWUP_STATUS_OPTIONS.map((value) => [value, value])
+    ], (value) => {
+      _contactFollowupFilter = value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterBar.appendChild(mkSelect(_contactChannelFilter, [
+      ['all', '全部建联方式'],
+      ...CONTACT_CHANNEL_OPTIONS.filter((value) => value !== '自动分流').map((value) => [value, value])
+    ], (value) => {
+      _contactChannelFilter = value;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    contactSec.appendChild(filterBar);
+
+    const filterActions = document.createElement('div');
+    filterActions.className = 'export-filter-actions';
+
+    const mkFilterBtn = (label, onClick) => {
+      const b = document.createElement('button');
+      b.className = 'btn ghost';
+      b.style.height = '32px';
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    filterActions.appendChild(mkFilterBtn('当前结果全选', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        if (review) {
+          markReviewSelected(review);
+        }
+      });
+      scheduleContactReviewSave();
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterActions.appendChild(mkFilterBtn('当前结果全不选', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        markReviewExcluded(review);
+      });
+      scheduleContactReviewSave();
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    filterActions.appendChild(mkFilterBtn('复制当前链接', async () => {
+      const text = filteredContactRows.map((row) => row.creatorUrl).filter(Boolean).join('\n');
+      if (!text) {
+        setMsg('当前筛选结果没有可复制的蒲公英链接。');
+        return;
+      }
+      const ok = await copyTextWithFallback(text);
+      if (ok) setMsg(`已复制当前筛选结果链接：${filteredContactRows.length} 条`);
+    }));
+    filterActions.appendChild(mkFilterBtn('复制当前摘要', async () => {
+      const text = buildContactReviewSummaryText(filteredContactRows);
+      if (!text) {
+        setMsg('当前筛选结果没有可复制的摘要。');
+        return;
+      }
+      const ok = await copyTextWithFallback(text);
+      if (ok) setMsg(`已复制当前筛选结果摘要：${filteredContactRows.length} 条`);
+    }));
+    filterActions.appendChild(mkFilterBtn('导出当前Excel', async () => {
+      if (!filteredContactRows.length) {
+        setMsg('当前筛选结果为空，无法导出。');
+        return;
+      }
+      try {
+        await saveContactReviewNow();
+        const r = await window.desktopAPI.exports.exportContactSelection({
+          runDir: _selectedRunDir,
+          suffix: buildContactSelectionExportSuffix(),
+          rows: buildExportRowsFromContactRows(filteredContactRows),
+          ...getContactSettings()
+        });
+        if (!r?.ok) {
+          setMsg(`导出当前筛选失败：${r?.error || 'unknown error'}`);
+          return;
+        }
+        _lastContactExportPath = r.outPath || '';
+        setMsg(`导出当前筛选成功：\n${r.outPath}\n\n统计：达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}`);
+        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+      } catch (e) {
+        setMsg(`导出当前筛选异常：${e?.message || String(e)}`);
+      }
+    }));
+    filterActions.appendChild(mkFilterBtn('清空筛选', () => {
+      _contactSearch = '';
+      _contactStatusFilter = 'all';
+      _contactContactFilter = 'all';
+      _contactPriorityFilter = 'all';
+      _contactFollowupFilter = 'all';
+      _contactChannelFilter = 'all';
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    const batchFollowup = document.createElement('select');
+    batchFollowup.className = 'tpl-input';
+    batchFollowup.style.height = '32px';
+    batchFollowup.style.width = '132px';
+    FOLLOWUP_STATUS_OPTIONS.forEach((value) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = value;
+      if (value === _contactBatchFollowupStatus) opt.selected = true;
+      batchFollowup.appendChild(opt);
+    });
+    batchFollowup.addEventListener('change', () => {
+      _contactBatchFollowupStatus = batchFollowup.value;
+    });
+    filterActions.appendChild(batchFollowup);
+    filterActions.appendChild(mkFilterBtn('当前结果改状态', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        if (!review) return;
+        review.followupStatus = _contactBatchFollowupStatus;
+        if (_contactBatchFollowupStatus === '不建联') review.selected = false;
+        else if (review.selected === false) review.selected = true;
+      });
+      scheduleContactReviewSave();
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
+    const bulkDetails = createAdvancedSection({
+      title: `批量处理当前筛选结果（${filteredContactRows.length} 人）`,
+      children: [filterActions]
+    });
+    bulkDetails.classList.add('bulk-actions-section');
+    contactSec.appendChild(bulkDetails);
+  }
+
+  if (_contactPreviewRunDir !== _selectedRunDir || !_contactPreviewRows.length) {
+    const emptyState = document.createElement('div');
+    emptyState.style.color = 'var(--muted)';
+    emptyState.style.fontSize = '12px';
+    emptyState.style.marginTop = '8px';
+    emptyState.style.padding = '10px 12px';
+    emptyState.style.border = '1px solid var(--line)';
+    emptyState.style.borderRadius = '10px';
+    emptyState.style.background = 'rgba(17,24,39,0.02)';
+
+    if (!_selectedRunDir) {
+      emptyState.textContent = '请选择一个 run 目录。';
+    } else if (_contactPreviewMeta.error) {
+      emptyState.textContent = `复核预览加载失败：${_contactPreviewMeta.error}`;
+    } else if (_contactPreviewRunDir !== _selectedRunDir && !_contactPreviewMeta.loaded) {
+      emptyState.textContent = '正在准备建联复核预览；如果没有自动出现，请点击“刷新复核预览”。';
+    } else if (_contactPreviewMeta.loaded && !_contactPreviewMeta.rawFiles) {
+      emptyState.textContent = '这个 run 目录下还没有 raw_result.json。请先完成采集，或确认选择的是包含子任务结果的 run 目录。';
+    } else if (_contactPreviewMeta.loaded && _contactPreviewMeta.rawFiles && !_contactPreviewRows.length) {
+      emptyState.textContent = `已找到 ${_contactPreviewMeta.rawFiles} 个 raw_result.json，但没有生成可复核达人。请检查采集结果里的 creator_summary 字段。`;
+    } else {
+      emptyState.textContent = '当前筛选条件下没有达人。';
+    }
+    contactSec.appendChild(emptyState);
+  }
+
+  if (_contactPreviewRows.length) {
+    const reviewList = document.createElement('div');
+    reviewList.className = 'contact-review-list';
+
+    if (!filteredContactRows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'contact-review-empty';
+      empty.textContent = '当前筛选条件下没有达人。';
+      reviewList.appendChild(empty);
+    }
+
+    filteredContactRows.forEach((row) => {
+      const review = ensureReviewRow(row);
+      const card = document.createElement('div');
+      card.className = `contact-review-card ${review?.selected === false ? 'is-excluded' : ''}`;
+
+      const main = document.createElement('div');
+      main.className = 'contact-review-main';
+
+      const selectedWrap = document.createElement('label');
+      selectedWrap.className = 'contact-review-check';
+      const selectedInput = document.createElement('input');
+      selectedInput.type = 'checkbox';
+      selectedInput.checked = review?.selected !== false;
+      selectedInput.addEventListener('change', () => {
+        if (!review) return;
+        if (selectedInput.checked) markReviewSelected(review);
+        else markReviewExcluded(review);
+        scheduleContactReviewSave();
+        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+      });
+      const selectedText = document.createElement('span');
+      selectedText.textContent = review?.selected === false ? '暂不建联' : '要建联';
+      selectedWrap.appendChild(selectedInput);
+      selectedWrap.appendChild(selectedText);
+
+      const creatorBlock = document.createElement('div');
+      creatorBlock.className = 'contact-review-creator';
+      const creatorName = document.createElement('div');
+      creatorName.className = 'contact-review-name';
+      creatorName.textContent = row.creatorName || '(无昵称)';
+      const sub = document.createElement('div');
+      sub.className = 'muted-line';
+      sub.textContent = [row.xhsId, row.followers].filter(Boolean).join(' / ');
+      creatorBlock.appendChild(creatorName);
+      creatorBlock.appendChild(sub);
+
+      const reason = document.createElement('div');
+      reason.className = 'contact-review-reason';
+      reason.textContent = row.recommendation || '暂无推荐理由';
+
+      main.appendChild(selectedWrap);
+      main.appendChild(creatorBlock);
+      main.appendChild(reason);
+
+      const quickMeta = document.createElement('div');
+      quickMeta.className = 'contact-review-quick-meta';
+      const appendChip = (label, value, tone = '') => {
+        const chip = document.createElement('span');
+        chip.className = `contact-chip ${tone}`.trim();
+        chip.textContent = `${label}${value ? `：${value}` : ''}`;
+        quickMeta.appendChild(chip);
+      };
+      appendChip('跟进', defaultFollowupStatus(review));
+      appendChip('方式', getContactExecutionChannel(review), 'strong');
+      if (review?.priority) appendChip('优先级', review.priority, 'strong');
+      appendChip('邮箱', review?.email ? '已填' : '待补', review?.email ? 'good' : 'warn');
+      appendChip('微信', review?.wechatId ? '已填' : '待补', review?.wechatId ? 'good' : 'warn');
+      if (review?.phone) appendChip('手机', '已填', 'good');
+
+      const fields = document.createElement('div');
+      fields.className = 'contact-review-fields';
+
+      const followupField = document.createElement('label');
+      followupField.className = 'field-label compact';
+      followupField.textContent = '跟进';
+      const followup = document.createElement('select');
+      followup.className = 'tpl-input';
+      followup.style.height = '34px';
+      const currentFollowup = defaultFollowupStatus(review);
+      if (!FOLLOWUP_STATUS_OPTIONS.includes(currentFollowup)) {
+        const opt = document.createElement('option');
+        opt.value = currentFollowup;
+        opt.textContent = currentFollowup;
+        followup.appendChild(opt);
+      }
+      FOLLOWUP_STATUS_OPTIONS.forEach((value) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = value;
+        if (value === currentFollowup) opt.selected = true;
+        followup.appendChild(opt);
+      });
+      followup.addEventListener('change', () => {
+        if (!review) return;
+        review.followupStatus = followup.value;
+        if (followup.value === '不建联') review.selected = false;
+        else if (review.selected === false) review.selected = true;
+        scheduleContactReviewSave();
+        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+      });
+      followupField.appendChild(followup);
+
+      const channelField = document.createElement('label');
+      channelField.className = 'field-label compact';
+      channelField.textContent = '方式';
+      const channel = document.createElement('select');
+      channel.className = 'tpl-input';
+      channel.style.height = '34px';
+      CONTACT_CHANNEL_OPTIONS.forEach((value) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = value;
+        if (value === normalizeContactChannel(review?.contactChannel || _contactChannelStrategy)) opt.selected = true;
+        channel.appendChild(opt);
+      });
+      channel.addEventListener('change', () => {
+        if (!review) return;
+        review.contactChannel = normalizeContactChannel(channel.value);
+        scheduleContactReviewSave();
+        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+      });
+      channelField.appendChild(channel);
+
+      const priorityField = document.createElement('label');
+      priorityField.className = 'field-label compact';
+      priorityField.textContent = '优先级';
+      const priority = document.createElement('input');
+      priority.className = 'tpl-input';
+      priority.style.height = '34px';
+      priority.placeholder = 'P1';
+      priority.value = review?.priority || '';
+      priority.addEventListener('input', () => {
+        if (review) review.priority = priority.value;
+        scheduleContactReviewSave();
+      });
+      priorityField.appendChild(priority);
+
+      const emailField = document.createElement('label');
+      emailField.className = 'field-label compact';
+      emailField.textContent = '邮箱';
+      const email = document.createElement('input');
+      email.className = 'tpl-input';
+      email.style.height = '34px';
+      email.placeholder = '邮箱';
+      email.value = review?.email || '';
+      email.addEventListener('input', () => {
+        if (review) review.email = email.value;
+        scheduleContactReviewSave();
+      });
+      emailField.appendChild(email);
+
+      const wechatField = document.createElement('label');
+      wechatField.className = 'field-label compact';
+      wechatField.textContent = '微信';
+      const wechat = document.createElement('input');
+      wechat.className = 'tpl-input';
+      wechat.style.height = '34px';
+      wechat.placeholder = '微信号';
+      wechat.value = review?.wechatId || '';
+      wechat.addEventListener('input', () => {
+        if (review) review.wechatId = wechat.value;
+        scheduleContactReviewSave();
+      });
+      wechatField.appendChild(wechat);
+
+      const phoneField = document.createElement('label');
+      phoneField.className = 'field-label compact';
+      phoneField.textContent = '手机';
+      const phone = document.createElement('input');
+      phone.className = 'tpl-input';
+      phone.style.height = '34px';
+      phone.placeholder = '手机号';
+      phone.value = review?.phone || '';
+      phone.addEventListener('input', () => {
+        if (review) review.phone = phone.value;
+        scheduleContactReviewSave();
+      });
+      phoneField.appendChild(phone);
+
+      const excludeField = document.createElement('label');
+      excludeField.className = 'field-label compact wide';
+      excludeField.textContent = '不建联原因';
+      const exclude = document.createElement('input');
+      exclude.className = 'tpl-input';
+      exclude.style.height = '34px';
+      exclude.placeholder = '不选时填写';
+      exclude.value = review?.excludeReason || '';
+      exclude.addEventListener('input', () => {
+        if (review) review.excludeReason = exclude.value;
+        scheduleContactReviewSave();
+      });
+      excludeField.appendChild(exclude);
+
+      const noteField = document.createElement('label');
+      noteField.className = 'field-label compact wide';
+      noteField.textContent = '备注';
+      const note = document.createElement('input');
+      note.className = 'tpl-input';
+      note.style.height = '34px';
+      note.placeholder = '跟进备注';
+      note.value = review?.note || '';
+      note.addEventListener('input', () => {
+        if (review) review.note = note.value;
+        scheduleContactReviewSave();
+      });
+      noteField.appendChild(note);
+
+      fields.appendChild(followupField);
+      fields.appendChild(channelField);
+      fields.appendChild(priorityField);
+      fields.appendChild(emailField);
+      fields.appendChild(wechatField);
+      fields.appendChild(phoneField);
+      fields.appendChild(excludeField);
+      fields.appendChild(noteField);
+
+      const detail = document.createElement('details');
+      detail.className = 'contact-review-detail';
+      const detailSummary = document.createElement('summary');
+      detailSummary.textContent = '编辑跟进信息';
+      detail.appendChild(detailSummary);
+      detail.appendChild(fields);
+
+      card.appendChild(main);
+      card.appendChild(quickMeta);
+      card.appendChild(detail);
+      reviewList.appendChild(card);
+    });
+    contactSec.appendChild(reviewList);
+  }
+  root.appendChild(contactSec);
 
   // 二次导出：按列勾选（两栏 + sticky 操作条）
   const sec = document.createElement('div');

@@ -1,4 +1,5 @@
 import { store } from '../state/store.js';
+import { createAdvancedSection, createMetricCard, createNotice, createPageIntro } from '../ui/components.js';
 
 let _msgs = [
   { role: 'assistant', content: '把你的需求直接发我：比如“筛选粉丝5-20w、互动率>3%、报价<8000的美妆达人”。我会先同步历史数据，然后用数据库查询再给你结论。' }
@@ -317,39 +318,23 @@ function bubble(m) {
 
 export function renderReport(state) {
   const root = document.createElement('div');
-  root.className = 'view';
+  root.className = 'view ai-report-view';
   root.style.display = 'flex';
   root.style.flexDirection = 'column';
   root.style.minHeight = 'calc(100vh - 120px)';
 
+  root.appendChild(createPageIntro({
+    title: 'AI 分析',
+    description: '把采集过的达人数据同步进本地库后，可以直接用自然语言筛选、对比和生成候选判断。'
+  }));
+
+  root.appendChild(createNotice({
+    text: '建议先同步历史数据，再提问。API Key 只保存在本机配置里，不要写进项目文件。',
+    tone: 'info'
+  }));
+
   const top = document.createElement('div');
-  top.className = 'card';
-  top.style.padding = '14px';
-  top.style.marginBottom = '12px';
-
-  const row1 = document.createElement('div');
-  row1.style.display = 'flex';
-  row1.style.flexWrap = 'wrap';
-  row1.style.gap = '10px';
-  row1.style.alignItems = 'center';
-  row1.style.justifyContent = 'space-between';
-
-  const left = document.createElement('div');
-  const h2 = document.createElement('h2');
-  h2.textContent = 'AI 对话分析';
-  h2.style.margin = '0 0 4px 0';
-  const p = document.createElement('div');
-  p.style.color = 'var(--muted)';
-  p.style.fontSize = '13px';
-  p.textContent = '支持 DeepSeek 官方 + OpenAI 兼容（例如 ai.comfly.chat）。建议先点“同步历史数据”。';
-  left.appendChild(h2);
-  left.appendChild(p);
-
-  const right = document.createElement('div');
-  right.style.display = 'flex';
-  right.style.flexWrap = 'wrap';
-  right.style.gap = '8px';
-  right.style.alignItems = 'center';
+  top.className = 'card ai-report-panel';
 
   const sel = document.createElement('select');
   sel.className = 'tpl-input';
@@ -423,44 +408,60 @@ export function renderReport(state) {
     store.set({ report: { ...(store.state.report || {}), _t: Date.now() } });
   });
 
-  right.appendChild(sel);
-  right.appendChild(selModel);
-  right.appendChild(btnModels);
-  right.appendChild(btnSync);
-  right.appendChild(btnKb);
-  right.appendChild(btnExport);
-  right.appendChild(btnCfg);
+  const primaryActions = document.createElement('div');
+  primaryActions.className = 'ai-report-actions';
+  primaryActions.appendChild(btnSync);
+  primaryActions.appendChild(btnExport);
 
-  row1.appendChild(left);
-  row1.appendChild(right);
-  top.appendChild(row1);
-
-  const stat = document.createElement('div');
-  stat.style.marginTop = '10px';
-  stat.style.color = 'var(--muted)';
-  stat.style.fontSize = '12px';
-  if (_dbStats?.ok) {
-    stat.textContent = `数据库：runs=${_dbStats.runs}，creators=${_dbStats.creators}，notes=${_dbStats.notes}`;
-  } else {
-    stat.textContent = '数据库：尚未加载统计（可先点同步）。';
-  }
-  top.appendChild(stat);
+  const statusGrid = document.createElement('div');
+  statusGrid.className = 'ai-status-grid';
+  statusGrid.appendChild(createMetricCard({
+    label: '采集任务',
+    value: _dbStats?.ok ? String(_dbStats.runs || 0) : '-'
+  }));
+  statusGrid.appendChild(createMetricCard({
+    label: '达人',
+    value: _dbStats?.ok ? String(_dbStats.creators || 0) : '-',
+    tone: _dbStats?.creators ? 'good' : ''
+  }));
+  statusGrid.appendChild(createMetricCard({
+    label: '笔记',
+    value: _dbStats?.ok ? String(_dbStats.notes || 0) : '-'
+  }));
+  statusGrid.appendChild(createMetricCard({
+    label: '知识库',
+    value: _kbStats?.builtAt ? String(_kbStats.docCount || 0) : '-',
+    tone: _kbStats?.builtAt ? 'good' : ''
+  }));
 
   const kbStat = document.createElement('div');
-  kbStat.style.marginTop = '6px';
-  kbStat.style.color = 'var(--muted)';
-  kbStat.style.fontSize = '12px';
+  kbStat.className = 'muted-line';
   if (_kbStats?.builtAt) {
-    kbStat.textContent = `知识库：doc=${_kbStats.docCount || 0}（更新于 ${_kbStats.builtAt}）`;
+    kbStat.textContent = `知识库最近更新：${_kbStats.builtAt}`;
   } else {
-    kbStat.textContent = '知识库：尚未构建（同步历史数据后会自动构建，也可手动点“重建知识库”）。';
+    kbStat.textContent = '知识库尚未构建。同步历史数据后会自动构建，也可以在高级设置里手动重建。';
   }
+
+  const advancedControls = document.createElement('div');
+  advancedControls.className = 'ai-advanced-controls';
+  advancedControls.appendChild(sel);
+  advancedControls.appendChild(selModel);
+  advancedControls.appendChild(btnModels);
+  advancedControls.appendChild(btnKb);
+  advancedControls.appendChild(btnCfg);
+
+  top.appendChild(primaryActions);
+  top.appendChild(statusGrid);
   top.appendChild(kbStat);
+  top.appendChild(createAdvancedSection({
+    title: '高级设置：模型、知识库和 API',
+    children: [advancedControls]
+  }));
 
   root.appendChild(top);
 
   const chat = document.createElement('div');
-  chat.className = 'card';
+  chat.className = 'card ai-chat-card';
   chat.style.padding = '12px';
   chat.style.flex = '1';
   chat.style.minHeight = '420px';

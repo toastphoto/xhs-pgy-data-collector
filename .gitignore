@@ -24,6 +24,7 @@ out/
 /recordings/
 /runs/
 /db/
+/tmp/
 /export_presets/
 content-analyzer/logs/
 content-analyzer/output/

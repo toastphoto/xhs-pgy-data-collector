@@ -14,13 +14,26 @@ try {
 }
 const { extractFromTemplate } = require('./lib/extract_dom');
 const { saveEvidence, safeName } = require('./lib/evidence');
-const { TaskRunner } = require('./lib/task_runner');
+const { ALLOWED_TASK_HOSTS, TaskRunner, isAllowedTaskUrl } = require('./lib/task_runner');
 const { buildQualityReport } = require('./lib/quality_report');
+const { exportCandidateWorkbook } = require('./lib/candidate_sheet');
+const { parseExcelToPgyItems: parsePgyExcelToItems } = require('./lib/pgy_excel');
+const { parseContactReviewWorkbook } = require('./lib/contact_review_excel');
+const { exportContactRowsWorkbook, exportContactWorkbook, getContactPreview } = require('./lib/contact_sheet');
 const { resolveInsideRoot, resolveInsideAny } = require('./lib/path_guard');
+const {
+  listSigningTasks,
+  saveSigningTask,
+  deleteSigningTask,
+  recordExecution,
+  listExecutionRecords
+} = require('./lib/signing_task_store');
+const { loadContactReview, saveContactReview } = require('./lib/contact_review_store');
 const { openDb, initDb, dbGet, dbAll } = require('./lib/db/sqlite');
 const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
 const { loadIndexFromDisk, rebuildKbFromDb, searchIndex } = require('./lib/kb/index');
+const { buildBrowserRiskDetectionSnippet } = require('./lib/pgy_risk');
 
 let mainWindow = null;
 let browserView = null;
@@ -34,11 +47,14 @@ let kbCache = { loaded: false, index: null, meta: null };
 let recordingEnabled = false;
 let currentRecording = [];
 
-const UI_WIDTH = 520;          // 左侧控制台默认宽度（renderer 可拖拽后动态更新）
+const UI_WIDTH = 820;          // 左侧工作台默认宽度（renderer 可拖拽后动态更新）
 const SPLITTER_WIDTH = 10;     // renderer 分割条宽度（px）
 const TOPBAR_HEIGHT = 56;      // 顶部工具栏高度（与 renderer 里保持一致）
 const DEFAULT_API_HOST = '127.0.0.1';
 const DEFAULT_API_PORT = '8010';
+const PGY_MIN_TAB_WAIT_MS = 2500;
+const PGY_ALLOW_NOTE_CLICK_RESOLVE = process.env.PGY_ALLOW_NOTE_CLICK_RESOLVE === 'true';
+const PGY_NOTE_CLICK_RESOLVE_LIMIT = 5;
 
 function getRecordingsDir() {
   const dir = path.join(app.getPath('userData'), 'recordings');
@@ -54,6 +70,18 @@ function getTemplatesDir() {
 
 function getRunsDir() {
   const dir = path.join(app.getPath('userData'), 'runs');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getSigningTasksDir() {
+  const dir = path.join(app.getPath('userData'), 'signing_tasks');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getContactReviewsDir() {
+  const dir = path.join(app.getPath('userData'), 'contact_reviews');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -487,7 +515,9 @@ async function resolveNoteUrlsByClick(webContents, notes, noteCardSelector, { ti
         if (t) lastClipboardSample = t.slice(0, 200);
       } catch (_) {}
 
-    } catch (_) {}
+    } catch (err) {
+      if (err?.riskDetected || err?.code === 'PGY_RISK_DETECTED') throw err;
+    }
     return null;
   };
 
@@ -652,7 +682,7 @@ function createMainWindow() {
     const [w, h] = mainWindow.getContentSize();
     const x = Math.round(uiWidth + SPLITTER_WIDTH);
     const y = TOPBAR_HEIGHT;
-    const width = Math.max(320, w - x);
+    const width = Math.max(420, w - x);
     const height = Math.max(240, h - TOPBAR_HEIGHT);
     browserView.setBounds({ x, y, width, height });
     // width 由我们根据 uiWidth 控制；height 跟随窗口即可
@@ -668,10 +698,10 @@ function createMainWindow() {
     try {
       const cw = Number(payload?.consoleWidth || 0);
       if (Number.isFinite(cw) && cw > 0) {
-        // 限制范围（保持右侧浏览器至少 320）
+        // 限制范围（保持右侧浏览区至少 420）
         const [w] = mainWindow.getContentSize();
-        const min = 420;
-        const max = Math.max(min, w - 320 - SPLITTER_WIDTH);
+        const min = 620;
+        const max = Math.max(min, w - 420 - SPLITTER_WIDTH);
         uiWidth = Math.max(min, Math.min(max, cw));
         applyBounds();
       }
@@ -687,6 +717,7 @@ function createMainWindow() {
     mainWindow?.webContents.send('browser:url', { url });
 
     if (!recordingEnabled) return;
+    if (!isAllowedTaskUrl(url)) return;
     currentRecording.push({
       t: Date.now(),
       type: 'navigate',
@@ -985,8 +1016,11 @@ async function pgyCheckLogin() {
             hasLogout
           );
 
+          const bodyText = String(document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 3000);
+          ${buildBrowserRiskDetectionSnippet('bodyText')}
+
           const loggedIn = !isLoginPage && hasUserEl;
-          return { ok: true, loggedIn, url, isLoginPage };
+          return { ok: true, loggedIn, url, isLoginPage, riskDetected, riskText };
         })()
       `,
       true
@@ -997,8 +1031,489 @@ async function pgyCheckLogin() {
   }
 }
 
+async function pgyDetectRiskOnCurrentPage(webContents) {
+  if (!webContents) return { ok: false, error: 'webContents 未初始化' };
+  try {
+    return await webContents.executeJavaScript(
+      `
+        (function(){
+          const bodyText = String(document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 3000);
+          ${buildBrowserRiskDetectionSnippet('bodyText')}
+          return {
+            ok: true,
+            riskDetected: Boolean(riskText),
+            riskText,
+            url: location.href
+          };
+        })()
+      `,
+      true
+    );
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+function rejectNonPgyCurrentPageForBrowserAutomation(actionLabel = '当前操作') {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const currentPageUrl = browserView.webContents?.getURL?.() || '';
+  if (isAllowedTaskUrl(currentPageUrl)) return null;
+  return {
+    ok: false,
+    code: 'PGY_CURRENT_URL_NOT_ALLOWED',
+    error: `${actionLabel}只能在蒲公英页面使用。请先在右侧打开蒲公英达人页。`,
+    url: currentPageUrl,
+    allowedHosts: ALLOWED_TASK_HOSTS
+  };
+}
+
 ipcMain.handle('pgy:checkLogin', async () => {
   return await pgyCheckLogin();
+});
+
+ipcMain.handle('pgy:pickElement', async (_e, payload = {}) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('鼠标精确点选');
+  if (rejected) return rejected;
+  const label = String(payload?.label || '要采集的内容');
+  const timeoutMs = Math.max(5000, Math.min(60000, Number(payload?.timeoutMs || 25000)));
+  try {
+    const js = `
+      (function(){
+        const label = ${JSON.stringify(label)};
+        const timeoutMs = ${timeoutMs};
+        const old = document.getElementById('__pgy_picker_overlay__');
+        if (old) old.remove();
+        document.getElementById('__pgy_scan_overlay__')?.remove();
+
+        const style = document.createElement('style');
+        style.id = '__pgy_picker_overlay__';
+        style.textContent = [
+          '*[data-pgy-picker-hover="1"]{outline:2px solid #2684ff!important;outline-offset:2px!important;cursor:crosshair!important;box-shadow:0 0 0 99999px rgba(15,23,42,.08)!important;}',
+          '#__pgy_picker_tip__{position:fixed;z-index:2147483647;right:14px;top:14px;display:flex;align-items:center;gap:8px;max-width:360px;padding:8px 11px;border-radius:12px;background:#eaf4ff;color:#1264d6;border:1px solid rgba(38,132,255,.24);font:13px/1.4 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;box-shadow:0 12px 28px rgba(15,23,42,.12);}',
+          '#__pgy_picker_tip__ b{color:#1264d6;}',
+          '#__pgy_picker_tip__ button{border:0;border-radius:9px;padding:4px 8px;background:#fff;color:#1264d6;font-weight:800;cursor:pointer;}',
+          '#__pgy_picker_tip__ .dot{width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;background:#dbeafe;color:#1264d6;font-weight:900;}',
+          '#__pgy_picker_inspector__{position:fixed;z-index:2147483647;left:14px;bottom:14px;min-width:210px;max-width:320px;padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.94);color:#111827;border:1px solid rgba(15,23,42,.12);font:12px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;box-shadow:0 14px 34px rgba(15,23,42,.18);pointer-events:none;}',
+          '#__pgy_picker_inspector__ .row{display:grid;grid-template-columns:54px minmax(0,1fr);gap:8px;}',
+          '#__pgy_picker_inspector__ .k{color:#64748b;}',
+          '#__pgy_picker_inspector__ .v{font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}'
+        ].join('');
+        document.documentElement.appendChild(style);
+
+        const tip = document.createElement('div');
+        tip.id = '__pgy_picker_tip__';
+        tip.innerHTML = '<span class="dot">＋</span><b>正在标注</b><span>点击“' + label.replace(/[<>&]/g, '') + '”所在区域，Esc 取消</span><button type="button">取消</button>';
+        document.body.appendChild(tip);
+
+        const inspector = document.createElement('div');
+        inspector.id = '__pgy_picker_inspector__';
+        inspector.innerHTML = '<div class="row"><span class="k">当前块</span><span class="v">移动鼠标选择页面内容</span></div>';
+        document.body.appendChild(inspector);
+
+        const uniqueSelector = (el) => {
+          if (!el || el.nodeType !== 1) return '';
+          if (el.id) return '#' + CSS.escape(el.id);
+          const attrNames = ['data-testid', 'data-test', 'data-e2e', 'data-v', 'aria-label', 'title'];
+          for (const name of attrNames) {
+            const value = el.getAttribute && el.getAttribute(name);
+            if (value && String(value).trim().length < 80) {
+              const sel = el.tagName.toLowerCase() + '[' + name + '=' + JSON.stringify(value) + ']';
+              try { if (document.querySelectorAll(sel).length === 1) return sel; } catch (_) {}
+            }
+          }
+          const path = [];
+          let node = el;
+          for (let depth = 0; node && node.nodeType === 1 && depth < 5; depth++) {
+            const tag = node.tagName.toLowerCase();
+            const classes = (typeof node.className === 'string' ? node.className.split(/\\s+/).filter(Boolean) : [])
+              .filter((c) => c && !/^css-/.test(c) && !/^_[a-z0-9]/i.test(c))
+              .slice(0, 2);
+            let part = tag + (classes.length ? '.' + classes.map((c) => CSS.escape(c)).join('.') : '');
+            const parent = node.parentElement;
+            if (parent) {
+              const same = Array.from(parent.children).filter((x) => x.tagName === node.tagName);
+              if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+            }
+            path.unshift(part);
+            const sel = path.join(' > ');
+            try {
+              const count = document.querySelectorAll(sel).length;
+              if (count === 1 || depth >= 2) return sel;
+            } catch (_) {}
+            node = parent;
+          }
+          return path.join(' > ');
+        };
+
+        let onMove = null;
+        let onClick = null;
+        let onKey = null;
+        const cleanup = () => {
+          try { document.querySelectorAll('[data-pgy-picker-hover="1"]').forEach((x) => x.removeAttribute('data-pgy-picker-hover')); } catch (_) {}
+          try { document.getElementById('__pgy_picker_tip__')?.remove(); } catch (_) {}
+          try { document.getElementById('__pgy_picker_inspector__')?.remove(); } catch (_) {}
+          try { document.getElementById('__pgy_picker_overlay__')?.remove(); } catch (_) {}
+          if (onMove) document.removeEventListener('mousemove', onMove, true);
+          if (onClick) document.removeEventListener('click', onClick, true);
+          if (onKey) document.removeEventListener('keydown', onKey, true);
+        };
+
+        let hover = null;
+        const setHover = (el) => {
+          if (hover === el) return;
+          if (hover) hover.removeAttribute('data-pgy-picker-hover');
+          hover = el && el.id !== '__pgy_picker_tip__' && !el.closest?.('#__pgy_picker_tip__') && !el.closest?.('#__pgy_picker_inspector__') ? el : null;
+          if (hover) {
+            hover.setAttribute('data-pgy-picker-hover', '1');
+            try {
+              const cs = getComputedStyle(hover);
+              const text = String(hover.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 44) || '(无文字)';
+              const fg = cs.color || '-';
+              const font = ((cs.fontSize || '') + ' ' + (cs.fontFamily || '')).trim();
+              inspector.innerHTML = [
+                '<div class="row"><span class="k">标签</span><span class="v">' + (hover.tagName || '').toLowerCase() + '</span></div>',
+                '<div class="row"><span class="k">颜色</span><span class="v">' + fg + '</span></div>',
+                '<div class="row"><span class="k">字体</span><span class="v">' + font.replace(/[<>&]/g, '') + '</span></div>',
+                '<div class="row"><span class="k">文字</span><span class="v">' + text.replace(/[<>&]/g, '') + '</span></div>'
+              ].join('');
+            } catch (_) {}
+          }
+        };
+
+        return new Promise((resolve) => {
+          const done = (value) => { cleanup(); resolve(value); };
+          onMove = (ev) => setHover(ev.target);
+          onKey = (ev) => {
+            if (ev.key === 'Escape') done({ ok: false, canceled: true });
+          };
+          onClick = (ev) => {
+            if (ev.target?.closest?.('#__pgy_picker_tip__ button')) {
+              ev.preventDefault(); ev.stopPropagation();
+              return done({ ok: false, canceled: true });
+            }
+            const el = ev.target;
+            if (!el || el.closest?.('#__pgy_picker_tip__')) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            const selector = uniqueSelector(el);
+            let count = 0;
+            try { count = selector ? document.querySelectorAll(selector).length : 0; } catch (_) {}
+            const href = el.closest?.('a[href]')?.getAttribute('href') || el.getAttribute?.('href') || '';
+            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            done({
+              ok: true,
+              selector,
+              count,
+              text: String(el.textContent || '').trim().slice(0, 300),
+              tag: el.tagName ? el.tagName.toLowerCase() : '',
+              href,
+              url: location.href,
+              rect: rect ? { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } : null
+            });
+          };
+          document.addEventListener('mousemove', onMove, true);
+          document.addEventListener('click', onClick, true);
+          document.addEventListener('keydown', onKey, true);
+          setTimeout(() => done({ ok: false, error: '点选超时，请重新开始。' }), timeoutMs);
+        });
+      })()
+    `;
+    return await browserView.webContents.executeJavaScript(js, true);
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('pgy:scanPageBlocks', async (_e, payload = {}) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('网页标注');
+  if (rejected) return rejected;
+  const fieldKey = String(payload?.fieldKey || 'creator_name');
+  const label = String(payload?.label || '要采集的内容');
+  const interactive = Boolean(payload?.interactive);
+  const timeoutMs = Math.max(8000, Math.min(90000, Number(payload?.timeoutMs || 45000)));
+  try {
+    const js = `
+      (function(){
+        const fieldKey = ${JSON.stringify(fieldKey)};
+        const label = ${JSON.stringify(label)};
+        const interactive = ${interactive ? 'true' : 'false'};
+        const timeoutMs = ${timeoutMs};
+        const old = document.getElementById('__pgy_scan_overlay__');
+        if (old) old.remove();
+
+        const esc = (value) => {
+          if (window.CSS && typeof CSS.escape === 'function') return CSS.escape(String(value));
+          return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\\\$&');
+        };
+        const cleanText = (value, limit = 120) => String(value || '')
+          .replace(/\\s+/g, ' ')
+          .trim()
+          .slice(0, limit);
+        const isVisible = (el) => {
+          if (!el || el.nodeType !== 1) return false;
+          if (el.closest('#__pgy_scan_overlay__,#__pgy_picker_tip__,#__pgy_picker_inspector__')) return false;
+          const rect = el.getBoundingClientRect?.();
+          if (!rect || rect.width < 16 || rect.height < 12) return false;
+          if (rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth) return false;
+          const style = getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) < 0.05) return false;
+          return true;
+        };
+        const uniqueSelector = (el) => {
+          if (!el || el.nodeType !== 1) return '';
+          if (el.id) return '#' + esc(el.id);
+          const attrNames = ['data-testid', 'data-test', 'data-e2e', 'aria-label', 'title'];
+          for (const name of attrNames) {
+            const value = el.getAttribute && el.getAttribute(name);
+            if (value && String(value).trim().length < 80) {
+              const sel = el.tagName.toLowerCase() + '[' + name + '=' + JSON.stringify(value) + ']';
+              try { if (document.querySelectorAll(sel).length === 1) return sel; } catch (_) {}
+            }
+          }
+          const path = [];
+          let node = el;
+          for (let depth = 0; node && node.nodeType === 1 && depth < 5; depth++) {
+            const tag = node.tagName.toLowerCase();
+            const classes = (typeof node.className === 'string' ? node.className.split(/\\s+/).filter(Boolean) : [])
+              .filter((c) => c && !/^css-/.test(c) && !/^_[a-z0-9]/i.test(c) && c.length < 42)
+              .slice(0, 2);
+            let part = tag + (classes.length ? '.' + classes.map(esc).join('.') : '');
+            const parent = node.parentElement;
+            if (parent) {
+              const same = Array.from(parent.children).filter((x) => x.tagName === node.tagName);
+              if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+            }
+            path.unshift(part);
+            const sel = path.join(' > ');
+            try {
+              const count = document.querySelectorAll(sel).length;
+              if (count === 1 || depth >= 2) return sel;
+            } catch (_) {}
+            node = parent;
+          }
+          return path.join(' > ');
+        };
+        const scoreElement = (el, text, rect, href) => {
+          const tag = (el.tagName || '').toLowerCase();
+          const cls = String(el.className || '').toLowerCase();
+          const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
+          const hay = [text, cls, aria, href].join(' ').toLowerCase();
+          let score = 0;
+          const area = Math.min(rect.width * rect.height, 120000);
+          score += Math.min(24, area / 4500);
+          if (/^h[1-4]$/.test(tag)) score += 16;
+          if (tag === 'a' && href) score += 9;
+          if (tag === 'img') score += 6;
+          if (fieldKey === 'creator_name') {
+            if (/name|nick|author|user|达人|昵称|名称|博主/.test(hay)) score += 26;
+            if (/^h[1-3]$/.test(tag)) score += 20;
+            if (text.length >= 2 && text.length <= 28) score += 12;
+          } else if (fieldKey === 'followers') {
+            if (/粉丝|fans|follower|关注/.test(hay)) score += 30;
+            if (/[0-9][0-9.,]*\\s*[万wW]?/.test(text)) score += 18;
+          } else if (fieldKey === 'note_card') {
+            if (/note|card|item|笔记|作品|阅读|互动|报价/.test(hay)) score += 24;
+            if (el.querySelector?.('a[href*="/explore/"],a[href*="/discovery/item/"],a[href*="/note/"]')) score += 24;
+            if (rect.width > 120 && rect.height > 80) score += 14;
+          } else if (fieldKey === 'note_title') {
+            if (/title|笔记|标题|作品/.test(hay)) score += 26;
+            if (text.length >= 4 && text.length <= 80) score += 14;
+          } else if (fieldKey === 'note_url') {
+            if (href) score += 24;
+            if (/explore|discovery\\/item|note|笔记|详情/.test(hay)) score += 20;
+          }
+          if (text.length > 180 && fieldKey !== 'note_card') score -= 18;
+          if (/确定|取消|登录|搜索|筛选|返回|打开/.test(text) && fieldKey !== 'note_url') score -= 10;
+          return score;
+        };
+
+        const selector = [
+          'h1','h2','h3','h4',
+          'a[href]','button','[role="button"]',
+          'img[alt]','[aria-label]','[title]',
+          '[class*="name" i]','[class*="nick" i]','[class*="author" i]','[class*="fans" i]','[class*="follow" i]',
+          '[class*="title" i]','[class*="note" i]','[class*="card" i]',
+          'p','span','div'
+        ].join(',');
+        const raw = Array.from(document.body.querySelectorAll(selector))
+          .filter(isVisible)
+          .slice(0, 1600)
+          .map((el) => {
+            const rect = el.getBoundingClientRect();
+            const href = el.closest?.('a[href]')?.getAttribute('href') || el.getAttribute?.('href') || '';
+            const text = cleanText(el.getAttribute?.('aria-label') || el.getAttribute?.('title') || el.getAttribute?.('alt') || el.textContent || '', 180);
+            if (!text && !href && (el.tagName || '').toLowerCase() !== 'img') return null;
+            const selector = uniqueSelector(el);
+            if (!selector) return null;
+            let count = 0;
+            try { count = document.querySelectorAll(selector).length; } catch (_) {}
+            const score = scoreElement(el, text, rect, href);
+            return {
+              selector,
+              count,
+              text,
+              tag: (el.tagName || '').toLowerCase(),
+              href,
+              score,
+              rect: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height)
+              }
+            };
+          })
+          .filter(Boolean)
+          .filter((x) => x.score >= 10);
+
+        const picked = [];
+        const seen = new Set();
+        raw.sort((a, b) => b.score - a.score);
+        for (const item of raw) {
+          const near = picked.some((x) =>
+            Math.abs(x.rect.x - item.rect.x) < 8 &&
+            Math.abs(x.rect.y - item.rect.y) < 8 &&
+            Math.abs(x.rect.width - item.rect.width) < 12 &&
+            Math.abs(x.rect.height - item.rect.height) < 12
+          );
+          if (near || seen.has(item.selector)) continue;
+          seen.add(item.selector);
+          picked.push(item);
+          if (picked.length >= 18) break;
+        }
+
+        const wrap = document.createElement('div');
+        wrap.id = '__pgy_scan_overlay__';
+        wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;';
+        const style = document.createElement('style');
+        style.textContent = [
+          '#__pgy_scan_overlay__ .pgy-scan-tip{position:fixed;right:14px;top:14px;max-width:410px;padding:10px 12px;border-radius:14px;background:rgba(17,24,39,.92);color:#fff;font:13px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;box-shadow:0 18px 42px rgba(15,23,42,.24);pointer-events:auto;}',
+          '#__pgy_scan_overlay__ .pgy-scan-tip b{font-weight:900;}',
+          '#__pgy_scan_overlay__ .pgy-scan-tip button{margin-left:8px;border:0;border-radius:9px;padding:4px 8px;background:#fff;color:#111827;font-weight:800;cursor:pointer;}',
+          '#__pgy_scan_overlay__ .pgy-scan-box{position:fixed;border:2px solid rgba(37,99,235,.78);border-radius:10px;background:rgba(37,99,235,.08);box-shadow:0 10px 30px rgba(37,99,235,.16);}',
+          '#__pgy_scan_overlay__[data-interactive="1"] .pgy-scan-box{pointer-events:auto;cursor:pointer;}',
+          '#__pgy_scan_overlay__[data-interactive="1"] .pgy-scan-box:hover{border-color:#ec4899;background:rgba(236,72,153,.12);box-shadow:0 14px 34px rgba(236,72,153,.20);}',
+          '#__pgy_scan_overlay__ .pgy-scan-badge{position:absolute;left:-8px;top:-10px;min-width:24px;height:24px;padding:0 7px;border-radius:999px;background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;font:800 12px/1 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;box-shadow:0 8px 18px rgba(37,99,235,.34);}',
+          '#__pgy_scan_overlay__[data-interactive="1"] .pgy-scan-box:hover .pgy-scan-badge{background:#ec4899;}',
+          '#__pgy_scan_overlay__ .pgy-scan-inspector{position:fixed;left:14px;bottom:14px;min-width:250px;max-width:360px;padding:11px 13px;border-radius:14px;background:rgba(255,255,255,.96);color:#111827;border:1px solid rgba(15,23,42,.12);font:12px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;box-shadow:0 16px 38px rgba(15,23,42,.18);pointer-events:none;}',
+          '#__pgy_scan_overlay__ .pgy-scan-inspector-title{font-size:13px;font-weight:900;color:#111827;margin-bottom:6px;}',
+          '#__pgy_scan_overlay__ .pgy-scan-inspector-row{display:grid;grid-template-columns:62px minmax(0,1fr);gap:8px;margin-top:3px;}',
+          '#__pgy_scan_overlay__ .pgy-scan-inspector-k{color:#64748b;}',
+          '#__pgy_scan_overlay__ .pgy-scan-inspector-v{font-weight:760;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}'
+        ].join('');
+        wrap.appendChild(style);
+        if (interactive) wrap.setAttribute('data-interactive', '1');
+        const tip = document.createElement('div');
+        tip.className = 'pgy-scan-tip';
+        tip.innerHTML = interactive
+          ? '<b>正在教系统识别：</b>' + cleanText(label, 30) + '。点击最准确的编号块，Esc 取消。<button type="button" data-pgy-scan-cancel="1">取消</button>'
+          : '已为“' + cleanText(label, 30) + '”标出可选页面块。请在左侧候选列表选择一个保存；重新扫描会清除本次标记。';
+        wrap.appendChild(tip);
+        let inspector = null;
+        const setInspector = (item, index) => {
+          if (!inspector) return;
+          if (!item) {
+            inspector.innerHTML = [
+              '<div class="pgy-scan-inspector-title">正在标注：' + cleanText(label, 30) + '</div>',
+              '<div class="pgy-scan-inspector-row"><span class="pgy-scan-inspector-k">操作</span><span class="pgy-scan-inspector-v">移动到编号块上查看内容，点击保存</span></div>'
+            ].join('');
+            return;
+          }
+          const preview = cleanText(item.text || item.href || '<' + (item.tag || 'block') + '>', 56)
+            .replace(/[<>&]/g, '');
+          inspector.innerHTML = [
+            '<div class="pgy-scan-inspector-title">候选 ' + (index + 1) + '：' + cleanText(label, 30) + '</div>',
+            '<div class="pgy-scan-inspector-row"><span class="pgy-scan-inspector-k">内容</span><span class="pgy-scan-inspector-v">' + preview + '</span></div>',
+            '<div class="pgy-scan-inspector-row"><span class="pgy-scan-inspector-k">类型</span><span class="pgy-scan-inspector-v">' + (item.tag || 'block') + '</span></div>',
+            '<div class="pgy-scan-inspector-row"><span class="pgy-scan-inspector-k">相似位置</span><span class="pgy-scan-inspector-v">' + (item.count || 0) + ' 个</span></div>',
+            '<div class="pgy-scan-inspector-row"><span class="pgy-scan-inspector-k">可信度</span><span class="pgy-scan-inspector-v">' + Math.round(item.score || 0) + '</span></div>'
+          ].join('');
+        };
+        if (interactive) {
+          inspector = document.createElement('div');
+          inspector.className = 'pgy-scan-inspector';
+          wrap.appendChild(inspector);
+          setInspector(null, -1);
+        }
+        picked.forEach((item, index) => {
+          const box = document.createElement('div');
+          box.className = 'pgy-scan-box';
+          box.setAttribute('data-pgy-scan-index', String(index));
+          const pad = 3;
+          box.style.left = Math.max(0, item.rect.x - pad) + 'px';
+          box.style.top = Math.max(0, item.rect.y - pad) + 'px';
+          box.style.width = Math.max(18, item.rect.width + pad * 2) + 'px';
+          box.style.height = Math.max(14, item.rect.height + pad * 2) + 'px';
+          const badge = document.createElement('div');
+          badge.className = 'pgy-scan-badge';
+          badge.textContent = String(index + 1);
+          box.appendChild(badge);
+          if (interactive) {
+            box.addEventListener('mouseenter', () => setInspector(item, index));
+            box.addEventListener('mouseleave', () => setInspector(null, -1));
+          }
+          wrap.appendChild(box);
+        });
+        document.body.appendChild(wrap);
+        if (!interactive) return { ok: true, fieldKey, label, candidates: picked, url: location.href };
+        if (!picked.length) {
+          try { wrap.remove(); } catch (_) {}
+          return { ok: false, error: '没有扫描到可点选的页面块。请换到更典型的达人页，或使用手动精确点选。', candidates: [], url: location.href };
+        }
+        return new Promise((resolve) => {
+          let timer = null;
+          let onKey = null;
+          const cleanup = () => {
+            if (timer) clearTimeout(timer);
+            if (onKey) document.removeEventListener('keydown', onKey, true);
+            try { wrap.remove(); } catch (_) {}
+          };
+          const done = (value) => {
+            cleanup();
+            resolve(value);
+          };
+          onKey = (ev) => {
+            if (ev.key === 'Escape') done({ ok: false, canceled: true, candidates: picked, url: location.href });
+          };
+          document.addEventListener('keydown', onKey, true);
+          tip.querySelector('[data-pgy-scan-cancel="1"]')?.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            done({ ok: false, canceled: true, candidates: picked, url: location.href });
+          });
+          wrap.querySelectorAll('[data-pgy-scan-index]').forEach((box) => {
+            box.addEventListener('click', (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              const index = Number(box.getAttribute('data-pgy-scan-index') || -1);
+              const selected = picked[index];
+              if (!selected) return;
+              done({ ok: true, fieldKey, label, selectedIndex: index, candidates: picked, ...selected, url: location.href });
+            }, true);
+          });
+          timer = setTimeout(() => done({ ok: false, error: '标注超时，请重新开始。', candidates: picked, url: location.href }), timeoutMs);
+        });
+      })()
+    `;
+    return await browserView.webContents.executeJavaScript(js, true);
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('pgy:clearPageBlockHints', async () => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  try {
+    await browserView.webContents.executeJavaScript(
+      `(() => { document.getElementById('__pgy_scan_overlay__')?.remove(); return true; })()`,
+      true
+    );
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
 });
 
 // =========================
@@ -1006,6 +1521,8 @@ ipcMain.handle('pgy:checkLogin', async () => {
 // =========================
 ipcMain.handle('pgy:suggestNoteCardSelector', async () => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('自动识别笔记卡片');
+  if (rejected) return rejected;
   try {
     const js = `
       (function(){
@@ -1160,6 +1677,179 @@ ipcMain.handle('pgy:suggestNoteCardSelector', async () => {
     `;
     const r = await browserView.webContents.executeJavaScript(js, true);
     return r;
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('pgy:extractSearchCandidates', async () => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('读取搜索结果');
+  if (rejected) return rejected;
+  try {
+    const js = `
+      (function(){
+        const clean = (value, limit = 180) => String(value || '')
+          .replace(/\\u00a0/g, ' ')
+          .replace(/\\s+/g, ' ')
+          .trim()
+          .slice(0, limit);
+        const absUrl = (href) => {
+          try { return new URL(href, location.href).toString(); } catch (_) { return ''; }
+        };
+        const isVisible = (el) => {
+          if (!el || el.nodeType !== 1) return false;
+          const rect = el.getBoundingClientRect?.();
+          if (!rect || rect.width < 40 || rect.height < 24) return false;
+          if (rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth) return false;
+          const style = getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) < 0.05) return false;
+          return true;
+        };
+        const findRowRoot = (node) => {
+          let best = node;
+          let cur = node;
+          for (let depth = 0; cur && cur.nodeType === 1 && depth < 9; depth++) {
+            const text = clean(cur.innerText || cur.textContent || '', 1200);
+            const rect = cur.getBoundingClientRect?.();
+            if (!rect) break;
+            const hasBusinessMarkers = /添加合作|发起邀约|更多操作|粉丝|阅读中位数|互动中位数|报价|博主信息|近期笔记/.test(text);
+            const reasonableSize = rect.width >= 360 && rect.height >= 54 && rect.height <= 360;
+            if (hasBusinessMarkers && reasonableSize) best = cur;
+            cur = cur.parentElement;
+          }
+          return best;
+        };
+        const linkLooksLikeCreator = (href) => {
+          const u = absUrl(href);
+          return /^https:\\/\\/pgy\\.xiaohongshu\\.com\\//i.test(u) && /blogger|creator|kol|profile|author/i.test(u);
+        };
+        const parseName = (row, link) => {
+          const linkText = clean(link?.innerText || link?.textContent || '', 40);
+          if (linkText && !/添加合作|发起邀约|更多操作/.test(linkText)) return linkText;
+          const lines = String(row?.innerText || row?.textContent || '')
+            .split(/\\n+/)
+            .map((x) => clean(x, 80))
+            .filter(Boolean)
+            .filter((x) => !/首页|找博主|学内容|去投放|我的工作台|帮助中心|添加合作|发起邀约|更多操作|博主信息|近期笔记|粉丝数|阅读中位数|互动中位数|全部报价|操作/.test(x));
+          for (const line of lines) {
+            if (/^[0-9,.]+\\s*[w万]?$/i.test(line)) continue;
+            if (/^¥|起$|合作|广告/.test(line)) continue;
+            if (line.length >= 2 && line.length <= 30) return line;
+          }
+          return '';
+        };
+        const parseMeta = (row) => {
+          const text = clean(row?.innerText || row?.textContent || '', 1000);
+          const parts = [];
+          const followers = text.match(/([0-9][0-9,.]*\\s*(?:w|万)?)\\s*(?=\\s*(?:阅读中位数|粉丝|互动中位数|¥|起|添加合作|发起邀约))/i);
+          const price = text.match(/[¥￥]\\s*[0-9][0-9,.]*(?:\\s*起)?/);
+          const location = text.match(/(?:上海|北京|广州|深圳|杭州|成都|重庆|长沙|武汉|南京|苏州|厦门|青岛|天津|西安|郑州|上海市|北京市)[^\\s]{0,8}/);
+          if (followers) parts.push(\`粉丝/指标 \${clean(followers[1], 24)}\`);
+          if (price) parts.push(\`报价 \${clean(price[0], 28)}\`);
+          if (location) parts.push(\`地区 \${clean(location[0], 24)}\`);
+          const compact = text
+            .replace(/添加合作|发起邀约|更多操作/g, '')
+            .replace(/首页|找博主|学内容|去投放|我的工作台|帮助中心/g, '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+          if (compact) parts.push(compact.slice(0, 120));
+          return parts.filter(Boolean).join(' / ');
+        };
+        const extractFilterSnapshot = () => {
+          const groupNames = ['合作目标', '匹配度', '数据表现', '平台推荐', '常规剔除'];
+          const isNoise = (text) => !text || /^\\?|^新$|^展开$|^收起$|^全部$/.test(text);
+          const lines = String(document.body?.innerText || '')
+            .split(/\\n+/)
+            .map((x) => clean(x, 260))
+            .filter(Boolean);
+          const groups = [];
+          for (let i = 0; i < lines.length; i++) {
+            const groupName = groupNames.find((name) => lines[i] === name || lines[i].startsWith(name + ' '));
+            if (!groupName) continue;
+            const bucket = [];
+            const firstLine = lines[i] === groupName ? '' : lines[i].slice(groupName.length).trim();
+            if (firstLine) bucket.push(...firstLine.split(/\\s{2,}|\\t+/).map((x) => clean(x, 40)).filter(Boolean));
+            for (let j = i + 1; j < lines.length; j++) {
+              if (groupNames.includes(lines[j])) break;
+              if (groupNames.some((name) => lines[j].startsWith(name + ' '))) break;
+              if (/^(推荐|博主信息|粉丝画像|笔记类目|日常笔记|合作笔记|数据表现|直播数据|热门活动|一键剔除)$/.test(lines[j])) {
+                bucket.push(lines[j]);
+                continue;
+              }
+              const pieces = lines[j].split(/\\s{2,}|\\t+/).map((x) => clean(x, 48)).filter((x) => x && !isNoise(x));
+              if (pieces.length) bucket.push(...pieces);
+              if (bucket.length >= 80) break;
+            }
+            const seen = new Set();
+            const options = bucket
+              .map((x) => x.replace(/[?？]$/, '').trim())
+              .filter((x) => x && !seen.has(x) && seen.add(x))
+              .slice(0, 80);
+            groups.push({ group: groupName, options });
+          }
+
+          const selected = [];
+          const optionNodes = Array.from(document.querySelectorAll('button,a,label,span,div,[role="button"],[role="checkbox"]'))
+            .filter(isVisible)
+            .slice(0, 1600);
+          for (const el of optionNodes) {
+            const text = clean(el.innerText || el.textContent || el.getAttribute?.('aria-label') || '', 40);
+            if (!text || isNoise(text)) continue;
+            const cls = String(el.className || '').toLowerCase();
+            const ariaChecked = String(el.getAttribute?.('aria-checked') || '').toLowerCase();
+            const ariaSelected = String(el.getAttribute?.('aria-selected') || '').toLowerCase();
+            const checkedInput = el.querySelector?.('input[type="checkbox"]:checked,input[type="radio"]:checked');
+            const active = /active|selected|checked|is-select|is-active|current/.test(cls)
+              || ariaChecked === 'true'
+              || ariaSelected === 'true'
+              || Boolean(checkedInput);
+            if (active && !selected.includes(text)) selected.push(text);
+          }
+          return { groups, selected: selected.slice(0, 80) };
+        };
+
+        const anchors = Array.from(document.querySelectorAll('a[href]'))
+          .filter((a) => isVisible(a) && linkLooksLikeCreator(a.getAttribute('href') || ''));
+        const rows = [];
+        const seenUrls = new Set();
+        const seenRows = new Set();
+        for (const a of anchors) {
+          const url = absUrl(a.getAttribute('href') || '');
+          if (!url || seenUrls.has(url)) continue;
+          const row = findRowRoot(a);
+          if (row && seenRows.has(row) && !clean(a.innerText || a.textContent || '', 40)) continue;
+          seenUrls.add(url);
+          if (row) seenRows.add(row);
+          rows.push({
+            pgy_url: url,
+            creator_name: parseName(row || a, a),
+            note: parseMeta(row || a),
+            status: 'candidate',
+            priority: '',
+            excludeReason: ''
+          });
+          if (rows.length >= 80) break;
+        }
+        const filters = extractFilterSnapshot();
+
+        return {
+          ok: true,
+          url: location.href,
+          items: rows,
+          filters,
+          stats: {
+            visibleCreatorLinks: anchors.length,
+            extracted: rows.length,
+            filterGroups: filters.groups.length
+          },
+          message: rows.length
+            ? '已读取当前可见搜索结果。'
+            : '当前页面没有暴露可读取的达人详情链接。请确认在蒲公英搜索结果页，或打开某个达人详情后用“加入当前达人”。'
+        };
+      })()
+    `;
+    return await browserView.webContents.executeJavaScript(js, true);
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
@@ -1579,6 +2269,16 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
     return { ok: false, error: `模板解析失败：${String(err?.message || err)}` };
   }
 
+  const currentPageUrl = browserView.webContents.getURL();
+  if (!isAllowedTaskUrl(currentPageUrl)) {
+    return {
+      ok: false,
+      code: 'PGY_CURRENT_URL_NOT_ALLOWED',
+      error: `为了降低误操作和平台风控风险，当前页必须是蒲公英链接（${ALLOWED_TASK_HOSTS.join(', ')}）。请先在右侧打开蒲公英达人页。`,
+      url: currentPageUrl || ''
+    };
+  }
+
   const opt = options || {};
   const runId = String(opt.runId || '').trim() || makeRunId();
   const runDir = path.join(getRunsDir(), runId);
@@ -1592,9 +2292,16 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
       ? template.tabTexts
       : ['数据概览', '笔记数据', '粉丝分析'];
 
-  const tabWaitMs = Number(opt.tabWaitMs || 0) > 0 ? Number(opt.tabWaitMs) : 1200;
-  const resolveNoteUrlByClick = opt.resolveNoteUrlByClick ?? template?.resolveNoteUrlByClick ?? true;
-  const resolveLimit = Number(opt.resolveLimit || 0) > 0 ? Number(opt.resolveLimit) : 10;
+  const requestedTabWaitMs = Number(opt.tabWaitMs || 0);
+  const tabWaitMs = Number.isFinite(requestedTabWaitMs) && requestedTabWaitMs > 0
+    ? Math.max(PGY_MIN_TAB_WAIT_MS, requestedTabWaitMs)
+    : PGY_MIN_TAB_WAIT_MS;
+  const requestedResolveByClick = Boolean(opt.resolveNoteUrlByClick ?? template?.resolveNoteUrlByClick ?? false);
+  const resolveNoteUrlByClick = PGY_ALLOW_NOTE_CLICK_RESOLVE && requestedResolveByClick;
+  const requestedResolveLimit = Number(opt.resolveLimit || 0);
+  const resolveLimit = resolveNoteUrlByClick && Number.isFinite(requestedResolveLimit) && requestedResolveLimit > 0
+    ? Math.min(PGY_NOTE_CLICK_RESOLVE_LIMIT, requestedResolveLimit)
+    : 0;
 
   const pages = [];
   const mergedSummary = {};
@@ -1603,6 +2310,20 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
   let mergedMetrics = {};
   let notesTop10 = [];
   let noteCardSelector = String(template?.noteCardSelector || '').trim();
+
+  const assertNoRiskPage = async (stage) => {
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (risk?.ok && risk?.riskDetected) {
+      const err = new Error(`检测到页面可能触发安全验证/风控：${risk.riskText || '请在右侧手工确认后继续'}`);
+      err.code = 'PGY_RISK_DETECTED';
+      err.riskDetected = true;
+      err.riskText = risk.riskText || '';
+      err.riskStage = stage || '';
+      err.url = risk.url || browserView.webContents.getURL();
+      throw err;
+    }
+    return risk;
+  };
 
   const mergeMetrics = (delta) => {
     if (!delta || typeof delta !== 'object') return;
@@ -1615,6 +2336,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
   };
 
   const extractOnce = async (pageName, tabText) => {
+    await assertNoRiskPage(`before_extract:${pageName}`);
     const baseUrl = browserView.webContents.getURL();
     const extracted = await extractFromTemplate(browserView.webContents, template, { baseUrl });
     // 强制以真实页面 URL 为准，避免被历史遗留的非空字段（例如带反引号）“锁死”不更新
@@ -1630,6 +2352,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
 
     // 资源表 v1：额外抽取（缺失留空）
     try {
+      await assertNoRiskPage(`before_resource_delta:${pageName}`);
       const key = tabText ? String(tabText) : 'base';
       if (key.includes('笔记') && !noteCardSelector) {
         const s = await pgySuggestNoteCardSelectorForCurrentPage(browserView.webContents);
@@ -1652,9 +2375,10 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
   };
 
   try {
-    const initialUrl = browserView.webContents.getURL();
+    const initialUrl = currentPageUrl;
 
     // 1) 先采集达人详情页（当前页面）
+    await assertNoRiskPage('before_first_extract');
     const r0 = await extractOnce('0_达人详情页', '');
     Object.assign(mergedSummary, mergePreferNonEmpty(mergedSummary, r0.creator_summary));
     mergedNotes = mergeNotesUnique(mergedNotes, r0.notes);
@@ -1674,22 +2398,28 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
         continue;
       }
       await sleep(tabWaitMs);
+      await assertNoRiskPage(`after_tab_click:${tabText}`);
       const r = await extractOnce(`tab_${i + 1}_${safeName(tabText)}`, tabText);
       // 在“笔记数据”tab 上尝试通过点击卡片补全 note_url（页面往往没有 href）
       if (resolveNoteUrlByClick && String(tabText).includes('笔记')) {
         try {
+          await assertNoRiskPage(`before_note_url_resolve:${tabText}`);
           noteUrlResolve = await resolveNoteUrlsByClick(
             browserView.webContents,
             r.notes,
             r?._meta?.noteCardSelector,
             { limit: resolveLimit }
           );
-        } catch (_) {}
+          await assertNoRiskPage(`after_note_url_resolve:${tabText}`);
+        } catch (err) {
+          if (err?.riskDetected || err?.code === 'PGY_RISK_DETECTED') throw err;
+        }
       }
       Object.assign(mergedSummary, mergePreferNonEmpty(mergedSummary, r.creator_summary));
       mergedNotes = mergeNotesUnique(mergedNotes, r.notes);
     }
 
+    await assertNoRiskPage('before_write_result');
     const rawResult = {
       platform: template?.platform || 'pgy',
       creator_url: initialUrl,
@@ -1750,7 +2480,17 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
         'utf-8'
       );
     } catch (_) {}
-    return { ok: false, error: String(err?.message || err), runId, runDir };
+    return {
+      ok: false,
+      error: String(err?.message || err),
+      code: err?.code || '',
+      riskDetected: Boolean(err?.riskDetected),
+      riskText: err?.riskText || '',
+      riskStage: err?.riskStage || '',
+      riskUrl: err?.url || '',
+      runId,
+      runDir
+    };
   }
 }
 
@@ -1762,6 +2502,8 @@ ipcMain.handle('pgy:extractCurrentMultiPage', async (_e, templatePath, options) 
 // IPC：录制/回放
 // =========================
 ipcMain.handle('recording:start', async () => {
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('录制排查');
+  if (rejected) return rejected;
   recordingEnabled = true;
   currentRecording = [];
   mainWindow?.webContents.send('recording:count', 0);
@@ -1791,6 +2533,8 @@ ipcMain.handle('recording:stop', async () => {
 
 ipcMain.on('recording:action', (_e, action) => {
   if (!recordingEnabled) return;
+  const currentPageUrl = browserView?.webContents?.getURL?.() || '';
+  if (!isAllowedTaskUrl(currentPageUrl)) return;
   currentRecording.push({ ...action, t: Date.now() });
   mainWindow?.webContents.send('recording:count', currentRecording.length);
 });
@@ -1872,17 +2616,68 @@ ipcMain.handle('recording:replay', async (_e, filePath) => {
   // 回放：先关闭录制，避免把回放又录进去
   recordingEnabled = false;
 
+  const stopIfReplayHitsRisk = async (stepIndex, action, stage) => {
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (risk?.ok && risk?.riskDetected) {
+      return {
+        ok: false,
+        code: 'PGY_RISK_DETECTED',
+        error: `回放已停止：检测到页面可能触发安全验证/风控：${risk.riskText || '请在右侧手工确认'}`,
+        riskDetected: true,
+        riskText: risk.riskText || '',
+        riskStage: stage || '',
+        riskUrl: risk.url || browserView.webContents.getURL(),
+        stepIndex,
+        action
+      };
+    }
+    return null;
+  };
+
+  const rejectReplayUrlIfNeeded = (url, stepIndex, action, stage) => {
+    if (isAllowedTaskUrl(url)) return null;
+    return {
+      ok: false,
+      code: 'PGY_REPLAY_URL_NOT_ALLOWED',
+      error: `回放已停止：为了降低误操作和平台风控风险，自动回放只允许蒲公英页面（${ALLOWED_TASK_HOSTS.join(', ')}）。`,
+      url: String(url || ''),
+      stage: stage || '',
+      stepIndex,
+      action
+    };
+  };
+
   for (let i = 0; i < actions.length; i++) {
     const a = actions[i];
+    const riskBefore = await stopIfReplayHitsRisk(i, a, 'before_replay_action');
+    if (riskBefore) return riskBefore;
     if (a.type === 'navigate' && a.url) {
+      const invalidNavigate = rejectReplayUrlIfNeeded(a.url, i, a, 'before_replay_navigate');
+      if (invalidNavigate) return invalidNavigate;
       try {
         await browserView.webContents.loadURL(a.url);
       } catch (_) {}
       await new Promise((r) => setTimeout(r, 600));
+      const invalidAfterNavigate = rejectReplayUrlIfNeeded(
+        browserView.webContents.getURL(),
+        i,
+        a,
+        'after_replay_navigate'
+      );
+      if (invalidAfterNavigate) return invalidAfterNavigate;
+      const riskAfterNavigate = await stopIfReplayHitsRisk(i, a, 'after_replay_navigate');
+      if (riskAfterNavigate) return riskAfterNavigate;
       continue;
     }
 
     if (a.type === 'click' && a.selector) {
+      const invalidClickPage = rejectReplayUrlIfNeeded(
+        browserView.webContents.getURL(),
+        i,
+        a,
+        'before_replay_click'
+      );
+      if (invalidClickPage) return invalidClickPage;
       const okWait = await browserView.webContents.executeJavaScript(
         buildWaitForSelectorJs(a.selector, 10000),
         true
@@ -1917,10 +2712,19 @@ ipcMain.handle('recording:replay', async (_e, filePath) => {
         };
       }
       await new Promise((r) => setTimeout(r, 450));
+      const riskAfterClick = await stopIfReplayHitsRisk(i, a, 'after_replay_click');
+      if (riskAfterClick) return riskAfterClick;
       continue;
     }
 
     if (a.type === 'input' && a.selector) {
+      const invalidInputPage = rejectReplayUrlIfNeeded(
+        browserView.webContents.getURL(),
+        i,
+        a,
+        'before_replay_input'
+      );
+      if (invalidInputPage) return invalidInputPage;
       const okWait = await browserView.webContents.executeJavaScript(
         buildWaitForSelectorJs(a.selector, 10000),
         true
@@ -1961,6 +2765,8 @@ ipcMain.handle('recording:replay', async (_e, filePath) => {
         };
       }
       await new Promise((r) => setTimeout(r, 450));
+      const riskAfterInput = await stopIfReplayHitsRisk(i, a, 'after_replay_input');
+      if (riskAfterInput) return riskAfterInput;
       continue;
     }
   }
@@ -2069,7 +2875,23 @@ ipcMain.handle('template:clone', async (_e, srcPath, newName) => {
 // =========================
 ipcMain.handle('tasks:start', async (_e, payload) => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
-  return await taskRunner.start(payload || {});
+  const r = await taskRunner.start(payload || {});
+  if (r?.ok) {
+    try {
+      recordExecution(getSigningTasksDir(), {
+        runId: r.runId,
+        runDir: r.runDir,
+        presetKey: payload?.presetKey || '',
+        queueCount: Array.isArray(payload?.items) && payload.items.length
+          ? payload.items.length
+          : Array.isArray(payload?.urls)
+            ? payload.urls.length
+            : 0,
+        signingTask: payload?.signingTask || {}
+      });
+    } catch (_) {}
+  }
+  return r;
 });
 
 ipcMain.handle('tasks:pause', async () => {
@@ -2109,106 +2931,56 @@ ipcMain.handle('tasks:openRunsDir', async () => {
   }
 });
 
-function _pickFirstPgyUrl(s) {
-  if (s == null) return null;
-  const t = String(s);
-  const m = t.match(/https?:\/\/pgy\.xiaohongshu\.com\/[^\s"'<>]+/i);
-  return m ? m[0] : null;
-}
-
-function _pickFirstXhsUrl(s) {
-  if (s == null) return null;
-  const t = String(s);
-  const m = t.match(/https?:\/\/(?:www\.)?xiaohongshu\.com\/[^\s"'<>]+/i);
-  return m ? m[0] : null;
-}
-
-function _findKeyByHeader(row, keywords) {
-  const keys = Object.keys(row || {});
-  for (const k of keys) {
-    const name = String(k || '').trim();
-    if (!name) continue;
-    if (keywords.some((kw) => name.includes(kw))) return k;
+ipcMain.handle('signingTasks:list', async () => {
+  try {
+    return { ok: true, items: listSigningTasks(getSigningTasksDir()) };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
   }
-  return null;
-}
+});
 
-function parseExcelToPgyItems(filePath) {
-  const wb = XLSX.readFile(filePath, { cellDates: true });
-  const items = [];
-  const seen = new Set();
-
-  const sheetNames = wb.SheetNames || [];
-  let scannedSheets = 0;
-  let scannedRows = 0;
-  let extracted = 0;
-
-  for (const sheet of sheetNames) {
-    const ws = wb.Sheets[sheet];
-    if (!ws) continue;
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
-    if (!Array.isArray(rows) || rows.length === 0) continue;
-    scannedSheets += 1;
-
-    // 尝试从表头自动识别列
-    const sample = rows[0] || {};
-    const colName = _findKeyByHeader(sample, ['达人昵称', '昵称', '达人', '博主', 'KOL']);
-    const colPgy = _findKeyByHeader(sample, ['蒲公英', 'pgy', 'PGY']);
-    const colXhs = _findKeyByHeader(sample, ['主页链接', '主页', '小红书', 'XHS']);
-
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i] || {};
-      scannedRows += 1;
-
-      let pgyUrl = colPgy ? _pickFirstPgyUrl(r[colPgy]) : null;
-      let xhsUrl = colXhs ? _pickFirstXhsUrl(r[colXhs]) : null;
-
-      if (!pgyUrl) {
-        // fallback: 扫描整行
-        for (const v of Object.values(r)) {
-          pgyUrl = _pickFirstPgyUrl(v);
-          if (pgyUrl) break;
-        }
-      }
-      if (!xhsUrl) {
-        for (const v of Object.values(r)) {
-          xhsUrl = _pickFirstXhsUrl(v);
-          if (xhsUrl) break;
-        }
-      }
-      if (!pgyUrl) continue;
-
-      // 去重按蒲公英链接
-      if (seen.has(pgyUrl)) continue;
-      seen.add(pgyUrl);
-      extracted += 1;
-
-      let creatorName = '';
-      if (colName && r[colName] && !_pickFirstPgyUrl(r[colName]) && !_pickFirstXhsUrl(r[colName])) {
-        creatorName = String(r[colName]).trim();
-      }
-      items.push({
-        creator_name: creatorName,
-        pgy_url: pgyUrl,
-        xhs_url: xhsUrl || '',
-        sheet,
-        row_index: i + 2 // 近似 Excel 行号（表头占 1 行）
-      });
-    }
+ipcMain.handle('signingTasks:save', async (_e, payload) => {
+  try {
+    const item = saveSigningTask(getSigningTasksDir(), payload || {});
+    return { ok: true, item, items: listSigningTasks(getSigningTasksDir()) };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
   }
+});
 
-  return {
-    ok: true,
-    filePath,
-    items,
-    stats: {
-      sheets: scannedSheets,
-      rows: scannedRows,
-      extracted,
-      deduped: items.length
-    }
-  };
-}
+ipcMain.handle('signingTasks:delete', async (_e, id) => {
+  try {
+    const deleted = deleteSigningTask(getSigningTasksDir(), id);
+    return { ok: true, deleted, items: listSigningTasks(getSigningTasksDir()) };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('signingTasks:executionRecords', async () => {
+  try {
+    return { ok: true, records: listExecutionRecords(getSigningTasksDir()) };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('tasks:exportCandidateSheet', async (_e, payload) => {
+  try {
+    const taskName = String(payload?.taskName || '候选初筛表').trim() || '候选初筛表';
+    const defaultName = `候选初筛表_${safeName(taskName)}.xlsx`;
+    const r = await dialog.showSaveDialog(mainWindow, {
+      title: '导出候选初筛表',
+      defaultPath: path.join(getRunsDir(), defaultName),
+      filters: [{ name: 'Excel', extensions: ['xlsx'] }]
+    });
+    if (r.canceled || !r.filePath) return { ok: true, canceled: true };
+    const exported = exportCandidateWorkbook(payload || {}, r.filePath);
+    return { ok: true, ...exported };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
 
 ipcMain.handle('tasks:importExcel', async () => {
   try {
@@ -2219,7 +2991,7 @@ ipcMain.handle('tasks:importExcel', async () => {
     });
     if (r.canceled || !r.filePaths?.[0]) return { ok: false, canceled: true };
     const filePath = r.filePaths[0];
-    return parseExcelToPgyItems(filePath);
+    return parsePgyExcelToItems(filePath);
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
@@ -2633,6 +3405,132 @@ ipcMain.handle('exports:exportResourceRun', async (_e, payload) => {
       mode: payload?.mode || 'full'
     });
     return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:exportContactRun', async (_e, payload) => {
+  try {
+    const runDirRaw = payload?.runDir || '';
+    const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    const pick = runDir || (listRunDirs()[0]?.path || '');
+    if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
+    const r = exportContactWorkbook(pick, {
+      defaultGroupTag: payload?.defaultGroupTag,
+      defaultGreeting: payload?.defaultGreeting,
+      contactChannel: payload?.contactChannel,
+      emailSubject: payload?.emailSubject,
+      emailBody: payload?.emailBody,
+      pgyCooperationType: payload?.pgyCooperationType,
+      pgyBrandName: payload?.pgyBrandName,
+      pgyProductName: payload?.pgyProductName,
+      pgyContactWay: payload?.pgyContactWay,
+      pgyIntro: payload?.pgyIntro,
+      pgyPublishStart: payload?.pgyPublishStart,
+      pgyPublishEnd: payload?.pgyPublishEnd,
+      reviewRows: payload?.reviewRows
+    });
+    return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:exportContactSelection', async (_e, payload) => {
+  try {
+    const runDirRaw = payload?.runDir || '';
+    const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    const pick = runDir || (listRunDirs()[0]?.path || '');
+    if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
+    const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+    if (!rows.length) return { ok: false, error: '当前筛选结果为空' };
+    const r = exportContactRowsWorkbook(pick, rows, {
+      suffix: payload?.suffix || '筛选结果',
+      defaultGroupTag: payload?.defaultGroupTag,
+      defaultGreeting: payload?.defaultGreeting,
+      contactChannel: payload?.contactChannel,
+      emailSubject: payload?.emailSubject,
+      emailBody: payload?.emailBody,
+      pgyCooperationType: payload?.pgyCooperationType,
+      pgyBrandName: payload?.pgyBrandName,
+      pgyProductName: payload?.pgyProductName,
+      pgyContactWay: payload?.pgyContactWay,
+      pgyIntro: payload?.pgyIntro,
+      pgyPublishStart: payload?.pgyPublishStart,
+      pgyPublishEnd: payload?.pgyPublishEnd
+    });
+    return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:getContactPreview', async (_e, payload) => {
+  try {
+    const runDirRaw = payload?.runDir || '';
+    const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    const pick = runDir || (listRunDirs()[0]?.path || '');
+    if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
+    const r = getContactPreview(pick, {
+      defaultGroupTag: payload?.defaultGroupTag,
+      defaultGreeting: payload?.defaultGreeting,
+      contactChannel: payload?.contactChannel,
+      emailSubject: payload?.emailSubject,
+      emailBody: payload?.emailBody,
+      pgyCooperationType: payload?.pgyCooperationType,
+      pgyBrandName: payload?.pgyBrandName,
+      pgyProductName: payload?.pgyProductName,
+      pgyContactWay: payload?.pgyContactWay,
+      pgyIntro: payload?.pgyIntro,
+      pgyPublishStart: payload?.pgyPublishStart,
+      pgyPublishEnd: payload?.pgyPublishEnd,
+      reviewRows: payload?.reviewRows
+    });
+    return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:loadContactReview', async (_e, payload) => {
+  try {
+    const runDirRaw = payload?.runDir || '';
+    const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    const pick = runDir || (listRunDirs()[0]?.path || '');
+    if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
+    const r = loadContactReview(getContactReviewsDir(), pick);
+    return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:saveContactReview', async (_e, payload) => {
+  try {
+    const runDirRaw = payload?.runDir || '';
+    const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    const pick = runDir || (listRunDirs()[0]?.path || '');
+    if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
+    const r = saveContactReview(getContactReviewsDir(), pick, {
+      reviewRows: payload?.reviewRows,
+      settings: payload?.settings
+    });
+    return { ok: true, runDir: pick, ...r };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:importContactReviewWorkbook', async () => {
+  try {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择建联复核表（Excel）',
+      properties: ['openFile'],
+      filters: [{ name: 'Excel', extensions: ['xlsx', 'xlsm', 'xls'] }]
+    });
+    if (r.canceled || !r.filePaths?.[0]) return { ok: true, canceled: true };
+    return parseContactReviewWorkbook(r.filePaths[0]);
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }

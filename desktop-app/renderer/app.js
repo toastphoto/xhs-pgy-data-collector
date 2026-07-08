@@ -5,6 +5,7 @@ import { renderTemplates } from './views/templates.js';
 import { renderTasks } from './views/tasks.js';
 import { renderExports } from './views/exports.js';
 import { renderReport } from './views/report_chat.js';
+import { renderToolbox } from './views/toolbox.js';
 
 const views = {
   login: renderLogin,
@@ -12,7 +13,8 @@ const views = {
   templates: renderTemplates,
   tasks: renderTasks,
   exports: renderExports,
-  report: renderReport
+  report: renderReport,
+  toolbox: renderToolbox
 };
 
 function h(tag, attrs = {}, children = []) {
@@ -38,41 +40,65 @@ function renderSidebar(state) {
     templates: iconSvg('M6 2h9l3 3v17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2 Z M9 9h6 M9 13h6 M9 17h4'),
     tasks: iconSvg('M9 11l3 3L22 4 M2 12h6 M2 6h6 M2 18h6'),
     exports: iconSvg('M12 3v12 M8 7l4-4 4 4 M5 21h14a2 2 0 0 0 2-2v-4 M3 15v4a2 2 0 0 0 2 2'),
-    report: iconSvg('M4 19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7l-4-4H6a2 2 0 0 0-2 2v14 Z M8 11h8 M8 15h8')
+    report: iconSvg('M4 19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7l-4-4H6a2 2 0 0 0-2 2v14 Z M8 11h8 M8 15h8'),
+    toolbox: iconSvg('M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.1-3.1a6 6 0 0 1-7.9 7.9l-5.6 5.6a2.1 2.1 0 0 1-3-3l5.6-5.6a6 6 0 0 1 7.9-7.9l-3.1 3.1 Z')
   };
 
-  const items = [
-    ['login', '登录态/账号'],
-    ['recordings', '录制&回放'],
-    ['templates', '采集模板'],
-    ['tasks', '批量任务'],
-    ['exports', '结果&导出'],
-    ['report', 'AI 报告']
+  const groups = [
+    {
+      label: '日常流程',
+      items: [
+        ['login', '开始', '登录账号，确认右侧网页可用'],
+        ['tasks', '找达人', '搜索、导入、整理候选达人'],
+        ['exports', '复核建联', '筛选达人并导出建联表']
+      ]
+    },
+    {
+      label: '辅助能力',
+      items: [
+        ['templates', '采集校准', '点选页面，教系统采集'],
+        ['report', 'AI 分析', '报告与问答'],
+        ['toolbox', '工具箱', '维护、排查和低频工具']
+      ]
+    }
   ];
 
-  sidebar.appendChild(h('div', { class: 'brand' }, ['小红书相关信息采集工具']));
-  // brand subtitle（始终显示在标题正下方）
-  const footer = document.createElement('div');
-  footer.className = 'sidebar-footer';
-  footer.textContent = '由黄熠制作，有问题七楼找黄熠。';
-  sidebar.appendChild(footer);
+  const brand = h('div', { class: 'brand-block' }, [
+    h('div', { class: 'brand' }, ['蒲公英达人工作台']),
+    h('div', { class: 'sidebar-footer' }, ['找达人、复核名单、导出建联表'])
+  ]);
+  sidebar.appendChild(brand);
+
+  const flow = h('div', { class: 'flow-strip' }, [
+    h('span', {}, ['搜索']),
+    h('span', {}, ['复核']),
+    h('span', {}, ['建联'])
+  ]);
+  sidebar.appendChild(flow);
 
   const navList = document.createElement('div');
   navList.className = 'nav-list';
-  items.forEach(([key, label]) => {
-    const icon = document.createElement('span');
-    icon.className = 'nav-icon';
-    icon.innerHTML = icons[key] || '';
-    navList.appendChild(
-      h(
-        'button',
-        {
-          class: `nav-item ${state.view === key ? 'active' : ''}`,
-          onclick: () => store.set({ view: key })
-        },
-        [icon, label]
-      )
-    );
+  groups.forEach((group) => {
+    navList.appendChild(h('div', { class: 'nav-group-label' }, [group.label]));
+    group.items.forEach(([key, label, desc]) => {
+      const icon = document.createElement('span');
+      icon.className = 'nav-icon';
+      icon.innerHTML = icons[key] || '';
+      const text = h('span', { class: 'nav-text' }, [
+        h('span', { class: 'nav-label' }, [label]),
+        h('span', { class: 'nav-desc' }, [desc])
+      ]);
+      navList.appendChild(
+        h(
+          'button',
+          {
+            class: `nav-item ${state.view === key ? 'active' : ''}`,
+            onclick: () => store.set({ view: key })
+          },
+          [icon, text]
+        )
+      );
+    });
   });
   sidebar.appendChild(navList);
 }
@@ -82,29 +108,34 @@ function renderTopbar(state) {
   topbar.innerHTML = '';
 
   const titleMap = {
-    login: '登录态/账号',
-    recordings: '录制&回放',
-    templates: '采集模板',
-    tasks: '批量任务',
-    exports: '结果&导出',
-    report: 'AI 报告'
+    login: ['开始', '先登录蒲公英，再进入找达人流程'],
+    recordings: ['录制回放', '工具箱里的网页操作复现工具'],
+    templates: ['点选采集内容', '页面变了再校准采集内容'],
+    tasks: ['找达人', '搜索、导入和采集候选达人'],
+    exports: ['复核建联', '筛选达人并生成建联表'],
+    report: ['AI 分析', '后续用于总结和问答'],
+    toolbox: ['工具箱', '低频维护、排查和分析入口']
   };
 
   const running = state.backend.running;
   const cls = running === true ? 'ok' : running === false ? 'bad' : 'unknown';
   const statusText =
     running === true ? '运行中' : running === false ? '未运行' : '未知';
-  const backendText = `后端：${statusText} http://${state.backend.host}:${state.backend.port}`;
+  const backendText = running === true ? '服务正常' : `服务${statusText}`;
+  const [pageTitle, pageSub] = titleMap[state.view] || ['', ''];
 
   const left = h('div', { class: 'topbar-left' }, [
-    h('div', { class: 'title' }, [titleMap[state.view] || ''])
+    h('div', { class: 'page-title-wrap' }, [
+      h('div', { class: 'title' }, [pageTitle]),
+      h('div', { class: 'page-subtitle' }, [pageSub])
+    ])
   ]);
 
   const center = h('div', { class: 'topbar-center' }, []);
   const navBack = h('button', { class: 'tb-btn ghost', title: '后退', onclick: () => window.desktopAPI.browser.nav('back') }, ['←']);
   const navForward = h('button', { class: 'tb-btn ghost', title: '前进', onclick: () => window.desktopAPI.browser.nav('forward') }, ['→']);
   const navReload = h('button', { class: 'tb-btn ghost', title: '刷新', onclick: () => window.desktopAPI.browser.nav('reload') }, ['⟳']);
-  const urlInput = h('input', { class: 'url-input', placeholder: '右侧浏览器地址（可输入并回车打开）' }, []);
+  const urlInput = h('input', { class: 'url-input', placeholder: '输入蒲公英网址，回车打开右侧网页' }, []);
   urlInput.value = state.browser?.url || '';
   urlInput.addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
@@ -180,7 +211,7 @@ function initSplitters() {
     });
   };
 
-  // 初始化时把当前 console 宽度同步给主进程，避免 BrowserView 覆盖分割条
+  // 初始化时把当前工作台宽度同步给主进程，避免右侧网页覆盖分割条
   try {
     const w = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--w-console') || '0', 10);
     if (w && window.desktopAPI?.browser?.setLayout) window.desktopAPI.browser.setLayout({ consoleWidth: w });
@@ -189,9 +220,9 @@ function initSplitters() {
   drag(splitMain, (e) => {
     const rect = body.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    // console 宽度：控制“左边控制台”与“右侧浏览器”比例
-    const min = 420;
-    const max = Math.max(min, rect.width - 320); // 右侧至少 320
+    // 工作台宽度：控制左侧工具区与右侧网页区比例
+    const min = 620;
+    const max = Math.max(min, rect.width - 420); // 右侧至少 420
     const w = clamp(x, min, max);
     rootStyle.setProperty('--w-console', `${Math.round(w)}px`);
     try {
@@ -204,7 +235,7 @@ function initSplitters() {
     const x = e.clientX - rect.left;
     // sidebar 宽度：控制左侧导航与中间内容比例
     const min = 180;
-    const max = Math.min(380, Math.max(min, rect.width - 240)); // 内容至少 240
+    const max = Math.min(320, Math.max(min, rect.width - 360)); // 内容至少 360
     const w = clamp(x, min, max);
     rootStyle.setProperty('--w-sidebar', `${Math.round(w)}px`);
   });

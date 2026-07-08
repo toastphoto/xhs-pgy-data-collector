@@ -3,7 +3,7 @@ export function renderReport(_state) {
   root.className = 'view';
   root.innerHTML = `
     <h2>AI 报告</h2>
-    <p>v1：占位页。后续 Task 8 将实现一键生成对比报告并展示 markdown。</p>
+    <p>这里后续用于生成达人对比报告。当前阶段先以复核名单和建联表为主。</p>
   `;
   return root;
 }

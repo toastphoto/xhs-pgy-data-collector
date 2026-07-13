@@ -10,8 +10,10 @@
     "dev": "node ./scripts/run-electron.js",
     "start": "node ./scripts/run-electron.js",
     "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/path_guard.test.js && node tests/quality_report.test.js && node tests/pgy_risk.test.js && node tests/task_runner_safety.test.js && node tests/signing_task.test.js && node tests/signing_task_store.test.js && node tests/candidate_sheet.test.js && node tests/pgy_excel.test.js && node tests/contact_sheet.test.js && node tests/contact_review_store.test.js && node tests/contact_review_excel.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
+    "build:backend:mac": "cd ../content-analyzer && python3 -m PyInstaller -y main.py --name xhs-pgy-backend --onedir --clean --distpath dist-pyinstaller --workpath build-pyinstaller --specpath build-pyinstaller --add-data \"$PWD/app/static:app/static\"",
     "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac"
+    "dist:mac": "npm run build:backend:mac && electron-builder --mac",
+    "dist:mac:app-only": "electron-builder --mac"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
@@ -47,6 +49,13 @@
           "!logs/**",
           "!output/**",
           "!data/**"
+        ]
+      },
+      {
+        "from": "../content-analyzer/dist-pyinstaller/xhs-pgy-backend",
+        "to": "content-analyzer-backend",
+        "filter": [
+          "**/*"
         ]
       }
     ],

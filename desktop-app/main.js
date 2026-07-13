@@ -847,19 +847,75 @@ function startBackendIfNeeded() {
     ? path.join(process.resourcesPath, 'content-analyzer')
     : path.resolve(__dirname, '..', 'content-analyzer');
   const backendEntry = path.join(backendDir, 'main.py');
+  const packagedBackendDir = path.join(process.resourcesPath, 'content-analyzer-backend');
+  const packagedBackendEntry = path.join(packagedBackendDir, 'xhs-pgy-backend');
+  const shouldUsePackagedBackend = app.isPackaged && fs.existsSync(packagedBackendEntry);
 
-  if (!fs.existsSync(backendEntry)) {
+  if (!shouldUsePackagedBackend && !fs.existsSync(backendEntry)) {
     console.warn('[backend] 未找到后端入口 main.py，跳过启动：', backendEntry);
     return;
   }
 
+  const packagedDataRoot = app.isPackaged ? path.join(app.getPath('userData'), 'content-analyzer') : null;
   // 可按需在这里固定端口
   const env = {
     ...process.env,
     API_HOST: process.env.API_HOST || DEFAULT_API_HOST,
     API_PORT: process.env.API_PORT || DEFAULT_API_PORT,
-    DEBUG: process.env.DEBUG || 'false'
+    DEBUG: process.env.DEBUG || 'false',
+    ...(packagedDataRoot
+      ? {
+          DATA_DIR: process.env.DATA_DIR || path.join(packagedDataRoot, 'data'),
+          OUTPUT_DIR: process.env.OUTPUT_DIR || path.join(packagedDataRoot, 'output'),
+          LOG_DIR: process.env.LOG_DIR || path.join(packagedDataRoot, 'logs')
+        }
+      : {})
   };
+
+  if (shouldUsePackagedBackend) {
+    console.log('[backend] 启动内置后端：', packagedBackendEntry);
+    const proc = spawn(packagedBackendEntry, [], {
+      cwd: packagedBackendDir,
+      env,
+      stdio: 'pipe'
+    });
+
+    proc.on('error', (err) => {
+      console.error('[backend] 内置后端启动失败：', err);
+      mainWindow?.webContents.send('backend:status', { running: false, code: err?.code || 'SPAWN_ERROR' });
+    });
+
+    proc.stdout.on('data', (buf) => {
+      const s = buf.toString();
+      console.log('[backend]', s.trimEnd());
+    });
+    proc.stderr.on('data', (buf) => {
+      const s = buf.toString();
+      console.error('[backend]', s.trimEnd());
+    });
+    proc.on('exit', (code) => {
+      console.warn('[backend] exited:', code);
+      if (backendProc === proc) backendProc = null;
+      mainWindow?.webContents.send('backend:status', { running: false, code });
+    });
+
+    backendProc = proc;
+    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT })
+      .then((ready) => {
+        mainWindow?.webContents.send('backend:status', ready?.ok
+          ? { running: true, host: env.API_HOST, port: env.API_PORT, readyPath: ready.path }
+          : { running: false, host: env.API_HOST, port: env.API_PORT, code: ready?.code || 'BACKEND_NOT_READY' });
+      })
+      .catch((err) => {
+        mainWindow?.webContents.send('backend:status', {
+          running: false,
+          host: env.API_HOST,
+          port: env.API_PORT,
+          code: err?.code || 'BACKEND_PROBE_ERROR'
+        });
+      });
+    return;
+  }
 
   // 兼容 Windows/macOS：python 命令可能叫 python3 / py
   const pythonCandidates = [];

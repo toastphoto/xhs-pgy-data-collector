@@ -5,8 +5,12 @@
 import sys
 import os
 
-# 添加项目根目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    os.chdir(sys._MEIPASS)
+    sys.path.insert(0, sys._MEIPASS)
+else:
+    # 添加项目根目录到Python路径
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.api.server import app
 from app.utils.config import Config

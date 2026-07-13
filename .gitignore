@@ -11,6 +11,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.packaging-venv/
+content-analyzer/build-pyinstaller/
+content-analyzer/dist-pyinstaller/
 
 # Node/Electron
 node_modules/

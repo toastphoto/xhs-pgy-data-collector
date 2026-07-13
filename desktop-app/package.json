@@ -36,6 +36,20 @@
     "files": [
       "**/*"
     ],
+    "extraResources": [
+      {
+        "from": "../content-analyzer",
+        "to": "content-analyzer",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!logs/**",
+          "!output/**",
+          "!data/**"
+        ]
+      }
+    ],
     "mac": {
       "target": "dmg"
     },

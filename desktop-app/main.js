@@ -843,8 +843,9 @@ function startBackendIfNeeded() {
   if (process.env.ELECTRON_START_BACKEND === 'false') return;
   if (backendProc) return;
 
-  // 假设项目结构为：workspace/content-analyzer + workspace/desktop-app
-  const backendDir = path.resolve(__dirname, '..', 'content-analyzer');
+  const backendDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'content-analyzer')
+    : path.resolve(__dirname, '..', 'content-analyzer');
   const backendEntry = path.join(backendDir, 'main.py');
 
   if (!fs.existsSync(backendEntry)) {

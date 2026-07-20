@@ -12,6 +12,10 @@ let _colsLoadedOnce = false;
 let _activeGroup = '';
 let _contactGroupTag = '';
 let _contactGreeting = '您好，我们想和您沟通一下品牌合作，方便的话可以通过一下好友吗？';
+let _xiaomifengSmartRemark = '{MMDD}-{昵称}';
+let _xiaomifengTaskWechat = '';
+let _xiaomifengApproval = null;
+let _xiaomifengApprovalCheck = null;
 let _contactChannelStrategy = '自动分流';
 let _contactEmailSubject = '';
 let _contactEmailBody = '';
@@ -35,9 +39,22 @@ let _contactPriorityFilter = 'all';
 let _contactFollowupFilter = 'all';
 let _contactChannelFilter = 'all';
 let _contactBatchFollowupStatus = '待建联';
+let _contactBatchChannel = '蒲公英邀约';
+let _xhsContactBatchCount = 20;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
 let _lastContactExportPath = '';
+let _xhsContactListenerBound = false;
+let _xhsContactState = {
+  running: false,
+  paused: false,
+  total: 0,
+  completed: 0,
+  found: 0,
+  failed: 0,
+  session: 'unknown',
+  message: ''
+};
 
 const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
 const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
@@ -113,6 +130,79 @@ function getReviewRows() {
   return Array.from(_contactReviewMap.values()).map((row) => ({ ...row }));
 }
 
+function applyXhsContactUpdate(update = {}) {
+  const rowId = String(update.rowId || '');
+  if (!rowId) return false;
+  const review = _contactReviewMap.get(rowId);
+  if (!review) return false;
+  if (!String(review.email || '').trim() && update.email) review.email = update.email;
+  if (!String(review.wechatId || '').trim() && update.wechatId) review.wechatId = update.wechatId;
+  if (!String(review.phone || '').trim() && update.phone) review.phone = update.phone;
+  if (update.xhsProfileUrl) review.xhsProfileUrl = update.xhsProfileUrl;
+  if (update.contactSource) review.contactSource = update.contactSource;
+  if (update.contactCollectedAt) review.contactCollectedAt = update.contactCollectedAt;
+  if (update.contactCollectionStatus) review.contactCollectionStatus = update.contactCollectionStatus;
+  _xiaomifengApprovalCheck = null;
+  scheduleContactReviewSave();
+  return true;
+}
+
+function ensureXhsContactProgressListener() {
+  if (_xhsContactListenerBound || !window.desktopAPI?.contacts?.onXhsProgress) return;
+  _xhsContactListenerBound = true;
+  window.desktopAPI.contacts.onXhsProgress((payload = {}) => {
+    if (payload.type === 'item_result' && payload.update) applyXhsContactUpdate(payload.update);
+    _xhsContactState = {
+      ..._xhsContactState,
+      running: typeof payload.running === 'boolean' ? payload.running : _xhsContactState.running,
+      paused: typeof payload.paused === 'boolean' ? payload.paused : _xhsContactState.paused,
+      total: Number.isFinite(Number(payload.total)) ? Number(payload.total) : _xhsContactState.total,
+      completed: Number.isFinite(Number(payload.completed)) ? Number(payload.completed) : _xhsContactState.completed,
+      found: Number.isFinite(Number(payload.found)) ? Number(payload.found) : _xhsContactState.found,
+      failed: Number.isFinite(Number(payload.failed)) ? Number(payload.failed) : _xhsContactState.failed,
+      message: payload.message || payload.pauseReason || payload.error || _xhsContactState.message
+    };
+    if (payload.type === 'started' || payload.type === 'resumed') {
+      _xhsContactState.running = true;
+      _xhsContactState.paused = false;
+    }
+    if (payload.type === 'paused') _xhsContactState.paused = true;
+    if (payload.type === 'finished' || payload.type === 'failed') {
+      _xhsContactState.running = false;
+      _xhsContactState.paused = false;
+    }
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+}
+
+async function startXhsContactRows(targets, scopeLabel = '当前筛选') {
+  if (!targets.length) return setMsg(`${scopeLabel}中没有已选达人。`);
+  const confirmed = window.confirm(
+    `确认开始补采${scopeLabel}的 ${targets.length} 位达人？\n\n系统会在右侧可见浏览器中低频串行打开个人主页，只读取公开简介中的联系方式，不会发送消息。`
+  );
+  if (!confirmed) return;
+  _xhsContactState = { running: true, paused: false, total: targets.length, completed: 0, found: 0, failed: 0, session: _xhsContactState.session, message: '' };
+  const result = await window.desktopAPI.contacts.enrichXhsBatch({
+    runDir: _selectedRunDir,
+    rows: buildExportRowsFromContactRows(targets)
+  });
+  if (!result?.ok) {
+    _xhsContactState.running = false;
+    return setMsg(`小红书补采失败：${result?.error || 'unknown error'}`);
+  }
+  (Array.isArray(result.updates) ? result.updates : []).forEach(applyXhsContactUpdate);
+  await saveContactReviewNow();
+  _xhsContactState = {
+    ..._xhsContactState,
+    running: false,
+    paused: false,
+    completed: result.updates?.length || _xhsContactState.completed,
+    found: result.found || 0,
+    failed: result.failed || 0
+  };
+  setMsg(`小红书补采完成：处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`);
+}
+
 function normalizeContactUrl(value) {
   const s = String(value || '').trim();
   if (!s) return '';
@@ -170,7 +260,15 @@ function buildExportRowsFromContactRows(rows) {
       email: review.email || row.email || '',
       wechatId: review.wechatId || '',
       phone: review.phone || '',
+      xhsProfileUrl: review.xhsProfileUrl || row.xhsProfileUrl || '',
+      contactSource: review.contactSource || '',
+      contactCollectedAt: review.contactCollectedAt || '',
+      contactCollectionStatus: review.contactCollectionStatus || '',
       contactChannel: normalizeContactChannel(review.contactChannel || row.contactChannel || _contactChannelStrategy),
+      groupTag: _contactGroupTag,
+      greeting: _contactGreeting,
+      xiaomifengSmartRemark: _xiaomifengSmartRemark,
+      xiaomifengTaskWechat: _xiaomifengTaskWechat,
       pgyInvite: row.pgyInvite || getPgyInviteSettings(),
       emailTemplate: row.emailTemplate || getEmailTemplateSettings()
     };
@@ -206,7 +304,7 @@ function summarizeContactReviewRows(rows) {
       acc.total += 1;
       if (selected) acc.selected += 1;
       if (selected && channel === '蒲公英邀约') acc.pgyInvite += 1;
-      if (selected && channel === '邮件建联' && hasEmail) acc.email += 1;
+      if (selected && hasEmail) acc.email += 1;
       if (selected && channel === '微信建联' && hasWechat) acc.wechat += 1;
       if (selected && (
         channel === '待补联系方式' ||
@@ -252,6 +350,8 @@ function getContactSettings() {
   return {
     defaultGroupTag: _contactGroupTag,
     defaultGreeting: _contactGreeting,
+    xiaomifengSmartRemark: _xiaomifengSmartRemark,
+    xiaomifengTaskWechat: _xiaomifengTaskWechat,
     contactChannel: _contactChannelStrategy,
     emailSubject: _contactEmailSubject,
     emailBody: _contactEmailBody,
@@ -338,6 +438,10 @@ function ensureReviewRow(row) {
       email: row?.email || '',
       wechatId: row?.wechatId || '',
       phone: row?.phone || '',
+      xhsProfileUrl: row?.xhsProfileUrl || '',
+      contactSource: row?.contactSource || '',
+      contactCollectedAt: row?.contactCollectedAt || '',
+      contactCollectionStatus: row?.contactCollectionStatus || '',
       contactChannel: normalizeContactChannel(row?.contactChannel || _contactChannelStrategy)
     });
   }
@@ -407,6 +511,8 @@ async function loadContactReviewForRun(force = false) {
     });
     if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
     if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
+    if (r.settings?.xiaomifengSmartRemark) _xiaomifengSmartRemark = r.settings.xiaomifengSmartRemark;
+    if (r.settings?.xiaomifengTaskWechat !== undefined) _xiaomifengTaskWechat = r.settings.xiaomifengTaskWechat;
     if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
     if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
     if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
@@ -430,6 +536,28 @@ async function saveContactReviewNow() {
     reviewRows: getReviewRows(),
     settings: getContactSettings()
   });
+}
+
+function getXiaomifengApprovalPayload() {
+  return {
+    runDir: _selectedRunDir,
+    rows: buildExportRowsFromContactRows(_contactPreviewRows),
+    settings: getContactSettings()
+  };
+}
+
+async function refreshXiaomifengApproval() {
+  if (!_selectedRunDir || !_contactPreviewRows.length) {
+    _xiaomifengApproval = null;
+    _xiaomifengApprovalCheck = null;
+    return;
+  }
+  try {
+    const result = await window.desktopAPI.approvals.getXiaomifeng(getXiaomifengApprovalPayload());
+    if (!result?.ok) return;
+    _xiaomifengApproval = result.approval || null;
+    _xiaomifengApprovalCheck = result.check || null;
+  } catch (_) {}
 }
 
 async function importContactReviewWorkbookNow() {
@@ -482,6 +610,7 @@ function scheduleContactReviewSave() {
   if (!_selectedRunDir) return;
   if (_contactSaveTimer) clearTimeout(_contactSaveTimer);
   _contactSaveStatus = '等待自动保存';
+  _xiaomifengApprovalCheck = null;
   _contactSaveTimer = setTimeout(async () => {
     _contactSaveTimer = null;
     try {
@@ -524,7 +653,14 @@ async function refreshContactPreview() {
       error: ''
     };
     _contactPreviewRunDir = _selectedRunDir;
-    _contactPreviewRows.forEach((row) => ensureReviewRow(row));
+    const migratedReviewMap = new Map();
+    _contactPreviewRows.forEach((row) => {
+      const review = ensureReviewRow(row);
+      if (review) migratedReviewMap.set(row.rowId, { ...review, rowId: row.rowId });
+    });
+    _contactReviewMap = migratedReviewMap;
+    await saveContactReviewNow();
+    await refreshXiaomifengApproval();
     _contactSaveStatus = '';
     setMsg('');
   } catch (e) {
@@ -534,6 +670,7 @@ async function refreshContactPreview() {
 }
 
 export function renderExports(state) {
+  ensureXhsContactProgressListener();
   const requestedRunDir = state.exports?.selectedRunDir || '';
   if (requestedRunDir && requestedRunDir !== _selectedRunDir) {
     _selectedRunDir = requestedRunDir;
@@ -730,6 +867,32 @@ export function renderExports(state) {
   });
   greetingWrap.appendChild(greetingInput);
 
+  const xmfRemarkWrap = document.createElement('label');
+  xmfRemarkWrap.className = 'field-label';
+  xmfRemarkWrap.textContent = '小蜜蜂智能备注';
+  const xmfRemarkInput = document.createElement('input');
+  xmfRemarkInput.className = 'tpl-input';
+  xmfRemarkInput.placeholder = '{MMDD}-{昵称}';
+  xmfRemarkInput.value = _xiaomifengSmartRemark;
+  xmfRemarkInput.addEventListener('input', () => {
+    _xiaomifengSmartRemark = xmfRemarkInput.value;
+    scheduleContactReviewSave();
+  });
+  xmfRemarkWrap.appendChild(xmfRemarkInput);
+
+  const xmfAccountWrap = document.createElement('label');
+  xmfAccountWrap.className = 'field-label';
+  xmfAccountWrap.textContent = '任务微信';
+  const xmfAccountInput = document.createElement('input');
+  xmfAccountInput.className = 'tpl-input';
+  xmfAccountInput.placeholder = '留空由小蜜蜂智能分配';
+  xmfAccountInput.value = _xiaomifengTaskWechat;
+  xmfAccountInput.addEventListener('input', () => {
+    _xiaomifengTaskWechat = xmfAccountInput.value;
+    scheduleContactReviewSave();
+  });
+  xmfAccountWrap.appendChild(xmfAccountInput);
+
   const btnExportContact = document.createElement('button');
   btnExportContact.className = 'btn primary';
   btnExportContact.className = 'btn primary export-main-cta';
@@ -760,6 +923,8 @@ export function renderExports(state) {
   contactGrid.appendChild(strategyWrap);
   contactGrid.appendChild(groupWrap);
   contactGrid.appendChild(greetingWrap);
+  contactGrid.appendChild(xmfRemarkWrap);
+  contactGrid.appendChild(xmfAccountWrap);
 
   const emailWrap = document.createElement('label');
   emailWrap.className = 'field-label';
@@ -841,12 +1006,156 @@ export function renderExports(state) {
   metrics.appendChild(makeMetricCard('待补联系方式', _contactPreviewRows.length ? String(allReviewSummary.pending) : '-', allReviewSummary.pending ? 'warn' : ''));
   contactSec.appendChild(metrics);
 
+  const xhsContactBar = document.createElement('div');
+  xhsContactBar.className = 'export-review-toolbar';
+  setStyles(xhsContactBar, { marginTop: '10px' });
+  const xhsContactStatus = document.createElement('div');
+  xhsContactStatus.className = 'export-review-summary';
+  if (_xhsContactState.running && _xhsContactState.paused) {
+    xhsContactStatus.textContent = `小红书补采已暂停：${_xhsContactState.message || '请在右侧手工处理'}（${_xhsContactState.completed}/${_xhsContactState.total}）`;
+  } else if (_xhsContactState.running) {
+    xhsContactStatus.textContent = `正在补采小红书公开联系方式：${_xhsContactState.completed}/${_xhsContactState.total}，已找到 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
+  } else if (_xhsContactState.total) {
+    xhsContactStatus.textContent = `上次补采：完成 ${_xhsContactState.completed}/${_xhsContactState.total}，找到联系方式 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
+  } else if (_xhsContactState.session === 'ready') {
+    xhsContactStatus.textContent = '小红书页面可用，可以对已选达人补采公开简介中的联系方式。';
+  } else {
+    xhsContactStatus.textContent = '先在右侧完成小红书人工登录，再串行补采公开邮箱、微信或手机号。';
+  }
+
+  const btnOpenXhsLogin = makeSoftButton('打开小红书登录', async () => {
+    const result = await window.desktopAPI.contacts.openXhsLogin();
+    if (!result?.ok) return setMsg(`打开小红书失败：${result?.error || 'unknown error'}`);
+    _xhsContactState = { ..._xhsContactState, session: 'waiting_login', message: '请在右侧人工登录' };
+    setMsg('请在右侧完成小红书登录，完成后点击“检测登录”。');
+  }, { disabled: _xhsContactState.running });
+
+  const btnCheckXhsLogin = makeSoftButton('检测登录', async () => {
+    const result = await window.desktopAPI.contacts.checkXhsLogin();
+    if (!result?.ok) return setMsg(`检测失败：${result?.error || 'unknown error'}`);
+    if (result.riskDetected) {
+      _xhsContactState = { ..._xhsContactState, session: 'risk', message: result.riskText || '需要手工验证' };
+      return setMsg(`小红书需要手工验证：${result.riskText || '请查看右侧页面'}`);
+    }
+    _xhsContactState = { ..._xhsContactState, session: result.loggedIn ? 'ready' : 'login_required', message: '' };
+    setMsg(result.loggedIn ? '小红书页面已可用。' : '尚未完成小红书登录。');
+  }, { disabled: _xhsContactState.running && !_xhsContactState.paused });
+
+  const btnStartXhsContact = makeSoftButton('补采当前筛选', async () => {
+    const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected !== false);
+    await startXhsContactRows(targets, '当前筛选');
+  }, { primary: true, disabled: !_contactPreviewRows.length || _xhsContactState.running });
+
+  const xhsBatchCountInput = document.createElement('input');
+  xhsBatchCountInput.className = 'tpl-input';
+  xhsBatchCountInput.type = 'number';
+  xhsBatchCountInput.min = '1';
+  xhsBatchCountInput.max = '50';
+  xhsBatchCountInput.value = String(_xhsContactBatchCount);
+  xhsBatchCountInput.title = '按建联表顺序补采的人数';
+  setStyles(xhsBatchCountInput, { width: '72px', height: '32px' });
+  xhsBatchCountInput.addEventListener('change', () => {
+    _xhsContactBatchCount = Math.max(1, Math.min(50, Number(xhsBatchCountInput.value) || 20));
+    xhsBatchCountInput.value = String(_xhsContactBatchCount);
+  });
+
+  const btnStartXhsFirstN = makeSoftButton('补采名单前 N 人', async () => {
+    const targets = _contactPreviewRows
+      .slice(0, _xhsContactBatchCount)
+      .filter((row) => ensureReviewRow(row)?.selected !== false);
+    await startXhsContactRows(targets, `名单前 ${_xhsContactBatchCount} 人`);
+  }, { disabled: !_contactPreviewRows.length || _xhsContactState.running });
+
+  const btnPauseXhsContact = makeSoftButton(_xhsContactState.paused ? '继续' : '暂停', async () => {
+    const result = _xhsContactState.paused
+      ? await window.desktopAPI.contacts.resumeXhsEnrichment()
+      : await window.desktopAPI.contacts.pauseXhsEnrichment();
+    if (!result?.ok) setMsg(`补采任务操作失败：${result?.error || 'unknown error'}`);
+  }, { disabled: !_xhsContactState.running });
+
+  const btnCancelXhsContact = makeSoftButton('停止', async () => {
+    const result = await window.desktopAPI.contacts.cancelXhsEnrichment();
+    if (!result?.ok) setMsg(`停止失败：${result?.error || 'unknown error'}`);
+  }, { disabled: !_xhsContactState.running });
+
+  xhsContactBar.appendChild(xhsContactStatus);
+  xhsContactBar.appendChild(btnOpenXhsLogin);
+  xhsContactBar.appendChild(btnCheckXhsLogin);
+  xhsContactBar.appendChild(btnStartXhsContact);
+  xhsContactBar.appendChild(xhsBatchCountInput);
+  xhsContactBar.appendChild(btnStartXhsFirstN);
+  xhsContactBar.appendChild(btnPauseXhsContact);
+  xhsContactBar.appendChild(btnCancelXhsContact);
+  contactSec.appendChild(xhsContactBar);
+
   const contactSettings = createAdvancedSection({
     title: '建联策略与话术',
     children: [contactGrid, pgyGrid]
   });
   contactSettings.classList.add('contact-settings-section');
   contactSec.appendChild(contactSettings);
+
+  const approvalBar = document.createElement('div');
+  approvalBar.className = 'export-review-toolbar';
+  setStyles(approvalBar, { marginTop: '10px' });
+  const approvalStatus = document.createElement('div');
+  approvalStatus.className = 'export-review-summary';
+  if (_xiaomifengApprovalCheck?.ok) {
+    approvalStatus.textContent = `小蜜蜂批次已由 ${_xiaomifengApproval?.approvedBy || '人工'} 确认，可以导出执行文件。`;
+  } else if (_xiaomifengApprovalCheck?.code === 'APPROVAL_STALE') {
+    approvalStatus.textContent = '小蜜蜂批次内容已变化，原确认失效，请重新提交。';
+  } else if (_xiaomifengApproval?.status === 'pending_approval') {
+    approvalStatus.textContent = '小蜜蜂批次等待人工确认。';
+  } else {
+    approvalStatus.textContent = '小蜜蜂执行文件需要先提交并完成人工确认。';
+  }
+
+  const btnSubmitXmfApproval = makeSoftButton('提交小蜜蜂确认', async () => {
+    try {
+      await saveContactReviewNow();
+      const result = await window.desktopAPI.approvals.submitXiaomifeng({
+        ...getXiaomifengApprovalPayload(),
+        requestedBy: '桌面端操作人'
+      });
+      if (!result?.ok) return setMsg(`提交确认失败：${result?.error || 'unknown error'}`);
+      _xiaomifengApproval = result.approval;
+      _xiaomifengApprovalCheck = result.check || { ok: false, code: 'APPROVAL_NOT_APPROVED' };
+      setMsg(`已提交 ${result.recipientCount || 0} 位达人，等待人工确认。`);
+    } catch (e) {
+      setMsg(`提交确认异常：${e?.message || String(e)}`);
+    }
+  }, { disabled: !allReviewSummary.wechat });
+
+  const btnApproveXmf = makeSoftButton('人工确认本批次', async () => {
+    const approver = window.prompt('请输入确认人姓名：', _xiaomifengApproval?.approvedBy || '');
+    if (!String(approver || '').trim()) return;
+    const confirmed = window.confirm(`确认批准当前小蜜蜂批次？\n\n达人数量：${allReviewSummary.wechat}\n发送内容：${_contactGreeting || '(空)'}\n\n确认后才允许生成执行文件。`);
+    if (!confirmed) return;
+    const result = await window.desktopAPI.approvals.approveXiaomifeng({
+      ...getXiaomifengApprovalPayload(),
+      approver
+    });
+    if (!result?.ok) return setMsg(`人工确认失败：${result?.error || 'unknown error'}`);
+    _xiaomifengApproval = result.approval;
+    _xiaomifengApprovalCheck = { ok: true };
+    setMsg(`已由 ${result.approval?.approvedBy || approver} 确认 ${result.recipientCount || 0} 位达人。`);
+  }, { disabled: _xiaomifengApproval?.status !== 'pending_approval' });
+
+  const btnExportXmf = makeSoftButton('导出小蜜蜂执行文件', async () => {
+    const result = await window.desktopAPI.exports.exportXiaomifeng(getXiaomifengApprovalPayload());
+    if (!result?.ok) {
+      _xiaomifengApprovalCheck = result;
+      return setMsg(`小蜜蜂文件未导出：${result?.error || '需要重新人工确认'}`);
+    }
+    _lastContactExportPath = result.outPath || '';
+    setMsg(`小蜜蜂执行文件已生成：\n${result.outPath}\n\n达人=${result.rows}，审批记录=${result.approvalId}`);
+  }, { primary: true, disabled: !_xiaomifengApprovalCheck?.ok });
+
+  approvalBar.appendChild(approvalStatus);
+  approvalBar.appendChild(btnSubmitXmfApproval);
+  approvalBar.appendChild(btnApproveXmf);
+  approvalBar.appendChild(btnExportXmf);
+  contactSec.appendChild(approvalBar);
 
   const reviewTop = document.createElement('div');
   reviewTop.className = 'export-review-toolbar';
@@ -1138,6 +1447,30 @@ export function renderExports(state) {
       scheduleContactReviewSave();
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     }));
+    const batchChannel = document.createElement('select');
+    batchChannel.className = 'tpl-input';
+    batchChannel.style.height = '32px';
+    batchChannel.style.width = '148px';
+    CONTACT_CHANNEL_OPTIONS.forEach((value) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = value;
+      if (value === _contactBatchChannel) opt.selected = true;
+      batchChannel.appendChild(opt);
+    });
+    batchChannel.addEventListener('change', () => {
+      _contactBatchChannel = normalizeContactChannel(batchChannel.value);
+    });
+    filterActions.appendChild(batchChannel);
+    filterActions.appendChild(mkFilterBtn('当前结果改建联方式', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        if (review) review.contactChannel = _contactBatchChannel;
+      });
+      _xiaomifengApprovalCheck = null;
+      scheduleContactReviewSave();
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }));
     const bulkDetails = createAdvancedSection({
       title: `批量处理当前筛选结果（${filteredContactRows.length} 人）`,
       children: [filterActions]
@@ -1241,6 +1574,11 @@ export function renderExports(state) {
       appendChip('邮箱', review?.email ? '已填' : '待补', review?.email ? 'good' : 'warn');
       appendChip('微信', review?.wechatId ? '已填' : '待补', review?.wechatId ? 'good' : 'warn');
       if (review?.phone) appendChip('手机', '已填', 'good');
+      if (review?.contactCollectionStatus === 'found') appendChip('小红书公开资料', '已补采', 'good');
+      if (review?.contactCollectionStatus === 'not_public') appendChip('小红书主页', '未公开联系方式');
+      if (review?.contactCollectionStatus === 'profile_not_found' || review?.contactCollectionStatus === 'profile_unavailable') {
+        appendChip('小红书主页', '补采失败', 'warn');
+      }
 
       const fields = document.createElement('div');
       fields.className = 'contact-review-fields';

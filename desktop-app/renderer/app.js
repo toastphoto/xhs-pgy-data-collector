@@ -242,36 +242,40 @@ function initSplitters() {
 }
 
 async function bootstrap() {
-  // 先用 backend.info 展示 host/port（是否真正运行由 backend:status 推送更新）
-  try {
-    const info = await window.desktopAPI.backend.info();
-    if (info?.ok) {
+  const applyBackendStatus = (status) => {
+    if (!status) return;
+    const next = {
+      ...store.state.backend,
+      running: typeof status.running === 'boolean' ? status.running : store.state.backend.running,
+      host: status.host || store.state.backend.host,
+      port: status.port || store.state.backend.port,
+      code: status.code || ''
+    };
+    if (
+      next.running !== store.state.backend.running ||
+      next.host !== store.state.backend.host ||
+      next.port !== store.state.backend.port ||
+      next.code !== store.state.backend.code
+    ) {
       store.set({
-        backend: {
-          ...store.state.backend,
-          running: typeof info.running === 'boolean' ? info.running : store.state.backend.running,
-          host: info.host || store.state.backend.host,
-          port: info.port || store.state.backend.port
-        }
+        backend: next
       });
     }
-  } catch (_) {}
+  };
 
-  window.desktopAPI.backend.onStatus((st) => {
-    if (st?.running) {
-      store.set({
-        backend: {
-          running: true,
-          host: st.host || store.state.backend.host,
-          port: st.port || store.state.backend.port
-        }
-      });
-    } else {
-      store.set({
-        backend: { ...store.state.backend, running: false }
-      });
+  const refreshBackendStatus = async () => {
+    try {
+      const info = await window.desktopAPI.backend.info();
+      if (info?.ok) applyBackendStatus(info);
+    } catch (_) {
+      applyBackendStatus({ running: false, code: 'BACKEND_INFO_FAILED' });
     }
-  });
+  };
+
+  // 先订阅再查询，避免后端在 renderer 初始化期间就绪时丢失状态事件。
+  window.desktopAPI.backend.onStatus(applyBackendStatus);
+  await refreshBackendStatus();
+  window.setInterval(refreshBackendStatus, 10000);
 
   window.desktopAPI.recording.onCount((n) => {
     store.set({

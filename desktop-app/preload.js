@@ -61,6 +61,7 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     exportResourceRun: (payload) => ipcRenderer.invoke('exports:exportResourceRun', payload),
     exportContactRun: (payload) => ipcRenderer.invoke('exports:exportContactRun', payload),
     exportContactSelection: (payload) => ipcRenderer.invoke('exports:exportContactSelection', payload),
+    exportXiaomifeng: (payload) => ipcRenderer.invoke('exports:exportXiaomifeng', payload),
     getContactPreview: (payload) => ipcRenderer.invoke('exports:getContactPreview', payload),
     loadContactReview: (payload) => ipcRenderer.invoke('exports:loadContactReview', payload),
     saveContactReview: (payload) => ipcRenderer.invoke('exports:saveContactReview', payload),
@@ -69,6 +70,20 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     loadColumnPreset: () => ipcRenderer.invoke('exports:loadColumnPreset'),
     saveColumnPreset: (cols) => ipcRenderer.invoke('exports:saveColumnPreset', cols),
     openPath: (p) => ipcRenderer.invoke('exports:openPath', p)
+  },
+  approvals: {
+    getXiaomifeng: (payload) => ipcRenderer.invoke('approvals:getXiaomifeng', payload),
+    submitXiaomifeng: (payload) => ipcRenderer.invoke('approvals:submitXiaomifeng', payload),
+    approveXiaomifeng: (payload) => ipcRenderer.invoke('approvals:approveXiaomifeng', payload)
+  },
+  contacts: {
+    openXhsLogin: () => ipcRenderer.invoke('contacts:openXhsLogin'),
+    checkXhsLogin: () => ipcRenderer.invoke('contacts:checkXhsLogin'),
+    enrichXhsBatch: (payload) => ipcRenderer.invoke('contacts:enrichXhsBatch', payload),
+    pauseXhsEnrichment: () => ipcRenderer.invoke('contacts:pauseXhsEnrichment'),
+    resumeXhsEnrichment: () => ipcRenderer.invoke('contacts:resumeXhsEnrichment'),
+    cancelXhsEnrichment: () => ipcRenderer.invoke('contacts:cancelXhsEnrichment'),
+    onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload))
   },
   db: {
     stats: () => ipcRenderer.invoke('db:stats'),

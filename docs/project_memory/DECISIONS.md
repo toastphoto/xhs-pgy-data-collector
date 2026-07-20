@@ -175,6 +175,13 @@
 - Impact: `desktop-app/lib/contact_sheet.js`, `desktop-app/lib/contact_review_store.js`, `desktop-app/lib/contact_review_excel.js`, and `desktop-app/renderer/views/exports.js` should preserve contact channel, email, WeChat/phone, and round-trip import behavior. `小蜜蜂导入表` remains only one downstream route; `蒲公英邀约表`, `邮件建联表`, and `待补联系方式` should stay reviewable and human-controlled.
 - Reevaluate when: The team approves an email sending policy/API, a stable Pugongying invite automation contract exists, or XiaoMiFeng/WeChat AI provides a tested import/result format.
 
+## 2026-07-20: Make email export additive when an address is available
+
+- Decision: Include every selected creator with a non-empty email in `邮件建联表`, regardless of the creator's primary contact channel. Keep the primary-channel row, such as `蒲公英邀约表`, at the same time.
+- Why: An available email is an additional executable contact option, not a reason to remove the creator from the already approved Pugongying route. Exclusive routing hid collected contact data from the email handoff sheet.
+- Impact: Email and Pugongying workbook counts may overlap. `邮件建联表` remains a reviewable candidate list and does not authorize or trigger sending; all actual sending still requires current human confirmation.
+- Reevaluate when: The product introduces explicit per-creator multi-channel enable/disable controls or a team-wide deduplication policy for parallel outreach.
+
 ## 2026-07-07: Define MVP acceptance before calling the app delivered
 
 - Decision: Add an explicit MVP acceptance plan and readiness checker. Static/local readiness, safety posture, real-account validation, and operator workbook trial must be treated as separate gates.
@@ -314,3 +321,17 @@
 - Why: Real-account testing is the only evidence that can support "safe enough for normal internal use", but it must be tied to the actual build and process that was tested. Otherwise a later thread could confuse static code safety with live platform validation.
 - Impact: `scripts/validate_pgy_live_validation.py` now requires precheck fields; `docs/project_memory/PGY_LIVE_VALIDATION_PROTOCOL.md`, `AGENTS.md`, and handoff docs point operators to the preparer script. Completed validation JSON should still stay out of git if it contains local run references or private notes.
 - Reevaluate when: The app gets an in-app safety validation wizard or the team adopts a shared, privacy-safe QA system.
+
+## 2026-07-15: Phase 1 stops at approved execution-file generation
+
+- Decision: Implement backend status recovery, strict XiaoMiFeng export, Feishu record/event contracts, and fingerprinted human approval first. Reserve `append_send_event` and `append_reply_event`, but do not implement result ingestion or reply tracking yet.
+- Why: The operator wants the preparation and control plane validated before deciding whether to build downstream result handling.
+- Impact: Feishu remains the intended task/status system of record; local approval records include a pending Feishu sync envelope. No external send may happen without explicit approval, and a changed recipient/message/executor payload invalidates that approval.
+- Reevaluate when: The phase-1 build passes visual acceptance, a sanitized XiaoMiFeng import test, and the actual Feishu Base/table field mapping is available.
+
+## 2026-07-20: Enrich public Xiaohongshu contacts as a separate review step
+
+- Decision: Reuse the reviewed PGY creator rows and add a visible, serial Xiaohongshu profile pass for public email, WeChat ID, and phone extraction. Login stays manual; login/risk prompts pause the job and are never bypassed.
+- Why: The first 50-person PGY workbook contained no actionable email or WeChat values, while some creators publish business contact details on their Xiaohongshu profiles.
+- Impact: Enrichment fills only empty fields, does not auto-switch outreach channels, and invalidates stale execution approval when recipients change. Persist only parsed contacts, a query-free profile URL, source, timestamp, and status; do not persist full bios.
+- Reevaluate when: A 3-5 creator live trial shows unstable profile resolution, unacceptable platform risk, or the page structure/policy changes.

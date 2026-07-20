@@ -18,7 +18,7 @@ assert.strictEqual(makeRunKey(runDir), 'run_2026-06-30T00-00-00-000Z');
 assert.ok(getReviewPath(tmp, runDir).endsWith('run_2026-06-30T00-00-00-000Z.json'));
 
 const normalized = normalizeReviewRows([
-  { rowId: 'a', selected: false, followupStatus: ' 不建联 ', priority: ' P1 ', excludeReason: ' 报价高 ', note: ' 先不联系 ', email: ' a@example.com ', wechatId: ' wx ', phone: ' 123 ', contactChannel: ' 邮件 ' },
+  { rowId: 'a', selected: false, followupStatus: ' 不建联 ', priority: ' P1 ', excludeReason: ' 报价高 ', note: ' 先不联系 ', email: ' a@example.com ', wechatId: ' wx ', phone: ' 123 ', xhsProfileUrl: ' https://www.xiaohongshu.com/user/profile/demo ', contactSource: ' xiaohongshu_public_profile ', contactCollectedAt: ' 2026-07-20T00:00:00.000Z ', contactCollectionStatus: ' found ', contactChannel: ' 邮件 ' },
   { rowId: 'a', selected: true },
   { rowId: '' }
 ]);
@@ -29,6 +29,9 @@ assert.strictEqual(normalized[0].priority, 'P1');
 assert.strictEqual(normalized[0].excludeReason, '报价高');
 assert.strictEqual(normalized[0].email, 'a@example.com');
 assert.strictEqual(normalized[0].wechatId, 'wx');
+assert.strictEqual(normalized[0].xhsProfileUrl, 'https://www.xiaohongshu.com/user/profile/demo');
+assert.strictEqual(normalized[0].contactSource, 'xiaohongshu_public_profile');
+assert.strictEqual(normalized[0].contactCollectionStatus, 'found');
 assert.strictEqual(normalized[0].contactChannel, '邮件建联');
 
 let loaded = loadContactReview(tmp, runDir);
@@ -36,11 +39,13 @@ assert.deepStrictEqual(loaded.reviewRows, []);
 
 const saved = saveContactReview(tmp, runDir, {
   reviewRows: normalized,
-  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '' }
+  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '', xiaomifengSmartRemark: '{YYMMDD}-{昵称}', xiaomifengTaskWechat: '运营微信A' }
 });
 assert.ok(saved.updatedAt);
 assert.strictEqual(saved.settings.defaultGroupTag, 'FILA');
 assert.strictEqual(saved.settings.contactChannel, '微信建联');
+assert.strictEqual(saved.settings.xiaomifengSmartRemark, '{YYMMDD}-{昵称}');
+assert.strictEqual(saved.settings.xiaomifengTaskWechat, '运营微信A');
 
 loaded = loadContactReview(tmp, runDir);
 assert.strictEqual(loaded.reviewRows.length, 1);

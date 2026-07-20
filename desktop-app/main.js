@@ -19,7 +19,7 @@ const { buildQualityReport } = require('./lib/quality_report');
 const { exportCandidateWorkbook } = require('./lib/candidate_sheet');
 const { parseExcelToPgyItems: parsePgyExcelToItems } = require('./lib/pgy_excel');
 const { parseContactReviewWorkbook } = require('./lib/contact_review_excel');
-const { exportContactRowsWorkbook, exportContactWorkbook, getContactPreview } = require('./lib/contact_sheet');
+const { exportContactRowsWorkbook, exportContactWorkbook, exportXiaomifengWorkbook, getContactPreview } = require('./lib/contact_sheet');
 const { resolveInsideRoot, resolveInsideAny } = require('./lib/path_guard');
 const {
   listSigningTasks,
@@ -29,6 +29,16 @@ const {
   listExecutionRecords
 } = require('./lib/signing_task_store');
 const { loadContactReview, saveContactReview } = require('./lib/contact_review_store');
+const { loadApproval, saveApproval } = require('./lib/approval_store');
+const { approveRequest, buildXiaomifengApprovalPayload, checkApproval, createApprovalRequest, executionFingerprint } = require('./lib/execution_approval');
+const { buildFeishuSyncEnvelope } = require('./lib/feishu_contracts');
+const {
+  contactFieldCount,
+  firstProfileUrl,
+  isIgnorableXhsNavigationError,
+  normalizeXhsProfileUrl,
+  parsePublicContactText
+} = require('./lib/xhs_contact_enrichment');
 const { openDb, initDb, dbGet, dbAll } = require('./lib/db/sqlite');
 const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
@@ -46,6 +56,14 @@ let kbCache = { loaded: false, index: null, meta: null };
 
 let recordingEnabled = false;
 let currentRecording = [];
+let xhsContactJob = {
+  running: false,
+  paused: false,
+  cancelRequested: false,
+  pauseReason: '',
+  resumeGate: null,
+  resumeGateResolve: null
+};
 
 const UI_WIDTH = 820;          // 左侧工作台默认宽度（renderer 可拖拽后动态更新）
 const SPLITTER_WIDTH = 10;     // renderer 分割条宽度（px）
@@ -55,6 +73,10 @@ const DEFAULT_API_PORT = '8010';
 const PGY_MIN_TAB_WAIT_MS = 2500;
 const PGY_ALLOW_NOTE_CLICK_RESOLVE = process.env.PGY_ALLOW_NOTE_CLICK_RESOLVE === 'true';
 const PGY_NOTE_CLICK_RESOLVE_LIMIT = 5;
+const XHS_CONTACT_BATCH_LIMIT = 50;
+const XHS_CONTACT_PAGE_WAIT_MS = 5500;
+const XHS_CONTACT_PAGE_JITTER_MS = 3500;
+const XHS_LOGIN_URL = 'https://www.xiaohongshu.com/explore';
 
 function getRecordingsDir() {
   const dir = path.join(app.getPath('userData'), 'recordings');
@@ -84,6 +106,24 @@ function getContactReviewsDir() {
   const dir = path.join(app.getPath('userData'), 'contact_reviews');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function getApprovalsDir() {
+  const dir = path.join(app.getPath('userData'), 'execution_approvals');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function approvalSyncEnvelope(approval) {
+  return buildFeishuSyncEnvelope('upsert_approval', {
+    approval_id: approval.approvalId,
+    batch_id: approval.payload?.runKey || '',
+    fingerprint: approval.fingerprint,
+    approver: approval.approvedBy || approval.requestedBy || '',
+    approved_at: approval.approvedAt || '',
+    status: approval.status,
+    updated_at: new Date().toISOString()
+  });
 }
 
 function getDbPath() {
@@ -1110,6 +1150,413 @@ async function pgyDetectRiskOnCurrentPage(webContents) {
     return { ok: false, error: String(err?.message || err) };
   }
 }
+
+function emitXhsContactProgress(payload = {}) {
+  mainWindow?.webContents.send('contacts:xhsProgress', {
+    running: xhsContactJob.running,
+    paused: xhsContactJob.paused,
+    pauseReason: xhsContactJob.pauseReason,
+    ...payload
+  });
+}
+
+function newXhsResumeGate() {
+  if (xhsContactJob.resumeGate) return;
+  xhsContactJob.resumeGate = new Promise((resolve) => {
+    xhsContactJob.resumeGateResolve = resolve;
+  });
+}
+
+async function waitForXhsResume() {
+  if (!xhsContactJob.paused) return 'resume';
+  newXhsResumeGate();
+  const action = await xhsContactJob.resumeGate;
+  return action || 'resume';
+}
+
+async function pauseXhsContactJob(reason, code = 'XHS_MANUAL_INTERVENTION') {
+  xhsContactJob.paused = true;
+  xhsContactJob.pauseReason = String(reason || '请在右侧页面手工处理');
+  newXhsResumeGate();
+  emitXhsContactProgress({ type: 'paused', code, message: xhsContactJob.pauseReason });
+  return await waitForXhsResume();
+}
+
+function resumeXhsContactJob(action = 'resume') {
+  const resolve = xhsContactJob.resumeGateResolve;
+  xhsContactJob.paused = false;
+  xhsContactJob.pauseReason = '';
+  xhsContactJob.resumeGate = null;
+  xhsContactJob.resumeGateResolve = null;
+  resolve?.(action);
+}
+
+async function waitForProfileNavigation(timeoutMs = 10000) {
+  const end = Date.now() + Math.max(1000, Number(timeoutMs || 0));
+  while (Date.now() < end) {
+    const current = normalizeXhsProfileUrl(browserView?.webContents?.getURL?.() || '');
+    if (current) return current;
+    await sleep(250);
+  }
+  return '';
+}
+
+async function resolveXhsProfileUrlFromPgy(row = {}) {
+  const saved = normalizeXhsProfileUrl(row.xhsProfileUrl);
+  if (saved) return { ok: true, profileUrl: saved, source: 'saved' };
+
+  const creatorUrl = String(row.creatorUrl || '').trim();
+  if (!isAllowedTaskUrl(creatorUrl)) {
+    return { ok: false, code: 'PGY_PROFILE_URL_REQUIRED', error: '缺少有效的蒲公英达人详情链接' };
+  }
+
+  await browserView.webContents.loadURL(creatorUrl);
+  mainWindow?.webContents.send('browser:url', { url: creatorUrl });
+  await sleep(3500);
+
+  const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+  if (risk?.riskDetected) {
+    return {
+      ok: false,
+      code: 'PGY_RISK_DETECTED',
+      error: `蒲公英页面触发验证：${risk.riskText || '请手工确认'}`,
+      manualIntervention: true
+    };
+  }
+
+  const xhsId = String(row.xhsId || '').trim();
+  const resolved = await browserView.webContents.executeJavaScript(
+    `
+      (function(){
+        const wanted = ${JSON.stringify(xhsId)};
+        const isVisible = (el) => {
+          try {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          } catch (_) { return false; }
+        };
+        const hrefs = [];
+        const addHref = (value) => {
+          const text = String(value || '').trim();
+          if (text && !hrefs.includes(text)) hrefs.push(text);
+        };
+        document.querySelectorAll('a[href], [data-href], [data-url]').forEach((el) => {
+          addHref(el.href);
+          addHref(el.getAttribute('href'));
+          addHref(el.getAttribute('data-href'));
+          addHref(el.getAttribute('data-url'));
+        });
+        let target = null;
+        if (wanted) {
+          const nodes = Array.from(document.querySelectorAll('a,button,span,div,p'))
+            .filter(isVisible)
+            .filter((el) => {
+              const text = String(el.textContent || '').replace(/\\s+/g, ' ').trim();
+              return text === wanted || text === '小红书号：' + wanted || text === '小红书号:' + wanted || text === '小红书号: ' + wanted;
+            })
+            .sort((a, b) => String(a.textContent || '').length - String(b.textContent || '').length);
+          target = nodes[0] || null;
+          const anchor = target?.closest?.('a') || target?.querySelector?.('a');
+          if (anchor) {
+            addHref(anchor.href);
+            addHref(anchor.getAttribute('href'));
+          }
+          let cursor = target;
+          for (let i = 0; cursor && i < 4; i += 1, cursor = cursor.parentElement) {
+            Array.from(cursor.attributes || []).forEach((attr) => addHref(attr.value));
+          }
+        }
+        const direct = hrefs.find((href) => /xiaohongshu\\.com\\/user\\/profile\\//i.test(href)) || '';
+        if (direct) return { ok: true, hrefs, clicked: false };
+        if (target) {
+          try {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.click();
+            return { ok: true, hrefs, clicked: true };
+          } catch (_) {}
+        }
+        return { ok: false, hrefs, clicked: false };
+      })()
+    `,
+    true
+  );
+
+  const direct = firstProfileUrl(resolved?.hrefs);
+  if (direct) return { ok: true, profileUrl: direct, source: 'pgy_link' };
+  if (resolved?.clicked) {
+    const navigated = await waitForProfileNavigation(10000);
+    if (navigated) return { ok: true, profileUrl: navigated, source: 'pgy_click' };
+  }
+  return { ok: false, code: 'XHS_PROFILE_NOT_FOUND', error: '未能从蒲公英页面解析小红书主页链接' };
+}
+
+async function inspectXhsProfilePage() {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  try {
+    return await browserView.webContents.executeJavaScript(
+      `
+        (function(){
+          const url = location.href;
+          const bodyText = String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+          const visible = (el) => {
+            try {
+              const rect = el.getBoundingClientRect();
+              const style = getComputedStyle(el);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            } catch (_) { return false; }
+          };
+          const loginInput = Array.from(document.querySelectorAll('input')).some((el) =>
+            visible(el) && /手机号|验证码/.test(String(el.placeholder || ''))
+          );
+          const loginModal = Array.from(document.querySelectorAll('[class*="login" i], [class*="modal" i], [class*="passport" i]'))
+            .some((el) => visible(el) && /登录|扫码/.test(String(el.innerText || '')));
+          const riskMatch = bodyText.match(/(安全验证|请完成验证|操作频繁|账号异常|网络环境存在风险|滑动验证)/);
+          const snippets = new Set();
+          const add = (value) => {
+            const text = String(value || '').replace(/\\s+/g, ' ').trim();
+            if (text && text.length <= 1200) snippets.add(text);
+          };
+          [
+            '[class*="user-desc" i]', '[class*="user-info" i]', '[class*="info-part" i]',
+            '[class*="profile" i] [class*="desc" i]', '[class*="bio" i]'
+          ].forEach((selector) => document.querySelectorAll(selector).forEach((el) => {
+            if (visible(el)) add(el.innerText);
+          }));
+          Array.from(document.querySelectorAll('div,span,p')).forEach((el) => {
+            if (!visible(el)) return;
+            const text = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (text.length > 0 && text.length <= 300 && /(小红书号|邮箱|邮件|微信|vx|v信|wechat|商务|合作|联系)/i.test(text)) add(text);
+          });
+          const profileText = Array.from(snippets).join('\\n').slice(0, 6000);
+          const profileReady = /xiaohongshu\\.com\\/user\\/profile\\//i.test(url) && (
+            /小红书号/.test(profileText) ||
+            !!document.querySelector('[class*="user-page" i], [id*="userPage" i], [class*="profile" i]')
+          );
+          return {
+            ok: true,
+            url,
+            loginRequired: Boolean(loginInput || loginModal),
+            riskDetected: Boolean(riskMatch),
+            riskText: riskMatch?.[1] || '',
+            profileReady,
+            profileText
+          };
+        })()
+      `,
+      true
+    );
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function runXhsContactBatch(rows) {
+  const updates = [];
+  let found = 0;
+  let failed = 0;
+
+  for (let index = 0; index < rows.length; index += 1) {
+    if (xhsContactJob.cancelRequested) break;
+    if (xhsContactJob.paused && await waitForXhsResume() === 'cancel') break;
+
+    const row = rows[index];
+    emitXhsContactProgress({
+      type: 'item_start',
+      index,
+      completed: index,
+      total: rows.length,
+      found,
+      failed,
+      rowId: row.rowId,
+      creatorName: row.creatorName
+    });
+
+    let profile = await resolveXhsProfileUrlFromPgy(row);
+    if (!profile.ok && profile.manualIntervention) {
+      const action = await pauseXhsContactJob(profile.error, profile.code);
+      if (action === 'cancel') break;
+      profile = await resolveXhsProfileUrlFromPgy(row);
+    }
+    if (!profile.ok) {
+      failed += 1;
+      const update = {
+        rowId: row.rowId,
+        contactCollectionStatus: 'profile_not_found',
+        error: profile.error || '未找到小红书主页'
+      };
+      updates.push(update);
+      emitXhsContactProgress({ type: 'item_result', index, completed: index + 1, total: rows.length, found, failed, update });
+      continue;
+    }
+
+    let ready = false;
+    let inspected = null;
+    while (!ready && !xhsContactJob.cancelRequested) {
+      try {
+        await browserView.webContents.loadURL(profile.profileUrl);
+      } catch (err) {
+        const currentUrl = browserView.webContents.getURL();
+        if (!isIgnorableXhsNavigationError(err, currentUrl, profile.profileUrl)) throw err;
+      }
+      mainWindow?.webContents.send('browser:url', { url: profile.profileUrl });
+      await sleep(XHS_CONTACT_PAGE_WAIT_MS + Math.round(Math.random() * XHS_CONTACT_PAGE_JITTER_MS));
+      inspected = await inspectXhsProfilePage();
+
+      if (inspected?.riskDetected) {
+        const action = await pauseXhsContactJob(
+          `小红书页面触发验证：${inspected.riskText || '请在右侧手工处理'}`,
+          'XHS_RISK_DETECTED'
+        );
+        if (action === 'cancel') break;
+        continue;
+      }
+      if (inspected?.loginRequired) {
+        const action = await pauseXhsContactJob(
+          '请在右侧完成小红书人工登录，然后点击“继续”',
+          'XHS_LOGIN_REQUIRED'
+        );
+        if (action === 'cancel') break;
+        continue;
+      }
+      ready = Boolean(inspected?.ok && inspected?.profileReady);
+      if (!ready) break;
+    }
+    if (xhsContactJob.cancelRequested) break;
+
+    if (!ready) {
+      failed += 1;
+      const update = {
+        rowId: row.rowId,
+        xhsProfileUrl: profile.profileUrl,
+        contactCollectionStatus: 'profile_unavailable',
+        error: inspected?.error || '个人主页未完整加载'
+      };
+      updates.push(update);
+      emitXhsContactProgress({ type: 'item_result', index, completed: index + 1, total: rows.length, found, failed, update });
+      continue;
+    }
+
+    const contact = parsePublicContactText(inspected.profileText);
+    const count = contactFieldCount(contact);
+    if (count > 0) found += 1;
+    const update = {
+      rowId: row.rowId,
+      xhsProfileUrl: profile.profileUrl,
+      email: contact.email,
+      wechatId: contact.wechatId,
+      phone: contact.phone,
+      contactSource: 'xiaohongshu_public_profile',
+      contactCollectedAt: new Date().toISOString(),
+      contactCollectionStatus: count > 0 ? 'found' : 'not_public'
+    };
+    updates.push(update);
+    emitXhsContactProgress({ type: 'item_result', index, completed: index + 1, total: rows.length, found, failed, update });
+
+    if (index < rows.length - 1) {
+      await sleep(1200 + Math.round(Math.random() * 1600));
+    }
+  }
+
+  return { updates, found, failed, canceled: xhsContactJob.cancelRequested };
+}
+
+ipcMain.handle('contacts:openXhsLogin', async () => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  try {
+    await browserView.webContents.loadURL(XHS_LOGIN_URL);
+    mainWindow?.webContents.send('browser:url', { url: XHS_LOGIN_URL });
+    return { ok: true, url: XHS_LOGIN_URL };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('contacts:checkXhsLogin', async () => {
+  const inspected = await inspectXhsProfilePage();
+  if (!inspected?.ok) return inspected;
+  const currentUrl = String(inspected.url || '');
+  const isXhsPage = /^https:\/\/(?:www\.)?xiaohongshu\.com\//i.test(currentUrl);
+  return {
+    ok: true,
+    loggedIn: isXhsPage && !inspected.loginRequired && !inspected.riskDetected,
+    loginRequired: !isXhsPage || inspected.loginRequired,
+    riskDetected: inspected.riskDetected,
+    riskText: inspected.riskText,
+    url: normalizeXhsProfileUrl(currentUrl) || currentUrl.split('?')[0]
+  };
+});
+
+ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待蒲公英采集任务结束' };
+  if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '小红书联系方式补采正在运行' };
+  const runDir = resolveInsideRuns(payload.runDir || '');
+  if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+
+  const seen = new Set();
+  const rows = (Array.isArray(payload.rows) ? payload.rows : []).map((row) => ({
+    rowId: String(row?.rowId || '').trim(),
+    creatorName: String(row?.creatorName || '').trim(),
+    creatorUrl: String(row?.creatorUrl || '').trim(),
+    xhsId: String(row?.xhsId || '').trim(),
+    xhsProfileUrl: normalizeXhsProfileUrl(row?.xhsProfileUrl)
+  })).filter((row) => {
+    if (!row.rowId || seen.has(row.rowId)) return false;
+    seen.add(row.rowId);
+    return Boolean(row.xhsProfileUrl || isAllowedTaskUrl(row.creatorUrl));
+  });
+  if (!rows.length) return { ok: false, error: '没有可补采的达人' };
+  if (rows.length > XHS_CONTACT_BATCH_LIMIT) {
+    return { ok: false, error: `为降低平台风控风险，单次最多补采 ${XHS_CONTACT_BATCH_LIMIT} 人` };
+  }
+
+  xhsContactJob = {
+    running: true,
+    paused: false,
+    cancelRequested: false,
+    pauseReason: '',
+    resumeGate: null,
+    resumeGateResolve: null
+  };
+  emitXhsContactProgress({ type: 'started', total: rows.length, completed: 0, found: 0, failed: 0 });
+  try {
+    const result = await runXhsContactBatch(rows);
+    emitXhsContactProgress({ type: 'finished', total: rows.length, completed: result.updates.length, ...result });
+    return { ok: true, total: rows.length, ...result };
+  } catch (err) {
+    const error = String(err?.message || err);
+    emitXhsContactProgress({ type: 'failed', total: rows.length, error });
+    return { ok: false, error };
+  } finally {
+    resumeXhsContactJob(xhsContactJob.cancelRequested ? 'cancel' : 'resume');
+    xhsContactJob.running = false;
+    xhsContactJob.cancelRequested = false;
+  }
+});
+
+ipcMain.handle('contacts:pauseXhsEnrichment', async () => {
+  if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
+  xhsContactJob.paused = true;
+  xhsContactJob.pauseReason = '用户暂停';
+  emitXhsContactProgress({ type: 'paused', code: 'USER_PAUSED', message: xhsContactJob.pauseReason });
+  return { ok: true };
+});
+
+ipcMain.handle('contacts:resumeXhsEnrichment', async () => {
+  if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
+  resumeXhsContactJob('resume');
+  emitXhsContactProgress({ type: 'resumed' });
+  return { ok: true };
+});
+
+ipcMain.handle('contacts:cancelXhsEnrichment', async () => {
+  if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
+  xhsContactJob.cancelRequested = true;
+  resumeXhsContactJob('cancel');
+  emitXhsContactProgress({ type: 'cancel_requested', message: '将在当前页处理完成后停止' });
+  return { ok: true };
+});
 
 function rejectNonPgyCurrentPageForBrowserAutomation(actionLabel = '当前操作') {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
@@ -3476,6 +3923,8 @@ ipcMain.handle('exports:exportContactRun', async (_e, payload) => {
     const r = exportContactWorkbook(pick, {
       defaultGroupTag: payload?.defaultGroupTag,
       defaultGreeting: payload?.defaultGreeting,
+      xiaomifengSmartRemark: payload?.xiaomifengSmartRemark,
+      xiaomifengTaskWechat: payload?.xiaomifengTaskWechat,
       contactChannel: payload?.contactChannel,
       emailSubject: payload?.emailSubject,
       emailBody: payload?.emailBody,
@@ -3506,6 +3955,8 @@ ipcMain.handle('exports:exportContactSelection', async (_e, payload) => {
       suffix: payload?.suffix || '筛选结果',
       defaultGroupTag: payload?.defaultGroupTag,
       defaultGreeting: payload?.defaultGreeting,
+      xiaomifengSmartRemark: payload?.xiaomifengSmartRemark,
+      xiaomifengTaskWechat: payload?.xiaomifengTaskWechat,
       contactChannel: payload?.contactChannel,
       emailSubject: payload?.emailSubject,
       emailBody: payload?.emailBody,
@@ -3532,6 +3983,8 @@ ipcMain.handle('exports:getContactPreview', async (_e, payload) => {
     const r = getContactPreview(pick, {
       defaultGroupTag: payload?.defaultGroupTag,
       defaultGreeting: payload?.defaultGreeting,
+      xiaomifengSmartRemark: payload?.xiaomifengSmartRemark,
+      xiaomifengTaskWechat: payload?.xiaomifengTaskWechat,
       contactChannel: payload?.contactChannel,
       emailSubject: payload?.emailSubject,
       emailBody: payload?.emailBody,
@@ -3588,6 +4041,66 @@ ipcMain.handle('exports:importContactReviewWorkbook', async () => {
     });
     if (r.canceled || !r.filePaths?.[0]) return { ok: true, canceled: true };
     return parseContactReviewWorkbook(r.filePaths[0]);
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('approvals:getXiaomifeng', async (_e, payload) => {
+  try {
+    const runDir = resolveInsideRuns(payload?.runDir || '');
+    if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+    const current = buildXiaomifengApprovalPayload(path.basename(runDir), payload?.rows, payload?.settings);
+    const approval = loadApproval(getApprovalsDir(), runDir, 'wechat_xiaomifeng');
+    return { ok: true, approval, check: checkApproval(approval, current), recipientCount: current.recipients.length };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('approvals:submitXiaomifeng', async (_e, payload) => {
+  try {
+    const runDir = resolveInsideRuns(payload?.runDir || '');
+    if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+    const current = buildXiaomifengApprovalPayload(path.basename(runDir), payload?.rows, payload?.settings);
+    const approval = createApprovalRequest(current, payload?.requestedBy || '桌面端操作人');
+    approval.feishuSync = approvalSyncEnvelope(approval);
+    const saved = saveApproval(getApprovalsDir(), runDir, 'wechat_xiaomifeng', approval);
+    return { ok: true, approval: saved, recipientCount: current.recipients.length };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('approvals:approveXiaomifeng', async (_e, payload) => {
+  try {
+    const runDir = resolveInsideRuns(payload?.runDir || '');
+    if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+    const current = buildXiaomifengApprovalPayload(path.basename(runDir), payload?.rows, payload?.settings);
+    const pending = loadApproval(getApprovalsDir(), runDir, 'wechat_xiaomifeng');
+    if (!pending) return { ok: false, error: '请先提交人工确认' };
+    if (pending.fingerprint !== executionFingerprint(current)) {
+      return { ok: false, code: 'APPROVAL_STALE', error: '名单、渠道、话术或执行账号已变化，请重新提交审批' };
+    }
+    const approved = approveRequest(pending, payload?.approver);
+    approved.feishuSync = approvalSyncEnvelope(approved);
+    const saved = saveApproval(getApprovalsDir(), runDir, 'wechat_xiaomifeng', approved);
+    return { ok: true, approval: saved, recipientCount: current.recipients.length };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('exports:exportXiaomifeng', async (_e, payload) => {
+  try {
+    const runDir = resolveInsideRuns(payload?.runDir || '');
+    if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+    const current = buildXiaomifengApprovalPayload(path.basename(runDir), payload?.rows, payload?.settings);
+    const approval = loadApproval(getApprovalsDir(), runDir, 'wechat_xiaomifeng');
+    const checked = checkApproval(approval, current);
+    if (!checked.ok) return checked;
+    const result = exportXiaomifengWorkbook(runDir, payload?.rows, payload?.settings);
+    return { ok: true, approvalId: approval.approvalId, ...result };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }

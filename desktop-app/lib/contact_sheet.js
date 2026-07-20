@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const XLSX = require('xlsx');
 
 const CONTACT_COLUMNS = [
@@ -30,16 +31,22 @@ const SUMMARY_COLUMNS = ['指标', '数量'];
 const CONTACT_CHANNELS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
 
 const XMF_COLUMNS = [
-  '微信号',
-  '手机号',
-  '昵称',
-  '备注名',
-  '分组标签',
-  '打招呼内容',
-  '来源',
-  '蒲公英链接',
-  '小红书号'
+  '微信号码',
+  '智能备注',
+  '标签',
+  '发送添加朋友申请',
+  '任务微信(为空则智能分配)'
 ];
+
+const XMF_TEMPLATE_HELP_HEADER = [
+  '智能备注通配符说明：',
+  '如下是系统指定的三种通配符',
+  '{YYMMDD}',
+  '{MMDD}',
+  '{昵称}',
+  '',
+  '示例：{MMDD}-{昵称}'
+].join('\n');
 
 const PGY_INVITE_COLUMNS = [
   '达人昵称',
@@ -123,7 +130,27 @@ function firstFilled(...values) {
 
 function makeRowId({ creatorUrl, xhsId, creatorName, index }) {
   const base = firstFilled(creatorUrl, xhsId, creatorName, `row_${index + 1}`);
+  return `row_${crypto.createHash('sha256').update(base).digest('base64url').slice(0, 32)}`;
+}
+
+function makeLegacyRowId({ creatorUrl, xhsId, creatorName, index }) {
+  const base = firstFilled(creatorUrl, xhsId, creatorName, `row_${index + 1}`);
   return Buffer.from(base).toString('base64url').slice(0, 48);
+}
+
+function creatorEntityId(value, marker) {
+  try {
+    const pathname = new URL(normalizeUrl(value)).pathname;
+    return cleanStr(pathname.match(marker)?.[1]);
+  } catch (_) {
+    return '';
+  }
+}
+
+function legacyReviewMatchesCreator(review, creatorUrl) {
+  const profileId = creatorEntityId(review?.xhsProfileUrl, /\/user\/profile\/([^/]+)/i);
+  const creatorId = creatorEntityId(creatorUrl, /\/blogger-detail\/([^/]+)/i);
+  return Boolean(profileId && creatorId && profileId === creatorId);
 }
 
 function readJson(filePath, fallback = null) {
@@ -206,6 +233,10 @@ function normalizeReviewMap(reviewRows) {
       email: cleanStr(row?.email),
       wechatId: cleanStr(row?.wechatId),
       phone: cleanStr(row?.phone),
+      xhsProfileUrl: cleanStr(row?.xhsProfileUrl),
+      contactSource: cleanStr(row?.contactSource),
+      contactCollectedAt: cleanStr(row?.contactCollectedAt),
+      contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
       contactChannel: normalizeContactChannel(row?.contactChannel || '', '')
     });
   }
@@ -266,6 +297,8 @@ function buildContactPreviewRows(runDir, options = {}) {
   const defaultGreeting = cleanStr(options.defaultGreeting || '您好，我们想和您沟通一下品牌合作，方便的话可以通过一下好友吗？');
   const defaultGroupTag = cleanStr(options.defaultGroupTag || '');
   const contactChannel = normalizeContactChannel(options.contactChannel || '微信');
+  const xiaomifengSmartRemark = cleanStr(options.xiaomifengSmartRemark || '{MMDD}-{昵称}');
+  const xiaomifengTaskWechat = cleanStr(options.xiaomifengTaskWechat || '');
   const reviewMap = normalizeReviewMap(options.reviewRows);
   const candidateMap = readCandidateReviewMap(runDir);
 
@@ -284,8 +317,10 @@ function buildContactPreviewRows(runDir, options = {}) {
     const videoPrice = firstFilled(metrics['视频笔记一口价'], metrics['视频报价'], summary.price_video);
     const recommendation = buildRecommendation({ metrics, summary, qualityReport });
     const rowId = makeRowId({ creatorUrl, xhsId, creatorName, index });
+    const legacyReview = reviewMap.get(makeLegacyRowId({ creatorUrl, xhsId, creatorName, index })) || {};
+    const migratedLegacyReview = legacyReviewMatchesCreator(legacyReview, creatorUrl) ? legacyReview : {};
     const candidateReview = candidateMap.get(normalizeUrl(creatorUrl)) || {};
-    const review = { ...candidateReview, ...(reviewMap.get(rowId) || {}) };
+    const review = { ...candidateReview, ...migratedLegacyReview, ...(reviewMap.get(rowId) || {}) };
     const selected = review.selected !== false;
 
     return {
@@ -307,9 +342,15 @@ function buildContactPreviewRows(runDir, options = {}) {
       email: review.email || findEmailInObject(obj),
       wechatId: review.wechatId || '',
       phone: review.phone || '',
+      xhsProfileUrl: review.xhsProfileUrl || '',
+      contactSource: review.contactSource || '',
+      contactCollectedAt: review.contactCollectedAt || '',
+      contactCollectionStatus: review.contactCollectionStatus || '',
       contactChannel: normalizeContactChannel(review.contactChannel || contactChannel),
       groupTag: defaultGroupTag,
       greeting: defaultGreeting,
+      xiaomifengSmartRemark,
+      xiaomifengTaskWechat,
       pgyInvite: normalizePgyInviteOptions(options),
       emailTemplate: normalizeEmailOptions(options),
       runSubdir: path.basename(path.dirname(item.fp)),
@@ -370,15 +411,11 @@ function normalizeEmailOptions(options = {}) {
 
 function xiaomifengRowFromPreview(row) {
   return {
-    '微信号': row.wechatId || '',
-    '手机号': row.phone || '',
-    '昵称': row.creatorName || '',
-    '备注名': row.creatorName || '',
-    '分组标签': row.groupTag || '',
-    '打招呼内容': row.greeting || '',
-    '来源': '蒲公英',
-    '蒲公英链接': row.creatorUrl || '',
-    '小红书号': row.xhsId || ''
+    '微信号码': firstFilled(row.wechatId, row.phone),
+    '智能备注': row.xiaomifengSmartRemark || '{MMDD}-{昵称}',
+    '标签': row.groupTag || '',
+    '发送添加朋友申请': row.greeting || '',
+    '任务微信(为空则智能分配)': row.xiaomifengTaskWechat || ''
   };
 }
 
@@ -495,7 +532,7 @@ function summarizeContactWorkbookRows(previewRows) {
     if (hasEmail) summary.withEmail += 1;
     if (selected && hasContact) summary.selectedWithContact += 1;
     if (selected && channel === '蒲公英邀约') summary.selectedPgyInvite += 1;
-    if (selected && channel === '邮件建联' && hasEmail) summary.selectedEmail += 1;
+    if (selected && hasEmail) summary.selectedEmail += 1;
     if (selected && channel === '微信建联' && hasWechat) summary.selectedWechat += 1;
     if (selected && (
       channel === '待补联系方式' ||
@@ -539,7 +576,7 @@ function buildContactRowsFromPreviewRows(previewRowsInput) {
     .filter((row) => resolveExecutionChannel(row) === '蒲公英邀约')
     .map(pgyInviteRowFromPreview);
   const emailContactRows = selectedRows
-    .filter((row) => resolveExecutionChannel(row) === '邮件建联' && hasEmailInfo(row))
+    .filter(hasEmailInfo)
     .map(emailContactRowFromPreview);
   const xiaomifengRows = previewRows
     .filter((row) => row.selected && resolveExecutionChannel(row) === '微信建联' && hasWechatContactInfo(row))
@@ -653,6 +690,32 @@ function exportContactRowsWorkbook(runDir, previewRows, options = {}) {
   });
 }
 
+function exportXiaomifengWorkbook(runDir, previewRows, options = {}) {
+  const preparedRows = (Array.isArray(previewRows) ? previewRows : []).map((row) => ({
+    ...row,
+    groupTag: cleanStr(options.defaultGroupTag || row?.groupTag),
+    greeting: cleanStr(options.defaultGreeting || row?.greeting),
+    xiaomifengSmartRemark: cleanStr(options.xiaomifengSmartRemark || row?.xiaomifengSmartRemark || '{MMDD}-{昵称}'),
+    xiaomifengTaskWechat: cleanStr(options.xiaomifengTaskWechat || row?.xiaomifengTaskWechat)
+  }));
+  const rows = buildContactRowsFromPreviewRows(preparedRows).xiaomifengRows;
+  if (!rows.length) throw new Error('没有已选择且具备微信号/手机号的微信建联达人');
+
+  const wb = XLSX.utils.book_new();
+  const aoa = [[...XMF_COLUMNS, XMF_TEMPLATE_HELP_HEADER]];
+  rows.forEach((row) => aoa.push([...XMF_COLUMNS.map((col) => row[col] ?? ''), '']));
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{ wch: 20 }, { wch: 24 }, { wch: 18 }, { wch: 38 }, { wch: 28 }, { wch: 56 }];
+  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[]]), 'Sheet2');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[]]), 'Sheet3');
+
+  const timestamp = cleanStr(options.timestamp) || timestampForFilename();
+  const outPath = path.join(runDir, `小蜜蜂导入_${timestamp}_${path.basename(runDir)}.xlsx`);
+  XLSX.writeFile(wb, outPath);
+  return { outPath, rows: rows.length, sheets: ['Sheet1', 'Sheet2', 'Sheet3'] };
+}
+
 module.exports = {
   CONTACT_COLUMNS,
   CONTACT_CHANNELS,
@@ -666,9 +729,13 @@ module.exports = {
   buildContactRowsFromRun,
   exportContactRowsWorkbook,
   exportContactWorkbook,
+  exportXiaomifengWorkbook,
   findRawResultFiles,
   getContactPreview,
+  makeLegacyRowId,
+  makeRowId,
   summarizeContactWorkbookRows,
   summarizePreviewRows,
-  timestampForFilename
+  timestampForFilename,
+  XMF_TEMPLATE_HELP_HEADER
 };

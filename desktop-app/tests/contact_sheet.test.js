@@ -8,7 +8,9 @@ const {
   buildContactRowsFromRun,
   exportContactRowsWorkbook,
   exportContactWorkbook,
+  exportXiaomifengWorkbook,
   getContactPreview,
+  makeLegacyRowId,
   summarizeContactWorkbookRows,
   timestampForFilename
 } = require('../lib/contact_sheet');
@@ -190,8 +192,39 @@ assert.strictEqual(contact[0]['达人昵称'], '测试达人');
 assert.strictEqual(contact[0]['选择建联'], '是');
 assert.strictEqual(contact[0]['跟进状态'], '待建联');
 const xmf = XLSX.utils.sheet_to_json(wb.Sheets['小蜜蜂导入表']);
-assert.strictEqual(xmf[0]['备注名'], '测试达人');
-assert.strictEqual(xmf[0]['微信号'], 'wx_test');
+assert.strictEqual(xmf[0]['微信号码'], 'wx_test');
+assert.strictEqual(xmf[0]['智能备注'], '{MMDD}-{昵称}');
+
+const xmfDedicated = exportXiaomifengWorkbook(runDir, [{
+  ...preview.rows[0],
+  selected: true,
+  contactChannel: '微信建联',
+  wechatId: 'wx_test',
+  groupTag: 'FILA',
+  greeting: '您好，想沟通一下合作。'
+}], {
+  xiaomifengSmartRemark: '{YYMMDD}-{昵称}',
+  xiaomifengTaskWechat: '运营微信A',
+  timestamp: '20260715-120000'
+});
+assert.ok(fs.existsSync(xmfDedicated.outPath));
+assert.strictEqual(xmfDedicated.rows, 1);
+const xmfDedicatedWb = XLSX.readFile(xmfDedicated.outPath);
+assert.deepStrictEqual(xmfDedicatedWb.SheetNames, ['Sheet1', 'Sheet2', 'Sheet3']);
+const xmfDedicatedRows = XLSX.utils.sheet_to_json(xmfDedicatedWb.Sheets.Sheet1);
+assert.deepStrictEqual(Object.keys(xmfDedicatedRows[0]).slice(0, 5), [
+  '微信号码',
+  '智能备注',
+  '标签',
+  '发送添加朋友申请',
+  '任务微信(为空则智能分配)'
+]);
+assert.ok(Object.keys(xmfDedicatedRows[0])[5].startsWith('智能备注通配符说明'));
+assert.strictEqual(xmfDedicatedRows[0]['微信号码'], 'wx_test');
+assert.strictEqual(xmfDedicatedRows[0]['智能备注'], '{YYMMDD}-{昵称}');
+assert.strictEqual(xmfDedicatedRows[0]['标签'], 'FILA');
+assert.strictEqual(xmfDedicatedRows[0]['发送添加朋友申请'], '您好，想沟通一下合作。');
+assert.strictEqual(xmfDedicatedRows[0]['任务微信(为空则智能分配)'], '运营微信A');
 
 const routedExported = exportContactRowsWorkbook(runDir, [
   {
@@ -211,6 +244,16 @@ const routedExported = exportContactRowsWorkbook(runDir, [
     email: '',
     wechatId: '',
     phone: ''
+  },
+  {
+    ...preview.rows[0],
+    rowId: `${preview.rows[0].rowId}_pgy_email`,
+    creatorName: '蒲公英兼邮件达人',
+    selected: true,
+    contactChannel: '蒲公英邀约',
+    email: 'pgy-and-email@example.com',
+    wechatId: '',
+    phone: ''
   }
 ], {
   suffix: '自动分流',
@@ -220,17 +263,20 @@ const routedExported = exportContactRowsWorkbook(runDir, [
   pgyBrandName: '品牌A',
   pgyProductName: '产品A'
 });
-assert.strictEqual(routedExported.emailContactRows, 1);
-assert.strictEqual(routedExported.pgyInviteRows, 1);
+assert.strictEqual(routedExported.emailContactRows, 2);
+assert.strictEqual(routedExported.pgyInviteRows, 2);
 assert.strictEqual(routedExported.xiaomifengRows, 0);
 assert.strictEqual(routedExported.pendingContactRows, 0);
 const routedWb = XLSX.readFile(routedExported.outPath);
 const routedEmailRows = XLSX.utils.sheet_to_json(routedWb.Sheets['邮件建联表']);
 assert.strictEqual(routedEmailRows[0]['邮箱'], 'creator@example.com');
 assert.strictEqual(routedEmailRows[0]['邮件标题'], '合作沟通');
+assert.strictEqual(routedEmailRows[1]['达人昵称'], '蒲公英兼邮件达人');
+assert.strictEqual(routedEmailRows[1]['邮箱'], 'pgy-and-email@example.com');
 const routedInviteRows = XLSX.utils.sheet_to_json(routedWb.Sheets['蒲公英邀约表']);
 assert.strictEqual(routedInviteRows[0]['达人昵称'], '无联系方式达人');
 assert.strictEqual(routedInviteRows[0]['品牌名'], '品牌A');
+assert.strictEqual(routedInviteRows[1]['达人昵称'], '蒲公英兼邮件达人');
 
 const filteredExported = exportContactRowsWorkbook(runDir, [
   {
@@ -258,6 +304,45 @@ assert.strictEqual(filteredContact[0]['跟进状态'], '需二次跟进');
 assert.strictEqual(filteredContact[0]['优先级'], 'P1');
 const filteredPending = XLSX.utils.sheet_to_json(filteredWb.Sheets['待补联系方式'], { defval: '' });
 assert.strictEqual(filteredPending[0]['备注'], '单独导出给同事补联系方式');
+
+const collisionRunDir = path.join(tmp, 'run_collision');
+const collisionCreators = [
+  { id: 'creator_one', name: '达人一', xhsId: 'xhs_one' },
+  { id: 'creator_two', name: '达人二', xhsId: 'xhs_two' }
+];
+collisionCreators.forEach((creator, index) => {
+  const dir = path.join(collisionRunDir, `${index + 1}_creator`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'raw_result.json'), JSON.stringify({
+    creator_url: `https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/${creator.id}`,
+    creator_summary: {
+      creator_name: creator.name,
+      xhs_id: creator.xhsId,
+      creator_url: `https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/${creator.id}`
+    }
+  }), 'utf-8');
+});
+const collisionPreview = getContactPreview(collisionRunDir);
+assert.strictEqual(collisionPreview.rows.length, 2);
+assert.notStrictEqual(collisionPreview.rows[0].rowId, collisionPreview.rows[1].rowId);
+
+const legacyTarget = collisionPreview.rows.find((row) => row.creatorName === '达人一');
+const legacyId = makeLegacyRowId({
+  creatorUrl: legacyTarget.creatorUrl,
+  xhsId: legacyTarget.xhsId,
+  creatorName: legacyTarget.creatorName,
+  index: collisionPreview.rows.indexOf(legacyTarget)
+});
+const migratedPreview = getContactPreview(collisionRunDir, {
+  reviewRows: [{
+    rowId: legacyId,
+    email: 'only-one@example.com',
+    xhsProfileUrl: 'https://www.xiaohongshu.com/user/profile/creator_one',
+    contactCollectionStatus: 'found'
+  }]
+});
+assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人一').email, 'only-one@example.com');
+assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人二').email, '');
 
 assert.strictEqual(timestampForFilename(new Date(2026, 5, 30, 9, 8, 7)), '20260630-090807');
 

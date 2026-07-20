@@ -10,6 +10,7 @@ Xiaohongshu Pugongying Data Collector is a conservative desktop data collection 
 - Main product line: `desktop-app/`
 - Compatibility backend/reference crawler: `content-analyzer/`
 - Product/spec notes: `docs/`
+- Feishu workflow schema: `docs/intranet/feishu-workflow-schema.md`
 - Project workflow skill: `skills/pgy-desktop-workflow/`
 - Project memory: `docs/project_memory/`
 - UX redesign blueprint: `docs/project_memory/UX_REDESIGN_PLAN.md`
@@ -85,6 +86,7 @@ python scripts/check_mvp_readiness.py --strict
 - Do not commit `.env`, cookies, browser session data, logs, `runs/`, database files, real creator links, or task spreadsheets.
 - Do not add real API keys, secrets, account identifiers, cookies, or private creator lists to docs or tests.
 - Do not bypass platform login, captcha, risk control, or rate limits. Keep the product aligned with manual-login, low-concurrency operation.
+- Do not generate an executable XiaoMiFeng file or trigger any external send unless the current recipient/channel/message fingerprint has an approved human approval record. Any execution-content change invalidates approval.
 - Do not assume the legacy Python backend is the main product; verify whether a requested change belongs in `desktop-app/` first.
 - Do not treat service/port/branch/auth status in memory as permanent fact. Recheck before acting.
 

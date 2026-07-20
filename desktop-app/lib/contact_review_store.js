@@ -49,6 +49,10 @@ function normalizeReviewRows(rows) {
       email: cleanStr(row?.email),
       wechatId: cleanStr(row?.wechatId),
       phone: cleanStr(row?.phone),
+      xhsProfileUrl: cleanStr(row?.xhsProfileUrl),
+      contactSource: cleanStr(row?.contactSource),
+      contactCollectedAt: cleanStr(row?.contactCollectedAt),
+      contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
       contactChannel: normalizeContactChannel(row?.contactChannel)
     });
   }
@@ -60,6 +64,8 @@ function normalizeSettings(settings) {
   return {
     defaultGroupTag: cleanStr(src.defaultGroupTag),
     defaultGreeting: cleanStr(src.defaultGreeting),
+    xiaomifengSmartRemark: cleanStr(src.xiaomifengSmartRemark || '{MMDD}-{昵称}') || '{MMDD}-{昵称}',
+    xiaomifengTaskWechat: cleanStr(src.xiaomifengTaskWechat),
     contactChannel: normalizeContactChannel(src.contactChannel || '微信') || '微信建联',
     emailSubject: cleanStr(src.emailSubject),
     emailBody: cleanStr(src.emailBody),

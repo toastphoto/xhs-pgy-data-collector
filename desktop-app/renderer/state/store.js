@@ -1,6 +1,6 @@
 export const store = {
   state: {
-    backend: { running: null, host: '127.0.0.1', port: '8010' }, // running: true | false | null(未知)
+    backend: { running: null, host: '127.0.0.1', port: '8010', code: '' }, // running: true | false | null(未知)
     browser: { url: '' },
     view: 'login', // login | tasks | exports | templates | report | toolbox | recordings
     recording: { isRecording: false, count: 0, files: [] },

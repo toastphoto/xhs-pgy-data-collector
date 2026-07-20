@@ -1,16 +1,24 @@
 # Active Context
 
-Last reviewed: 2026-07-02.
+Last reviewed: 2026-07-20.
 
 ## Current Goal
 
-Maintain and improve the Xiaohongshu/Pugongying desktop data collector with a bias toward reliable, operator-controlled collection, clear evidence, and safe handling of local data. Current product direction is an Electron-based Pugongying creator discovery and contact-list workbench: focus on finding creators, reviewing/filtering them, and generating useful contact tables. Do not build a Chrome browser extension path. XiaoMiFeng WeChat RPA can be supported later through an Excel export/import bridge, but it should remain optional downstream execution.
-
-Current execution goal: recheck whether the Pugongying collection workflow is reasonably conservative against platform risk-control/anti-bot triggers. The allowed direction is risk reduction and operator control, not bypass. Keep `docs/project_memory/PGY_ANTI_BOT_SAFETY_AUDIT.md` as the safety boundary before changing collection speed, browser automation, proxy/headless behavior, batch size, or risk-page handling.
-
-Current product-readiness target: move the app from advanced prototype to usable internal MVP candidate. Use `docs/project_memory/MVP_ACCEPTANCE_PLAN.md` and `scripts/check_mvp_readiness.py` to separate static/local readiness from the still-missing real-account workflow validation.
+Complete phase 1 of the outreach workflow: reliable backend status, a strict XiaoMiFeng execution workbook, a Feishu system-of-record contract, and a mandatory human approval gate. Sending-result and reply tracking are schema/event interfaces only in this phase; they must not be represented as working integrations. Preserve all existing conservative Pugongying safety boundaries.
 
 ## Completed Important Stages
+
+- On 2026-07-20, fixed contact-review row identity collisions caused by truncating the Base64 encoding of long Pugongying URLs. Row IDs now hash the complete stable source identifier; legacy contact enrichment migrates only when the XHS profile entity ID matches the Pugongying creator entity ID. Regression tests cover shared URL prefixes and one-creator-only email migration.
+- Added a current-filter batch action for changing contact channel. The existing 50-person run was restored to 50 Pugongying-invite rows and re-exported; verification found exactly one email row, belonging to “是谢谢啦”. No invite was sent.
+- Email contact export is now a contact-capability view instead of an exclusive primary-channel route: every selected creator with an email is included in `邮件建联表`, while their Pugongying invite row remains intact. The 50-person run now exports 50 Pugongying rows and one email row for “是谢谢啦”; no message was sent.
+- On 2026-07-20, a visible low-frequency live test processed the first 20 creators in the saved 50-person order: 20 completed, 12 public-contact hits, 8 with no public contact, and 0 failures. All 12 hits were emails; no reliable WeChat ID or phone was found, and no login/captcha/risk pause occurred.
+- Added a reusable first-N enrichment control, defaulting to 20 with a 50-person ceiling. The verified workbook contains 50 contact rows, 50 Pugongying rows, 13 email rows including the previously enriched creator, and 0 XiaoMiFeng rows. No outreach or execution approval was triggered.
+
+- Phase 1 source implementation added on 2026-07-15: backend status is queried on renderer startup and refreshed every 10 seconds instead of relying on one startup event.
+- Added a dedicated XiaoMiFeng workbook export with the exact five business columns from the provided template, its help header, and blank `Sheet2`/`Sheet3`. Only selected creators with a WeChat ID or phone number are eligible.
+- Added a XiaoMiFeng approval fingerprint bound to channel, run, selected recipients, message, smart-remark rule, tag, and executor WeChat. A changed payload invalidates approval, and no execution workbook can be generated without a valid current approval.
+- Added Feishu contracts for tasks, task creators, execution batches, approvals, send events, and reply events. Actual Feishu writes remain pending until Base/table/field identifiers and permissions are configured.
+- Full desktop test chain passed on 2026-07-15, including the new approval, approval-store, XiaoMiFeng export, and Feishu-contract tests. Project-memory verification and PGY safety audit passed. MVP readiness remains blocked only by the missing sanitized real-account validation record.
 
 - Clean Git repository established at `xhs-pgy-data-collector`.
 - Main product direction chosen: Electron desktop app in `desktop-app/`; legacy Python/FastAPI backend in `content-analyzer/` remains for compatibility.
@@ -82,10 +90,23 @@ Current product-readiness target: move the app from advanced prototype to usable
 - Added `scripts/prepare_pgy_live_validation.py` and upgraded live-validation records to schema v2. The preparer creates a sanitized JSON record with current branch/worktree note, Electron/backend PIDs, `scripts/audit_pgy_safety.py` result, and `scripts/probe_pgy_runtime_safety.py` result prefilled before any real-account testing. `scripts/validate_pgy_live_validation.py` now requires those prechecks for a passing record.
 - Tightened schema-v2 live-validation records further: completed records must replace placeholder aliases, choose `office/home/other`, include local start/end times, include local-only evidence refs for both batches, choose a concrete risk-stop method, and avoid URL/secret shapes. `scripts/test_pgy_live_validation.py` covers these validator cases.
 - Added `docs/project_memory/MVP_ACCEPTANCE_PLAN.md` and `scripts/check_mvp_readiness.py` to make the delivery boundary explicit. The project should not be described as delivered until local readiness, safety gates, and sanitized real-account validation are all satisfied.
+- On 2026-07-20, added a separate Xiaohongshu public-contact enrichment step to the contact-review workbench. It resolves a creator profile from the PGY creator page, visits profiles serially in the visible BrowserView, requires manual Xiaohongshu login, pauses on login/risk prompts, extracts only public email/WeChat/phone values, never overwrites manual contact fields, and does not change the selected contact channel automatically. Full profile text is not persisted.
 
 ## Checked Environment State
 
-Checked on 2026-07-02:
+Latest checks on 2026-07-20:
+
+- Repository path: `/Users/jingjing/Documents/Codex/2026-06-03/new-chat/product/xhs-pgy-data-collector`; branch `main`. The validated 2026-07-20 iteration is saved as a local Git checkpoint; commit hash, remote status, and worktree cleanliness must be rechecked at the start of the next thread.
+- The installed backend answered at `127.0.0.1:8010`; the observed “service not running” UI was stale startup state, not a failed backend. Recheck after restart or packaging.
+- `pnpm test` passed all 19 test files. `python3 scripts/verify_project_memory.py` and `python3 scripts/audit_pgy_safety.py` passed. `python3 scripts/check_mvp_readiness.py` reported `pass=32 fail=0 block=1`; the block is the missing sanitized live validation record.
+- The installed `.app` has not been replaced by this source build. Visual acceptance, a XiaoMiFeng test import, and real Feishu writes remain unverified.
+- Desktop dependencies were restored and all 20 Node test files passed, including `xhs_contact_enrichment.test.js`. Safety audit passed; readiness remains `pass=32 fail=0 block=1`, with sanitized real-account validation still missing.
+- The source Electron review page was visually checked at 1195x768 using an isolated temporary profile; the enrichment controls fit without obvious overlap. No creator profile was visited and no outreach was sent.
+- The source Python backend failed to start because `fastapi` is absent. A separate installed app was already serving the same health port, so the green UI status is not evidence that the source backend passed. Recheck process ownership before packaging or backend acceptance.
+- A one-creator live enrichment passed on 2026-07-20 after manual Xiaohongshu login: PGY profile resolution, visible Xiaohongshu navigation, public-email parsing, review-store persistence, and UI status all completed (`processed=1`, `found=1`, `failed=0`). No risk prompt appeared and no outreach was sent. The first attempt exposed a Chromium `-3/ERR_ABORTED` signal after the correct profile had already loaded; this is now tolerated only when the canonical current and target profile URLs match, with unit coverage.
+- The enrichment action now applies only to selected creators inside the current review filter. This allowed a one-person trial without changing the other 49 selection states or starting the full batch.
+
+Older checked state from 2026-07-02 (historical and volatile):
 
 - Repository path: `/Users/workstudio/Downloads/数据收集/xhs-pgy-data-collector`
 - Git branch: `main`
@@ -124,3 +145,4 @@ All items in this section are volatile and must be rechecked before making new c
 9. Extend annotation-style calibration after real-page validation: tune candidate scoring for live Pugongying pages, add Shift area selection if needed, and capture lightweight screenshot evidence for saved blocks.
 10. Run the anti-bot safety validation in `docs/project_memory/PGY_ANTI_BOT_SAFETY_AUDIT.md` before increasing speed, batch size, or adding any deeper automation.
 11. Use `scripts/check_mvp_readiness.py --run-commands` as the first readiness report before deciding whether to polish UI, fix static gaps, or start real-account validation.
+12. After the operator completes manual Xiaohongshu login, run the public-contact enrichment on 3-5 sanitized creators first. Validate profile resolution, parser accuracy, and pause-on-risk behavior before expanding to the original 50-person run.

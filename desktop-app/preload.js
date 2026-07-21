@@ -18,7 +18,8 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     scanPageBlocks: (payload) => ipcRenderer.invoke('pgy:scanPageBlocks', payload),
     clearPageBlockHints: () => ipcRenderer.invoke('pgy:clearPageBlockHints'),
     suggestNoteCardSelector: () => ipcRenderer.invoke('pgy:suggestNoteCardSelector'),
-    extractSearchCandidates: () => ipcRenderer.invoke('pgy:extractSearchCandidates'),
+    parseCandidateInstruction: (instruction) => ipcRenderer.invoke('pgy:parseCandidateInstruction', instruction),
+    extractSearchCandidates: (options) => ipcRenderer.invoke('pgy:extractSearchCandidates', options),
     extractCurrentMultiPage: (templatePath, options) =>
       ipcRenderer.invoke('pgy:extractCurrentMultiPage', templatePath, options)
   },

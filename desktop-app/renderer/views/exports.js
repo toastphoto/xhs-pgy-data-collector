@@ -44,7 +44,9 @@ let _xhsContactBatchCount = 20;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
 let _lastContactExportPath = '';
+let _contactExportState = { status: 'idle', message: '', outPath: '' };
 let _xhsContactListenerBound = false;
+const _autoEnrichmentStartedRuns = new Set();
 let _xhsContactState = {
   running: false,
   paused: false,
@@ -175,12 +177,14 @@ function ensureXhsContactProgressListener() {
   });
 }
 
-async function startXhsContactRows(targets, scopeLabel = '当前筛选') {
+async function startXhsContactRows(targets, scopeLabel = '当前筛选', options = {}) {
   if (!targets.length) return setMsg(`${scopeLabel}中没有已选达人。`);
-  const confirmed = window.confirm(
-    `确认开始补采${scopeLabel}的 ${targets.length} 位达人？\n\n系统会在右侧可见浏览器中低频串行打开个人主页，只读取公开简介中的联系方式，不会发送消息。`
-  );
-  if (!confirmed) return;
+  if (options.confirm !== false) {
+    const confirmed = window.confirm(
+      `确认开始补采${scopeLabel}的 ${targets.length} 位达人？\n\n系统会在右侧可见浏览器中低频串行打开个人主页，只读取公开简介中的联系方式，不会发送消息。`
+    );
+    if (!confirmed) return;
+  }
   _xhsContactState = { running: true, paused: false, total: targets.length, completed: 0, found: 0, failed: 0, session: _xhsContactState.session, message: '' };
   const result = await window.desktopAPI.contacts.enrichXhsBatch({
     runDir: _selectedRunDir,
@@ -677,6 +681,32 @@ export function renderExports(state) {
     resetContactPreviewState();
     _autoPreviewRequestedRunDir = '';
   }
+  const autoEnrichRunDir = String(state.exports?.autoEnrichRunDir || '');
+  if (
+    autoEnrichRunDir &&
+    autoEnrichRunDir === _selectedRunDir &&
+    !_autoEnrichmentStartedRuns.has(autoEnrichRunDir)
+  ) {
+    _autoEnrichmentStartedRuns.add(autoEnrichRunDir);
+    _autoPreviewRequestedRunDir = autoEnrichRunDir;
+    setTimeout(async () => {
+      await refreshContactPreview();
+      const targets = _contactPreviewRows.filter((row) => ensureReviewRow(row)?.selected !== false).slice(0, 50);
+      if (targets.length) {
+        setMsg(`蒲公英采集已完成，正在继续补采 ${targets.length} 位达人的小红书公开联系方式。`);
+        await startXhsContactRows(targets, '本次采集名单', { confirm: false });
+      } else {
+        setMsg('蒲公英采集已结束，但本次没有可用的达人结果可继续补采。');
+      }
+      store.set({
+        exports: {
+          ...(store.state.exports || {}),
+          autoEnrichRunDir: '',
+          _t: Date.now()
+        }
+      });
+    }, 0);
+  }
 
   const root = document.createElement('div');
   root.className = 'view';
@@ -896,27 +926,43 @@ export function renderExports(state) {
   const btnExportContact = document.createElement('button');
   btnExportContact.className = 'btn primary';
   btnExportContact.className = 'btn primary export-main-cta';
-  btnExportContact.textContent = '导出建联表';
+  btnExportContact.textContent = _contactExportState.status === 'working' ? '正在导出...' : '导出建联表';
+  btnExportContact.disabled = _contactExportState.status === 'working' || !_selectedRunDir || !_contactPreviewRows.length;
   btnExportContact.addEventListener('click', async () => {
+    if (_contactExportState.status === 'working') return;
+    _contactExportState = { status: 'working', message: '正在生成建联表，请稍候。', outPath: '' };
     setMsg('导出建联表中...');
     try {
-      await saveContactReviewNow();
+      const saveResult = await saveContactReviewNow();
+      if (saveResult && !saveResult.ok) throw new Error(saveResult.error || '复核内容保存失败');
       const r = await window.desktopAPI.exports.exportContactRun({
         runDir: _selectedRunDir,
         ...getContactSettings(),
         reviewRows: getReviewRows()
       });
       if (!r?.ok) {
+        _contactExportState = { status: 'error', message: `导出失败：${r?.error || 'unknown error'}`, outPath: '' };
         setMsg(`导出失败：${r?.error || 'unknown error'}`);
         return;
       }
       _lastContactExportPath = r.outPath || '';
+      _contactExportState = {
+        status: 'success',
+        message: `建联表已导出，共 ${r.creators || 0} 位达人。`,
+        outPath: _lastContactExportPath
+      };
       const statusCounts = formatFollowupStatusCounts(r.summary?.followupStatusCounts);
       const statusLine = statusCounts ? `\n跟进状态：${statusCounts}` : '';
       setMsg(`导出成功：\n${r.outPath}\n\n统计：raw_result.json=${r.files}，建联达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}${statusLine}`);
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     } catch (e) {
+      _contactExportState = { status: 'error', message: `导出异常：${e?.message || String(e)}`, outPath: '' };
       setMsg(`导出异常：${e?.message || String(e)}`);
+    } finally {
+      if (_contactExportState.status === 'working') {
+        _contactExportState = { status: 'error', message: '导出未完成，请重试。', outPath: '' };
+      }
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     }
   });
 
@@ -1081,15 +1127,25 @@ export function renderExports(state) {
   xhsContactBar.appendChild(xhsContactStatus);
   xhsContactBar.appendChild(btnOpenXhsLogin);
   xhsContactBar.appendChild(btnCheckXhsLogin);
-  xhsContactBar.appendChild(btnStartXhsContact);
-  xhsContactBar.appendChild(xhsBatchCountInput);
-  xhsContactBar.appendChild(btnStartXhsFirstN);
   xhsContactBar.appendChild(btnPauseXhsContact);
   xhsContactBar.appendChild(btnCancelXhsContact);
   contactSec.appendChild(xhsContactBar);
 
+  const manualXhsTools = document.createElement('div');
+  manualXhsTools.className = 'export-review-toolbar';
+  manualXhsTools.appendChild(btnStartXhsContact);
+  manualXhsTools.appendChild(xhsBatchCountInput);
+  manualXhsTools.appendChild(btnStartXhsFirstN);
+  const manualXhsSection = createAdvancedSection({
+    title: '需要时重新补采联系方式',
+    children: [manualXhsTools]
+  });
+  manualXhsSection.classList.add('contact-settings-section');
+  contactSec.appendChild(manualXhsSection);
+
   const contactSettings = createAdvancedSection({
-    title: '建联策略与话术',
+    title: '填写建联话术',
+    open: true,
     children: [contactGrid, pgyGrid]
   });
   contactSettings.classList.add('contact-settings-section');
@@ -1242,7 +1298,7 @@ export function renderExports(state) {
   const btnOpenLastContact = document.createElement('button');
   btnOpenLastContact.className = 'btn ghost';
   btnOpenLastContact.style.height = '34px';
-  btnOpenLastContact.textContent = '打开最近建联表';
+  btnOpenLastContact.textContent = _lastContactExportPath ? '打开已导出文件' : '打开最近建联表';
   btnOpenLastContact.disabled = !_lastContactExportPath;
   btnOpenLastContact.addEventListener('click', async () => {
     const r = await window.desktopAPI.exports.openPath(_lastContactExportPath);
@@ -1256,6 +1312,24 @@ export function renderExports(state) {
     reviewTop.appendChild(saveStatus);
   }
   contactSec.appendChild(reviewTop);
+
+  if (_contactExportState.status !== 'idle') {
+    const exportFeedback = document.createElement('div');
+    exportFeedback.className = `export-action-feedback ${_contactExportState.status}`;
+    exportFeedback.setAttribute('role', 'status');
+    exportFeedback.setAttribute('aria-live', 'polite');
+    const exportFeedbackMessage = document.createElement('div');
+    exportFeedbackMessage.className = 'export-action-feedback-message';
+    exportFeedbackMessage.textContent = _contactExportState.message;
+    exportFeedback.appendChild(exportFeedbackMessage);
+    if (_contactExportState.outPath) {
+      const exportFeedbackPath = document.createElement('div');
+      exportFeedbackPath.className = 'export-action-feedback-path';
+      exportFeedbackPath.textContent = _contactExportState.outPath;
+      exportFeedback.appendChild(exportFeedbackPath);
+    }
+    contactSec.appendChild(exportFeedback);
+  }
 
   if (_contactPreviewRows.length) {
     const reviewBatchActions = document.createElement('div');

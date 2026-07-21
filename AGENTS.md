@@ -86,6 +86,7 @@ python scripts/check_mvp_readiness.py --strict
 - Do not commit `.env`, cookies, browser session data, logs, `runs/`, database files, real creator links, or task spreadsheets.
 - Do not add real API keys, secrets, account identifiers, cookies, or private creator lists to docs or tests.
 - Do not bypass platform login, captcha, risk control, or rate limits. Keep the product aligned with manual-login, low-concurrency operation.
+- Natural-language candidate intake, result pagination, and collection must all preserve the PGY-only boundary, the hard 50-creator ceiling, serial jittered waits, batch cooldown, and immediate stop on login/captcha/risk/frequent-operation prompts.
 - Do not generate an executable XiaoMiFeng file or trigger any external send unless the current recipient/channel/message fingerprint has an approved human approval record. Any execution-content change invalidates approval.
 - Do not assume the legacy Python backend is the main product; verify whether a requested change belongs in `desktop-app/` first.
 - Do not treat service/port/branch/auth status in memory as permanent fact. Recheck before acting.

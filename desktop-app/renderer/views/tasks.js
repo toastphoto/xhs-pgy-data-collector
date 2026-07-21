@@ -31,6 +31,10 @@ let _executionRecords = [];
 let _selectedSigningTaskId = '';
 let _lastPgyLoginCheck = null;
 let _lastSearchSnapshot = null;
+let _candidateInstruction = '将当前页面前30位达人加入候选';
+let _candidateInstructionStatus = '';
+let _autoContactRunDir = '';
+const _forwardedContactRuns = new Set();
 let _candidateDirty = false;
 let _taskSetupOpen = false;
 let _searchAdvancedOpen = false;
@@ -359,67 +363,6 @@ function buildCriteriaText() {
   return lines.join('\n');
 }
 
-function taskBriefItems() {
-  const sourceMode = _signingTaskDraft.sourceMode || 'import';
-  const sourceLabel = SOURCE_MODE_OPTIONS.find(([value]) => value === sourceMode)?.[1] || '已有达人表/链接';
-  const criteriaCount = buildCriteriaText().split('\n').filter(Boolean).length;
-  const channels = [
-    _signingTaskDraft.channels?.pgy !== false ? '蒲公英搜索' : '',
-    _signingTaskDraft.channels?.xhs ? '小红书站内搜索' : ''
-  ].filter(Boolean).join(' / ') || '蒲公英搜索';
-  const contact = [
-    _signingTaskDraft.contactPlan?.pgyInvite ? '蒲公英邀约' : '',
-    _signingTaskDraft.contactPlan?.wechat ? '微信建联' : '',
-    _signingTaskDraft.contactPlan?.email ? '邮件建联' : ''
-  ].filter(Boolean).join(' / ') || '先生成建联表';
-  return [
-    ['任务', String(_signingTaskDraft.taskName || '').trim() || '未命名任务'],
-    ['来源', sourceLabel],
-    ['搜索', channels],
-    ['筛选', criteriaCount ? `${criteriaCount} 条要求` : '未填写'],
-    ['建联', contact],
-    ['候选', `${_draftUrls.length} 人`]
-  ];
-}
-
-function buildDiscoveryBrief() {
-  const taskName = String(_signingTaskDraft.taskName || '').trim() || '未命名签约任务';
-  const sourceMode = _signingTaskDraft.sourceMode || 'import';
-  const sourceLabel = SOURCE_MODE_OPTIONS.find(([value]) => value === sourceMode)?.[1] || '已有达人表/链接';
-  const criteria = buildCriteriaText() || '暂未填写筛选条件';
-  const channels = [
-    _signingTaskDraft.channels?.pgy !== false ? '蒲公英搜索' : '',
-    _signingTaskDraft.channels?.xhs ? '小红书站内搜索' : ''
-  ].filter(Boolean).join(' / ') || '蒲公英搜索';
-  const contact = [
-    _signingTaskDraft.contactPlan?.pgyInvite ? '蒲公英邀约' : '',
-    _signingTaskDraft.contactPlan?.wechat ? '微信建联' : '',
-    _signingTaskDraft.contactPlan?.email ? '邮件建联' : ''
-  ].filter(Boolean).join(' / ') || '先生成建联表';
-  const note = String(_signingTaskDraft.note || '').trim();
-
-  return [
-    `任务: ${taskName}`,
-    `任务来源: ${sourceLabel}`,
-    `搜索渠道: ${channels}`,
-    `建联计划: ${contact}`,
-    '',
-    '筛选条件:',
-    criteria,
-    '',
-    '操作:',
-    sourceMode === 'import'
-      ? '1. 导入或粘贴已有达人表/蒲公英链接。'
-      : '1. 登录蒲公英达人广场，先用平台自带筛选条件搜索达人。',
-    sourceMode === 'import'
-      ? '2. 在候选队列里标记优先/待复核/排除。'
-      : '2. 打开候选达人详情页，确认符合要求后点击“当前页加入候选”。',
-    '3. 候选列表确认无误后点击“开始”进行串行采集。',
-    '4. 采集完成后到“结果&导出”复核并生成建联表。',
-    note ? `\n备注:\n${note}` : ''
-  ].filter((line) => line !== '').join('\n');
-}
-
 function buildPreRunSummary({ loginCheck } = {}) {
   const criteriaCount = buildCriteriaText().split('\n').filter(Boolean).length;
   const withLabel = countDraftItemsWithLabel();
@@ -638,6 +581,30 @@ function renderExecutionRecords(root) {
 }
 
 export function renderTasks(state) {
+  const completedRunDir = String(state.tasks?.runDir || '');
+  const completionQueue = Array.isArray(state.tasks?.queue) ? state.tasks.queue : [];
+  const queueFinished = completionQueue.length > 0 && completionQueue.every((item) => ['ok', 'fail', 'skipped'].includes(String(item?.status || '')));
+  if (
+    _autoContactRunDir &&
+    completedRunDir === _autoContactRunDir &&
+    !state.tasks?.running &&
+    queueFinished &&
+    !_forwardedContactRuns.has(completedRunDir)
+  ) {
+    _forwardedContactRuns.add(completedRunDir);
+    _autoContactRunDir = '';
+    setTimeout(() => {
+      store.set({
+        view: 'exports',
+        exports: {
+          ...(store.state.exports || {}),
+          selectedRunDir: completedRunDir,
+          autoEnrichRunDir: completedRunDir,
+          _t: Date.now()
+        }
+      });
+    }, 0);
+  }
   if (!_signingDataLoaded && window.desktopAPI?.signingTasks) {
     refreshSigningData();
   }
@@ -842,43 +809,9 @@ export function renderTasks(state) {
   signingHead.className = 'panel-title-row';
   const signingTitle = document.createElement('div');
   signingTitle.className = 'section-label compact';
-  signingTitle.textContent = '任务简报';
-  const copyCriteria = document.createElement('button');
-  copyCriteria.className = 'btn';
-  copyCriteria.textContent = '复制任务简报';
-  copyCriteria.addEventListener('click', async () => {
-    const text = buildDiscoveryBrief();
-    if (!text) {
-      alert('请先填写任务简报');
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (_) {
-      window.prompt('复制失败，请手工复制：', text);
-    }
-  });
+  signingTitle.textContent = '从当前结果加入候选';
   signingHead.appendChild(signingTitle);
-  signingHead.appendChild(copyCriteria);
   signingPanel.appendChild(signingHead);
-
-  const briefGrid = document.createElement('div');
-  briefGrid.className = 'task-brief-grid';
-  taskBriefItems().forEach(([label, value]) => {
-    const item = document.createElement('div');
-    item.className = 'task-brief-item';
-    const k = document.createElement('div');
-    k.className = 'task-brief-label';
-    k.textContent = label;
-    const v = document.createElement('div');
-    v.className = 'task-brief-value';
-    v.textContent = value;
-    item.appendChild(k);
-    item.appendChild(v);
-    briefGrid.appendChild(item);
-  });
-  signingPanel.appendChild(briefGrid);
-
   const discoveryRow = document.createElement('div');
   discoveryRow.className = 'task-actions discovery-actions';
 
@@ -894,30 +827,29 @@ export function renderTasks(state) {
     }
   });
 
-  const copyBriefBtn = document.createElement('button');
-  copyBriefBtn.className = 'btn';
-  copyBriefBtn.textContent = '复制筛选清单';
-  copyBriefBtn.addEventListener('click', async () => {
-    const text = buildDiscoveryBrief();
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (_) {
-      window.prompt('复制失败，请手工复制：', text);
-    }
-  });
-
   const readSearchBtn = document.createElement('button');
   readSearchBtn.className = 'btn primary';
-  readSearchBtn.textContent = '读取当前结果';
+  readSearchBtn.textContent = '执行指令';
   readSearchBtn.disabled = !!state.tasks?.running;
   readSearchBtn.addEventListener('click', async () => {
     try {
-      const r = await window.desktopAPI.pgy.extractSearchCandidates();
-      if (!r?.ok) {
-        alert(`读取失败：${r?.error || 'unknown error'}`);
+      _candidateInstructionStatus = '正在读取右侧蒲公英结果...';
+      store.set({ tasks: { ...store.state.tasks } });
+      const command = await window.desktopAPI.pgy.parseCandidateInstruction(_candidateInstruction);
+      if (!command?.ok) {
+        _candidateInstructionStatus = command?.error || '指令无法识别';
+        alert(_candidateInstructionStatus);
+        store.set({ tasks: { ...store.state.tasks } });
         return;
       }
-      const items = Array.isArray(r.items) ? r.items : [];
+      const r = await window.desktopAPI.pgy.extractSearchCandidates({ requestedCount: command.requestedCount });
+      if (!r?.ok) {
+        _candidateInstructionStatus = r?.error || '读取失败';
+        alert(`读取失败：${r?.error || 'unknown error'}`);
+        store.set({ tasks: { ...store.state.tasks } });
+        return;
+      }
+      const items = (Array.isArray(r.items) ? r.items : []).slice(0, command.requestedCount);
       const mergeResult = applyImportedCandidateItems(items, { merge: true });
       _lastSearchSnapshot = {
         url: r.url || '',
@@ -938,17 +870,52 @@ export function renderTasks(state) {
         filters: r.filters || null,
         items: items.slice(0, 10)
       };
+      _candidateInstructionStatus = items.length
+        ? `已读取 ${items.length} 位，候选池现有 ${_draftUrls.length} 位`
+        : '未读取到达人，请确认右侧停留在蒲公英筛选结果页。';
       store.set({ tasks: { ...store.state.tasks } });
       const filterText = summarizeSearchFilters(r.filters);
       alert([
         r.message || '读取完成。',
-        `本次读取 ${items.length} 个可见达人，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
+        `指令要求 ${command.requestedCount} 位，本次读取 ${items.length} 位，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
         filterText ? `\n已记录当前筛选结构：\n${filterText.slice(0, 500)}` : ''
       ].filter(Boolean).join('\n'));
     } catch (e) {
+      _candidateInstructionStatus = e?.message || String(e);
       alert(`读取当前搜索结果异常：${e?.message || String(e)}`);
+      store.set({ tasks: { ...store.state.tasks } });
     }
   });
+
+  const commandWrap = document.createElement('div');
+  commandWrap.className = 'candidate-command';
+  const commandLabel = document.createElement('label');
+  commandLabel.className = 'candidate-command-label';
+  commandLabel.textContent = '告诉工具要取多少位达人';
+  const commandInputRow = document.createElement('div');
+  commandInputRow.className = 'candidate-command-input-row';
+  const commandInput = document.createElement('input');
+  commandInput.className = 'tpl-input candidate-command-input';
+  commandInput.placeholder = '例如：将当前页面前30位达人加入候选';
+  commandInput.value = _candidateInstruction;
+  commandInput.disabled = !!state.tasks?.running;
+  commandInput.addEventListener('input', () => {
+    _candidateInstruction = commandInput.value;
+    _candidateInstructionStatus = '';
+  });
+  commandInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    readSearchBtn.click();
+  });
+  commandInputRow.appendChild(commandInput);
+  commandInputRow.appendChild(readSearchBtn);
+  commandWrap.appendChild(commandLabel);
+  commandWrap.appendChild(commandInputRow);
+  const commandStatus = document.createElement('div');
+  commandStatus.className = 'muted-line candidate-command-status';
+  commandStatus.textContent = _candidateInstructionStatus || `当前候选 ${_draftUrls.length} 位，单次最多 ${SAFE_BATCH_LIMIT} 位`;
+  commandWrap.appendChild(commandStatus);
 
   const addCurrentBtn = document.createElement('button');
   addCurrentBtn.className = 'btn';
@@ -976,13 +943,10 @@ export function renderTasks(state) {
 
   const discoveryHint = document.createElement('div');
   discoveryHint.className = 'muted-line discovery-hint';
-  discoveryHint.textContent = (_signingTaskDraft.sourceMode || 'import') === 'import'
-    ? '已有达人表流程：可直接导入 Excel 或粘贴链接；如临时需要补充达人，也可打开蒲公英搜索后加入候选。'
-    : '搜索发现流程：先在右侧用蒲公英筛选条件找达人，点“读取当前结果”把当前可见结果加入候选；打开详情页时也可单独加入当前达人。';
+  discoveryHint.textContent = '筛选条件仍由用户在右侧蒲公英中设置；工具只按当前排序取前 N 位达人。';
 
   discoveryRow.appendChild(openPgyBtn);
-  discoveryRow.appendChild(copyBriefBtn);
-  discoveryRow.appendChild(readSearchBtn);
+  discoveryRow.appendChild(commandWrap);
   discoveryRow.appendChild(addCurrentBtn);
   discoveryRow.appendChild(discoveryHint);
   signingPanel.appendChild(discoveryRow);
@@ -1762,6 +1726,8 @@ export function renderTasks(state) {
         '确认开始采集？',
         '',
         summary,
+        '\n采集完成后，工具会继续低频访问这批达人的小红书公开主页，补采邮箱、微信号或手机号。如需登录或安全验证会自动暂停，等待人工处理。',
+        '本流程只采集和生成建联表，不会自动发送邀约、邮件或微信申请。',
         warnings.length ? `\n提醒:\n${warnings.map((x) => `- ${x}`).join('\n')}` : ''
       ].join('\n'));
       if (!ok) return;
@@ -1780,6 +1746,7 @@ export function renderTasks(state) {
         alert(`启动失败：${r?.error || 'unknown error'}`);
         return;
       }
+      _autoContactRunDir = r.runDir || '';
       // 启动后，队列状态由 tasks:state 推送覆盖，这里只保留草稿
       _draftText = _draftUrls.join('\n');
       textarea.value = _draftText;

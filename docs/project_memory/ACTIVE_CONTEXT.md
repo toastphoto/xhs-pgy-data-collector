@@ -1,12 +1,20 @@
 # Active Context
 
-Last reviewed: 2026-07-20.
+Last reviewed: 2026-07-21.
 
 ## Current Goal
 
-Complete phase 1 of the outreach workflow: reliable backend status, a strict XiaoMiFeng execution workbook, a Feishu system-of-record contract, and a mandatory human approval gate. Sending-result and reply tracking are schema/event interfaces only in this phase; they must not be represented as working integrations. Preserve all existing conservative Pugongying safety boundaries.
+Finish the six-step operator flow: manual PGY filtering, natural-language first-N candidate intake, serial PGY collection with automatic public-XHS-contact enrichment, outreach-copy review, and workbook export. Preserve every conservative PGY safety boundary and the mandatory human approval gate for all actual sending. First-3 live intake, the 50-person hard limit, and contact-workbook export feedback are verified; first-30/50 pagination is implemented and installed but still needs a separate live test.
 
 ## Completed Important Stages
+
+- On 2026-07-21, reworked the task page around a natural-language candidate instruction while keeping Excel and pasted-link import. The start action can hand a completed run to visible, serial public-XHS-contact enrichment; outreach copy and export remain in the review page.
+- The live PGY creator plaza test successfully added the current first 3 creators in order. A request for 51 creators was rejected by the 50-person hard limit. No cooperation, invitation, email, WeChat, or other send action was triggered.
+- Because the current PGY list does not expose detail links, candidate intake now has an in-memory read-only response parser. It retains only normalized public creator IDs, names, and metrics; it does not persist response bodies, headers, cookies, or tokens.
+- Low-frequency pagination for up to 3 result pages/50 creators is implemented with pre-page risk checks, waits, deduplication, and best-effort return to the starting page. Live first-30/50 validation remains pending.
+- The 22-test desktop chain and `scripts/audit_pgy_safety.py` passed on 2026-07-21. This iteration was saved as a local Git checkpoint; immediately afterward `main` was two commits ahead of `origin/main` with a clean worktree. Remote state remains volatile.
+- On 2026-07-21, fixed the primary contact-workbook export feedback. Export had succeeded, but its only status message was rendered after the long secondary-export section and looked unresponsive. The primary action now shows a working state, nearby success/error feedback and path, and an immediately enabled open-file action. A live 20-row export was reread successfully with all 6 expected sheets and 16 email rows; no outreach was sent.
+- `/Applications/小红书相关信息采集工具.app` now contains the latest source changes, the matched standalone backend resource, pagination code, and export feedback fix. The first-30/50 PGY pagination behavior still needs its separate live validation.
 
 - On 2026-07-20, fixed contact-review row identity collisions caused by truncating the Base64 encoding of long Pugongying URLs. Row IDs now hash the complete stable source identifier; legacy contact enrichment migrates only when the XHS profile entity ID matches the Pugongying creator entity ID. Regression tests cover shared URL prefixes and one-creator-only email migration.
 - Added a current-filter batch action for changing contact channel. The existing 50-person run was restored to 50 Pugongying-invite rows and re-exported; verification found exactly one email row, belonging to “是谢谢啦”. No invite was sent.

@@ -44,6 +44,13 @@ const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
 const { loadIndexFromDisk, rebuildKbFromDb, searchIndex } = require('./lib/kb/index');
 const { buildBrowserRiskDetectionSnippet } = require('./lib/pgy_risk');
+const {
+  MAX_CANDIDATE_COUNT,
+  buildSearchCandidateExtractionScript,
+  buildSearchPaginationScript,
+  parseCandidateInstruction
+} = require('./lib/pgy_candidate_command');
+const { PgyCandidateResponseCache } = require('./lib/pgy_candidate_response_cache');
 
 let mainWindow = null;
 let browserView = null;
@@ -53,6 +60,8 @@ let dbInstance = null;
 let dbInitPromise = null;
 let aiLastSqlResult = null; // { sql, rows } for optional export
 let kbCache = { loaded: false, index: null, meta: null };
+let pgyCandidateDebuggerAttached = false;
+const pgyCandidateResponseCache = new PgyCandidateResponseCache();
 
 let recordingEnabled = false;
 let currentRecording = [];
@@ -674,6 +683,146 @@ async function resolveNoteUrlsByClick(webContents, notes, noteCardSelector, { ti
   return { resolved, baseUrl, lastClipboardSample };
 }
 
+function attachPgyCandidateResponseCapture(webContents) {
+  if (!webContents || pgyCandidateDebuggerAttached) return;
+  const pendingResponses = new Set();
+  try {
+    if (!webContents.debugger.isAttached()) webContents.debugger.attach('1.3');
+    webContents.debugger.sendCommand('Network.enable').then(() => {
+      pgyCandidateDebuggerAttached = true;
+    }).catch(() => {});
+    webContents.debugger.on('message', (_event, method, params = {}) => {
+      if (method === 'Network.responseReceived') {
+        try {
+          const pageUrl = new URL(webContents.getURL());
+          const responseUrl = new URL(params.response?.url || '');
+          const isPgyPage = pageUrl.hostname === 'pgy.xiaohongshu.com';
+          const isXhsRequest = responseUrl.hostname === 'xiaohongshu.com'
+            || responseUrl.hostname.endsWith('.xiaohongshu.com');
+          const isDataRequest = params.type === 'XHR' || params.type === 'Fetch';
+          if (isPgyPage && isXhsRequest && isDataRequest && params.requestId) {
+            pendingResponses.add(params.requestId);
+          }
+        } catch (_) {}
+        return;
+      }
+      if (method !== 'Network.loadingFinished' || !pendingResponses.has(params.requestId)) return;
+      pendingResponses.delete(params.requestId);
+      webContents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId })
+        .then((response) => {
+          let body = String(response?.body || '');
+          if (response?.base64Encoded) body = Buffer.from(body, 'base64').toString('utf8');
+          if (!body || body.length > 8 * 1024 * 1024) return;
+          let payload = null;
+          try { payload = JSON.parse(body); } catch (_) { return; }
+          pgyCandidateResponseCache.capture(payload);
+        })
+        .catch(() => {});
+    });
+  } catch (_) {
+    pgyCandidateDebuggerAttached = false;
+  }
+}
+
+async function readPgyCandidatesFromResponsePages(requestedCount) {
+  const firstPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
+  if (!Array.isArray(firstPage?.items) || !firstPage.items.length) return null;
+  const items = [];
+  const seen = new Set();
+  const append = (rows) => {
+    for (const row of rows || []) {
+      if (!row?.pgy_url || seen.has(row.pgy_url)) continue;
+      seen.add(row.pgy_url);
+      items.push(row);
+    }
+  };
+  append(firstPage.items);
+  if (items.length >= requestedCount || !browserView) {
+    const resultItems = items.slice(0, requestedCount);
+    return {
+      ok: true,
+      items: resultItems,
+      stats: {
+        requested: requestedCount,
+        available: items.length,
+        extracted: resultItems.length,
+        source: 'pgy-list-response',
+        pagesRead: 1,
+        stoppedForRisk: false
+      },
+      message: `已按当前排序读取前 ${requestedCount} 位达人。`
+    };
+  }
+
+  let pagination = null;
+  try {
+    pagination = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect'), true);
+  } catch (_) {}
+  const startPage = Math.max(1, Number(pagination?.currentPage || 1));
+  let movedPages = 0;
+  let stoppedForRisk = false;
+
+  while (items.length < requestedCount && movedPages < 2) {
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (!risk?.ok || risk.riskDetected) {
+      stoppedForRisk = true;
+      break;
+    }
+    const previousFirstUrl = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT)?.items?.[0]?.pgy_url || '';
+    let next = null;
+    try {
+      next = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('next'), true);
+    } catch (_) {}
+    if (!next?.clicked) break;
+    movedPages += 1;
+    await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
+
+    let nextPage = null;
+    const waitUntil = Date.now() + 6000;
+    while (Date.now() < waitUntil) {
+      const latest = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
+      const latestFirstUrl = latest?.items?.[0]?.pgy_url || '';
+      if (latestFirstUrl && latestFirstUrl !== previousFirstUrl) {
+        nextPage = latest;
+        break;
+      }
+      await sleep(450);
+    }
+    if (!nextPage?.items?.length) break;
+    append(nextPage.items);
+  }
+
+  if (movedPages > 0) {
+    try {
+      const restore = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('goto', startPage),
+        true
+      );
+      if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+    } catch (_) {}
+  }
+
+  const resultItems = items.slice(0, requestedCount);
+  const complete = resultItems.length >= requestedCount;
+  return {
+    ok: true,
+    items: resultItems,
+    stats: {
+      requested: requestedCount,
+      available: items.length,
+      extracted: resultItems.length,
+      source: 'pgy-list-response',
+      pagesRead: movedPages + 1,
+      stoppedForRisk
+    },
+    message: complete
+      ? `已按当前排序读取前 ${requestedCount} 位达人。`
+      : (stoppedForRisk
+        ? `检测到登录或安全提示，已停止翻页；本次只读取 ${resultItems.length} 位达人。`
+        : `当前结果可读取 ${resultItems.length} 位达人，少于指令中的 ${requestedCount} 位。`)
+  };
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -699,6 +848,7 @@ function createMainWindow() {
       nodeIntegration: false
     }
   });
+  attachPgyCandidateResponseCapture(browserView.webContents);
   mainWindow.setBrowserView(browserView);
   // 很多站点（含蒲公英）会用 target=_blank / window.open 做站内跳转。
   // 如果直接 deny，用户点击会“没反应”。这里改为：拦截新窗口并在当前 BrowserView 内打开。
@@ -808,6 +958,8 @@ function createMainWindow() {
     mainWindow = null;
     browserView = null;
     taskRunner = null;
+    pgyCandidateDebuggerAttached = false;
+    pgyCandidateResponseCache.clear();
   });
 }
 
@@ -2186,11 +2338,25 @@ ipcMain.handle('pgy:suggestNoteCardSelector', async () => {
   }
 });
 
-ipcMain.handle('pgy:extractSearchCandidates', async () => {
+ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('读取搜索结果');
   if (rejected) return rejected;
   try {
+    const requestedCount = Math.max(1, Math.min(
+      MAX_CANDIDATE_COUNT,
+      Number(options?.requestedCount || MAX_CANDIDATE_COUNT) || MAX_CANDIDATE_COUNT
+    ));
+    const runtimeResult = await browserView.webContents.executeJavaScript(
+      buildSearchCandidateExtractionScript(requestedCount),
+      true
+    );
+    if (Array.isArray(runtimeResult?.items) && runtimeResult.items.length) return runtimeResult;
+    const responseResult = await readPgyCandidatesFromResponsePages(requestedCount);
+    if (Array.isArray(responseResult?.items) && responseResult.items.length) {
+      return { ...responseResult, url: browserView.webContents.getURL() };
+    }
+
     const js = `
       (function(){
         const clean = (value, limit = 180) => String(value || '')
@@ -2353,11 +2519,26 @@ ipcMain.handle('pgy:extractSearchCandidates', async () => {
         };
       })()
     `;
-    return await browserView.webContents.executeJavaScript(js, true);
+    const fallbackResult = await browserView.webContents.executeJavaScript(js, true);
+    if (Array.isArray(fallbackResult?.items)) {
+      fallbackResult.items = fallbackResult.items.slice(0, requestedCount);
+      fallbackResult.stats = {
+        ...(fallbackResult.stats || {}),
+        requested: requestedCount,
+        available: Number(fallbackResult?.stats?.extracted || fallbackResult.items.length),
+        extracted: fallbackResult.items.length,
+        source: 'visible-links-fallback'
+      };
+    }
+    return fallbackResult;
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
 });
+
+ipcMain.handle('pgy:parseCandidateInstruction', async (_e, instruction) => (
+  parseCandidateInstruction(instruction, { maxCount: MAX_CANDIDATE_COUNT })
+));
 
 // =========================
 // PGY Resource v1：从页面文本做“指标名->数值”抽取（缺失留空）

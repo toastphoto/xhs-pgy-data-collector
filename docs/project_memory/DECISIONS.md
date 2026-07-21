@@ -335,3 +335,10 @@
 - Why: The first 50-person PGY workbook contained no actionable email or WeChat values, while some creators publish business contact details on their Xiaohongshu profiles.
 - Impact: Enrichment fills only empty fields, does not auto-switch outreach channels, and invalidates stale execution approval when recipients change. Persist only parsed contacts, a query-free profile URL, source, timestamp, and status; do not persist full bios.
 - Reevaluate when: A 3-5 creator live trial shows unstable profile resolution, unacceptable platform risk, or the page structure/policy changes.
+
+## 2026-07-21: Keep the six-step flow inside the existing safety envelope
+
+- Decision: The operator manually filters PGY, then uses a natural-language first-N instruction to populate candidates. Candidate intake may read additional result pages and a completed PGY run may continue into visible public-XHS-contact enrichment, but all such operations retain the PGY-only boundary, 50-person hard ceiling, serial jittered waits, batch cooldown, and immediate stop on login/captcha/risk/frequent-operation prompts. Actual outreach always requires current human approval.
+- Why: The operator wants less manual candidate handling and explicitly requires the existing risk-control features to remain. Product simplification must not weaken platform or communication safeguards.
+- Impact: Natural language does not click PGY filters. Response parsing keeps only normalized public creator fields in memory and never persists raw response bodies or authentication material. Send/result/reply integrations remain outside this iteration.
+- Reevaluate when: An official PGY export/API is available and passes a new safety review. Do not lower the 50-person ceiling, risk-stop behavior, or human send approval as an ordinary UX optimization.

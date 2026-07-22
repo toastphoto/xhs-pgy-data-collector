@@ -342,3 +342,10 @@
 - Why: The operator wants less manual candidate handling and explicitly requires the existing risk-control features to remain. Product simplification must not weaken platform or communication safeguards.
 - Impact: Natural language does not click PGY filters. Response parsing keeps only normalized public creator fields in memory and never persists raw response bodies or authentication material. Send/result/reply integrations remain outside this iteration.
 - Reevaluate when: An official PGY export/API is available and passes a new safety review. Do not lower the 50-person ceiling, risk-stop behavior, or human send approval as an ordinary UX optimization.
+
+## 2026-07-22: Email handoff may prepare recipients but never send
+
+- Decision: The review workbench may open the official Tencent enterprise-mail site and prepare up to 20 unique valid emails from selected creators in the current filter. Login remains manual. Automation is limited to opening a semantic compose action and filling the recipient field; it must never fill credentials, call a mail-send API, fill message content, or click send.
+- Why: Operators need to avoid copying addresses one by one, while every external communication must remain visible, reviewable, and explicitly sent by a person. A small cap and strict host/input validation reduce accidental bulk outreach and privacy mistakes.
+- Impact: Recipient preparation requires an in-app confirmation, uses only official Tencent enterprise-mail hosts, stops on security-verification or abnormal-access text, and warns that multiple `To` recipients may see one another. Pugongying profile links similarly use the existing PGY allowlist and never click invite/cooperation controls.
+- Reevaluate when: Tencent changes its official host or compose DOM, the team adopts a reviewed official mail API, or live testing shows that embedded-browser login causes unacceptable account verification. Human send confirmation and recipient privacy review must remain mandatory.

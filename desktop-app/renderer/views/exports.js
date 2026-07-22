@@ -57,6 +57,13 @@ let _xhsContactState = {
   session: 'unknown',
   message: ''
 };
+let _tencentEmailListenerBound = false;
+let _tencentEmailState = {
+  active: false,
+  status: 'idle',
+  recipientCount: 0,
+  message: ''
+};
 
 const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
 const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
@@ -173,6 +180,20 @@ function ensureXhsContactProgressListener() {
       _xhsContactState.running = false;
       _xhsContactState.paused = false;
     }
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  });
+}
+
+function ensureTencentEmailProgressListener() {
+  if (_tencentEmailListenerBound || !window.desktopAPI?.contacts?.onTencentEmailProgress) return;
+  _tencentEmailListenerBound = true;
+  window.desktopAPI.contacts.onTencentEmailProgress((payload = {}) => {
+    _tencentEmailState = {
+      active: Boolean(payload.active),
+      status: String(payload.status || _tencentEmailState.status || 'idle'),
+      recipientCount: Number(payload.recipientCount || _tencentEmailState.recipientCount || 0),
+      message: String(payload.message || '')
+    };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
   });
 }
@@ -675,6 +696,7 @@ async function refreshContactPreview() {
 
 export function renderExports(state) {
   ensureXhsContactProgressListener();
+  ensureTencentEmailProgressListener();
   const requestedRunDir = state.exports?.selectedRunDir || '';
   if (requestedRunDir && requestedRunDir !== _selectedRunDir) {
     _selectedRunDir = requestedRunDir;
@@ -1040,6 +1062,10 @@ export function renderExports(state) {
   pgyGrid.appendChild(emailBodyWrap);
 
   const filteredContactRows = getContactFilteredRows();
+  const selectedEmailRows = filteredContactRows.filter((row) => {
+    const review = ensureReviewRow(row);
+    return review?.selected !== false && Boolean(String(review?.email || row?.email || '').trim());
+  });
   const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
   const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
 
@@ -1295,6 +1321,45 @@ export function renderExports(state) {
   reviewTop.appendChild(btnExportContact);
   reviewTop.appendChild(btnPreview);
   reviewTop.appendChild(btnSaveReview);
+  const btnTencentEmail = document.createElement('button');
+  btnTencentEmail.className = 'btn primary';
+  btnTencentEmail.style.height = '34px';
+  btnTencentEmail.textContent = _tencentEmailState.active
+    ? '正在准备邮箱...'
+    : `去邮箱建联${selectedEmailRows.length ? `（${selectedEmailRows.length}）` : ''}`;
+  btnTencentEmail.disabled = !selectedEmailRows.length || _tencentEmailState.active;
+  btnTencentEmail.title = '打开腾讯企业邮箱并填入当前筛选中已勾选且有邮箱的达人；不会发送邮件';
+  btnTencentEmail.addEventListener('click', async () => {
+    const recipients = selectedEmailRows
+      .map((row) => String(ensureReviewRow(row)?.email || row?.email || '').trim())
+      .filter(Boolean);
+    if (!recipients.length) return setMsg('当前筛选中没有已勾选且带邮箱的达人。');
+    const confirmed = window.confirm(
+      `即将打开腾讯企业邮箱，并准备 ${recipients.length} 位收件人。\n\n` +
+      '系统只会尝试填入收件人，不会填写密码，不会点击发送。\n' +
+      '多位达人放在同一封邮件的收件人栏时可能互相看到邮箱地址，请在发送前人工检查收件人、正文、附件及隐私设置。\n\n' +
+      '确认继续？'
+    );
+    if (!confirmed) return;
+    _tencentEmailState = {
+      active: true,
+      status: 'opening',
+      recipientCount: recipients.length,
+      message: '正在打开腾讯企业邮箱。'
+    };
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    const result = await window.desktopAPI.contacts.prepareTencentEmail({ recipients });
+    if (!result?.ok) {
+      _tencentEmailState = {
+        active: false,
+        status: 'error',
+        recipientCount: recipients.length,
+        message: result?.error || '腾讯企业邮箱准备失败'
+      };
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }
+  });
+  reviewTop.appendChild(btnTencentEmail);
   const btnOpenLastContact = document.createElement('button');
   btnOpenLastContact.className = 'btn ghost';
   btnOpenLastContact.style.height = '34px';
@@ -1312,6 +1377,29 @@ export function renderExports(state) {
     reviewTop.appendChild(saveStatus);
   }
   contactSec.appendChild(reviewTop);
+
+  if (_tencentEmailState.status !== 'idle') {
+    const emailStatus = document.createElement('div');
+    const tone = _tencentEmailState.status === 'ready'
+      ? 'success'
+      : ['error', 'risk', 'timeout'].includes(_tencentEmailState.status) ? 'error' : '';
+    emailStatus.className = `email-compose-feedback ${tone}`.trim();
+    emailStatus.setAttribute('role', 'status');
+    emailStatus.setAttribute('aria-live', 'polite');
+    const statusText = document.createElement('div');
+    statusText.textContent = _tencentEmailState.message;
+    emailStatus.appendChild(statusText);
+    if (_tencentEmailState.active) {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn ghost';
+      cancel.textContent = '停止填入';
+      cancel.addEventListener('click', async () => {
+        await window.desktopAPI.contacts.cancelTencentEmail();
+      });
+      emailStatus.appendChild(cancel);
+    }
+    contactSec.appendChild(emailStatus);
+  }
 
   if (_contactExportState.status !== 'idle') {
     const exportFeedback = document.createElement('div');
@@ -1625,6 +1713,19 @@ export function renderExports(state) {
       sub.textContent = [row.xhsId, row.followers].filter(Boolean).join(' / ');
       creatorBlock.appendChild(creatorName);
       creatorBlock.appendChild(sub);
+      if (row.creatorUrl) {
+        const pgyLink = document.createElement('a');
+        pgyLink.className = 'contact-pgy-link';
+        pgyLink.href = normalizeContactUrl(row.creatorUrl);
+        pgyLink.textContent = '打开蒲公英主页';
+        pgyLink.title = row.creatorUrl;
+        pgyLink.addEventListener('click', async (event) => {
+          event.preventDefault();
+          const result = await window.desktopAPI.contacts.openPgyCreator(row.creatorUrl);
+          if (!result?.ok) setMsg(`打开蒲公英主页失败：${result?.error || 'unknown error'}`);
+        });
+        creatorBlock.appendChild(pgyLink);
+      }
 
       const reason = document.createElement('div');
       reason.className = 'contact-review-reason';
@@ -1643,7 +1744,6 @@ export function renderExports(state) {
         quickMeta.appendChild(chip);
       };
       appendChip('跟进', defaultFollowupStatus(review));
-      appendChip('方式', getContactExecutionChannel(review), 'strong');
       if (review?.priority) appendChip('优先级', review.priority, 'strong');
       appendChip('邮箱', review?.email ? '已填' : '待补', review?.email ? 'good' : 'warn');
       appendChip('微信', review?.wechatId ? '已填' : '待补', review?.wechatId ? 'good' : 'warn');

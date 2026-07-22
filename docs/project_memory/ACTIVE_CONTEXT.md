@@ -1,6 +1,6 @@
 # Active Context
 
-Last reviewed: 2026-07-21.
+Last reviewed: 2026-07-22.
 
 ## Current Goal
 
@@ -8,6 +8,9 @@ Finish the six-step operator flow: manual PGY filtering, natural-language first-
 
 ## Completed Important Stages
 
+- On 2026-07-22, the contact-review cards gained a restricted Pugongying profile link that opens only an allowlisted `pgy.xiaohongshu.com` creator URL in the visible BrowserView. The prominent per-card execution-channel chip was removed; underlying channel/export data remains intact.
+- Added a Tencent enterprise-mail handoff for selected creators in the current review filter who have valid emails. It opens the official visible mailbox page, waits for manual login, may click only a semantic compose action, and fills only the recipient field. It never fills credentials, invokes a mail API, fills content, or clicks send. The action is capped at 20 unique valid recipients, requires an in-app confirmation, stops on security/risk text, and warns about multi-recipient privacy.
+- The 23-test desktop chain, syntax checks, PGY safety audit, and project-memory verification passed on 2026-07-22. An isolated dummy-data UI test verified recipient-count changes, the confirmation/cancel gate, visible Pugongying links, and the official Tencent enterprise-mail landing page. Post-login recipient filling still needs a user-authorized live mailbox test; no real email or invitation was sent.
 - On 2026-07-21, reworked the task page around a natural-language candidate instruction while keeping Excel and pasted-link import. The start action can hand a completed run to visible, serial public-XHS-contact enrichment; outreach copy and export remain in the review page.
 - The live PGY creator plaza test successfully added the current first 3 creators in order. A request for 51 creators was rejected by the 50-person hard limit. No cooperation, invitation, email, WeChat, or other send action was triggered.
 - Because the current PGY list does not expose detail links, candidate intake now has an in-memory read-only response parser. It retains only normalized public creator IDs, names, and metrics; it does not persist response bodies, headers, cookies, or tokens.
@@ -102,6 +105,12 @@ Finish the six-step operator flow: manual PGY filtering, natural-language first-
 
 ## Checked Environment State
 
+Latest checks on 2026-07-22:
+
+- Repository branch was `main`, two commits ahead of `origin/main`, based on `snapshot-2026-07-21-final`; the new mail/link iteration was uncommitted during implementation. Recheck after packaging/checkpoint creation.
+- The official Tencent enterprise-mail landing page resolved to `https://work.weixin.qq.com/mail/` in an isolated Electron profile. Login state, post-login DOM, recipient tokens, and account-specific verification remain volatile and require a user-authorized live check.
+- No real creator page, mailbox account, invitation, or send action was used in UI testing. Dummy addresses and dummy Pugongying URLs were stored only under a temporary test user-data directory.
+
 Latest checks on 2026-07-20:
 
 - Repository path: `/Users/jingjing/Documents/Codex/2026-06-03/new-chat/product/xhs-pgy-data-collector`; branch `main`. The validated 2026-07-20 iteration is saved as a local Git checkpoint; commit hash, remote status, and worktree cleanliness must be rechecked at the start of the next thread.
@@ -139,6 +148,7 @@ All items in this section are volatile and must be rechecked before making new c
 - Whether a real Pugongying account can run 3-5 and then 10 creator checks without triggering risk-control pages, recorded via `scripts/validate_pgy_live_validation.py`; do not infer this from unit tests or static safety audits.
 - Whether the XiaoMiFeng RPA package, Feishu manuals, and WeChat RPA website have changed since the last inspection.
 - Whether XiaoMiFeng supports a stable import template, result export, command-line trigger, API trigger, or stable local database schema.
+- Whether Tencent enterprise mail still uses the same official host and post-login compose DOM; revalidate with a dummy or approved mailbox before relying on automatic recipient filling.
 
 ## Suggested Next Steps
 

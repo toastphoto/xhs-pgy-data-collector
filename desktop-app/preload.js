@@ -78,13 +78,17 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     approveXiaomifeng: (payload) => ipcRenderer.invoke('approvals:approveXiaomifeng', payload)
   },
   contacts: {
+    openPgyCreator: (url) => ipcRenderer.invoke('contacts:openPgyCreator', url),
     openXhsLogin: () => ipcRenderer.invoke('contacts:openXhsLogin'),
     checkXhsLogin: () => ipcRenderer.invoke('contacts:checkXhsLogin'),
     enrichXhsBatch: (payload) => ipcRenderer.invoke('contacts:enrichXhsBatch', payload),
     pauseXhsEnrichment: () => ipcRenderer.invoke('contacts:pauseXhsEnrichment'),
     resumeXhsEnrichment: () => ipcRenderer.invoke('contacts:resumeXhsEnrichment'),
     cancelXhsEnrichment: () => ipcRenderer.invoke('contacts:cancelXhsEnrichment'),
-    onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload))
+    prepareTencentEmail: (payload) => ipcRenderer.invoke('contacts:prepareTencentEmail', payload),
+    cancelTencentEmail: () => ipcRenderer.invoke('contacts:cancelTencentEmail'),
+    onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload)),
+    onTencentEmailProgress: (cb) => ipcRenderer.on('contacts:tencentEmailProgress', (_e, payload) => cb(payload))
   },
   db: {
     stats: () => ipcRenderer.invoke('db:stats'),

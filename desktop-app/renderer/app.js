@@ -17,6 +17,8 @@ const views = {
   toolbox: renderToolbox
 };
 
+let lastRenderedView = '';
+
 function h(tag, attrs = {}, children = []) {
   const el = document.createElement(tag);
   Object.entries(attrs).forEach(([k, v]) => {
@@ -168,9 +170,13 @@ function renderTopbar(state) {
 
 function renderContent(state) {
   const content = document.getElementById('content');
+  const keepScroll = lastRenderedView === state.view;
+  const scrollTop = keepScroll ? content.scrollTop : 0;
   content.innerHTML = '';
   const view = views[state.view] || views.login;
   content.appendChild(view(state));
+  content.scrollTop = scrollTop;
+  lastRenderedView = state.view;
 }
 
 function initSplitters() {

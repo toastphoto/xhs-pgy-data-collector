@@ -40,6 +40,8 @@ let _contactFollowupFilter = 'all';
 let _contactChannelFilter = 'all';
 let _contactBatchFollowupStatus = '待建联';
 let _contactBatchChannel = '蒲公英邀约';
+let _contactReviewScrollTop = 0;
+let _contactBulkActionsOpen = false;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
 let _lastContactExportPath = '';
@@ -538,6 +540,7 @@ function resetContactPreviewState({ keepMeta = false } = {}) {
   _contactPreviewRunDir = '';
   _contactLoadedRunDir = '';
   _contactReviewMap = new Map();
+  _contactReviewScrollTop = 0;
   _contactSaveStatus = '';
   resetEmailHandoff();
   if (!keepMeta) _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
@@ -1518,14 +1521,41 @@ export function renderExports(state) {
       b.addEventListener('click', onClick);
       return b;
     };
-    filterActions.appendChild(mkFilterBtn('清空当前勾选', () => {
-      filteredContactRows.forEach((row) => {
+
+    const selectionActions = document.createElement('div');
+    selectionActions.className = 'export-filter-actions';
+    setStyles(selectionActions, { padding: '8px 18px 0', alignItems: 'center' });
+
+    const selectAllButton = mkFilterBtn('全选', () => {
+      _contactPreviewRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        markReviewSelected(review);
+      });
+      _xiaomifengApprovalCheck = null;
+      scheduleContactReviewSave();
+      setMsg(`已选中本批次全部 ${_contactPreviewRows.length} 位达人。`);
+    });
+    selectAllButton.title = '选中本批次全部已采集达人，不受当前筛选条件影响';
+    selectionActions.appendChild(selectAllButton);
+
+    const resetSelectionButton = mkFilterBtn('重置', () => {
+      _contactPreviewRows.forEach((row) => {
         const review = ensureReviewRow(row);
         clearReviewSelected(review);
       });
+      _xiaomifengApprovalCheck = null;
       scheduleContactReviewSave();
-      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-    }));
+      setMsg('已清空本批次全部达人勾选；采集数据和已填写内容保持不变。');
+    });
+    resetSelectionButton.title = '清空本批次全部达人勾选，不删除采集数据或已填写内容';
+    selectionActions.appendChild(resetSelectionButton);
+
+    const selectionScope = document.createElement('span');
+    selectionScope.className = 'muted-line';
+    selectionScope.textContent = `作用于本批次全部 ${_contactPreviewRows.length} 位达人`;
+    selectionActions.appendChild(selectionScope);
+    contactSec.appendChild(selectionActions);
+
     filterActions.appendChild(mkFilterBtn('复制当前链接', async () => {
       const text = filteredContactRows.map((row) => row.creatorUrl).filter(Boolean).join('\n');
       if (!text) {
@@ -1629,6 +1659,10 @@ export function renderExports(state) {
     }));
     const bulkDetails = createAdvancedSection({
       title: `批量处理当前筛选结果（${filteredContactRows.length} 人）`,
+      open: _contactBulkActionsOpen,
+      onToggle: (open) => {
+        _contactBulkActionsOpen = open;
+      },
       children: [filterActions]
     });
     bulkDetails.classList.add('bulk-actions-section');
@@ -1661,8 +1695,10 @@ export function renderExports(state) {
     contactSec.appendChild(emptyState);
   }
 
+  let contactReviewList = null;
   if (_contactPreviewRows.length) {
     const reviewList = document.createElement('div');
+    contactReviewList = reviewList;
     reviewList.className = 'contact-review-list';
 
     if (!filteredContactRows.length) {
@@ -1687,8 +1723,10 @@ export function renderExports(state) {
       selectedInput.checked = review?.selected === true;
       selectedInput.addEventListener('change', () => {
         if (!review) return;
+        _contactReviewScrollTop = reviewList.scrollTop;
         if (selectedInput.checked) markReviewSelected(review);
         else clearReviewSelected(review);
+        _xiaomifengApprovalCheck = null;
         resetEmailHandoff();
         scheduleContactReviewSave();
         store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1909,8 +1947,18 @@ export function renderExports(state) {
       reviewList.appendChild(card);
     });
     contactSec.appendChild(reviewList);
+    reviewList.addEventListener('scroll', () => {
+      _contactReviewScrollTop = reviewList.scrollTop;
+    });
   }
   root.appendChild(contactSec);
+  if (contactReviewList) {
+    const scrollTop = _contactReviewScrollTop;
+    contactReviewList.scrollTop = scrollTop;
+    requestAnimationFrame(() => {
+      if (contactReviewList.isConnected) contactReviewList.scrollTop = scrollTop;
+    });
+  }
 
   // 二次导出：按列勾选（两栏 + sticky 操作条）
   const sec = document.createElement('div');

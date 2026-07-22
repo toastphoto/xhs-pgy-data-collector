@@ -85,10 +85,8 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     pauseXhsEnrichment: () => ipcRenderer.invoke('contacts:pauseXhsEnrichment'),
     resumeXhsEnrichment: () => ipcRenderer.invoke('contacts:resumeXhsEnrichment'),
     cancelXhsEnrichment: () => ipcRenderer.invoke('contacts:cancelXhsEnrichment'),
-    prepareTencentEmail: (payload) => ipcRenderer.invoke('contacts:prepareTencentEmail', payload),
-    cancelTencentEmail: () => ipcRenderer.invoke('contacts:cancelTencentEmail'),
-    onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload)),
-    onTencentEmailProgress: (cb) => ipcRenderer.on('contacts:tencentEmailProgress', (_e, payload) => cb(payload))
+    openTencentEmail: () => ipcRenderer.invoke('contacts:openTencentEmail'),
+    onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload))
   },
   db: {
     stats: () => ipcRenderer.invoke('db:stats'),

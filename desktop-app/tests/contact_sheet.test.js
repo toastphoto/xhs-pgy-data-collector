@@ -100,6 +100,15 @@ assert.strictEqual(preview.rows[0].priority, 'P2');
 assert.strictEqual(preview.rows[0].excludeReason, '候选阶段排除');
 assert.strictEqual(preview.rows[0].note, '候选备注');
 
+const manualOptInRunDir = path.join(tmp, 'run_manual_opt_in');
+const manualOptInChildDir = path.join(manualOptInRunDir, '1_creator');
+fs.mkdirSync(manualOptInChildDir, { recursive: true });
+fs.copyFileSync(path.join(childDir, 'raw_result.json'), path.join(manualOptInChildDir, 'raw_result.json'));
+const manualOptInPreview = getContactPreview(manualOptInRunDir);
+assert.strictEqual(manualOptInPreview.rows[0].selected, false);
+assert.strictEqual(manualOptInPreview.summary.selected, 0);
+assert.strictEqual(manualOptInPreview.rows[0].followupStatus, '');
+
 const reviewed = buildContactRowsFromRun(runDir, {
   defaultGroupTag: 'FILA',
   defaultGreeting: '您好，想沟通一下合作。',

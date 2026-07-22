@@ -41,9 +41,7 @@ const {
 } = require('./lib/xhs_contact_enrichment');
 const {
   TENCENT_MAIL_HOME_URL,
-  buildTencentRecipientPrefillScript,
-  isAllowedTencentMailUrl,
-  normalizeTencentEmailRecipients
+  isAllowedTencentMailUrl
 } = require('./lib/tencent_email_compose');
 const { openDb, initDb, dbGet, dbAll } = require('./lib/db/sqlite');
 const { syncRunsToDb } = require('./lib/db/import_runs');
@@ -79,15 +77,6 @@ let xhsContactJob = {
   resumeGate: null,
   resumeGateResolve: null
 };
-let tencentEmailComposeJob = {
-  active: false,
-  inFlight: false,
-  recipients: [],
-  startedAt: 0,
-  timer: null,
-  lastStatus: ''
-};
-
 const UI_WIDTH_RATIO = 0.72;   // 默认优先保证左侧建联工作台的可读宽度
 const UI_MIN_WIDTH = 620;
 const UI_MAX_WIDTH = 1040;
@@ -278,84 +267,6 @@ function buildWaitForSelectorJs(selector, timeoutMs) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function emitTencentEmailProgress(payload = {}) {
-  mainWindow?.webContents.send('contacts:tencentEmailProgress', {
-    active: tencentEmailComposeJob.active,
-    recipientCount: tencentEmailComposeJob.recipients.length,
-    ...payload
-  });
-}
-
-function clearTencentEmailTimer() {
-  if (tencentEmailComposeJob.timer) clearTimeout(tencentEmailComposeJob.timer);
-  tencentEmailComposeJob.timer = null;
-}
-
-function finishTencentEmailCompose(status, message) {
-  clearTencentEmailTimer();
-  tencentEmailComposeJob.active = false;
-  tencentEmailComposeJob.inFlight = false;
-  tencentEmailComposeJob.lastStatus = status;
-  emitTencentEmailProgress({ status, message });
-}
-
-function scheduleTencentEmailProgress(delayMs = 1200) {
-  clearTencentEmailTimer();
-  if (!tencentEmailComposeJob.active) return;
-  tencentEmailComposeJob.timer = setTimeout(() => progressTencentEmailCompose(), delayMs);
-}
-
-async function progressTencentEmailCompose() {
-  if (!tencentEmailComposeJob.active || tencentEmailComposeJob.inFlight || !browserView) return;
-  if (Date.now() - tencentEmailComposeJob.startedAt > 10 * 60 * 1000) {
-    finishTencentEmailCompose('timeout', '等待登录或写信页面超时，请重新点击“去邮箱建联”。');
-    return;
-  }
-  const currentUrl = browserView.webContents.getURL() || '';
-  if (!isAllowedTencentMailUrl(currentUrl)) {
-    if (!currentUrl || currentUrl === 'about:blank') {
-      scheduleTencentEmailProgress(1200);
-      return;
-    }
-    finishTencentEmailCompose('canceled', '页面已离开腾讯企业邮箱，已停止自动填入收件人。');
-    return;
-  }
-
-  tencentEmailComposeJob.inFlight = true;
-  try {
-    const result = await browserView.webContents.executeJavaScript(
-      buildTencentRecipientPrefillScript(tencentEmailComposeJob.recipients),
-      true
-    );
-    const status = String(result?.status || 'mailbox_loading');
-    if (status === 'recipients_filled') {
-      finishTencentEmailCompose(
-        'ready',
-        `已填入 ${tencentEmailComposeJob.recipients.length} 位收件人。请人工核对收件人、正文和附件后再决定是否发送。`
-      );
-      return;
-    }
-    if (status === 'risk_detected') {
-      finishTencentEmailCompose('risk', '腾讯企业邮箱出现安全验证或访问异常，已停止填入，请人工处理。');
-      return;
-    }
-    const messages = {
-      login_required: '请在右侧腾讯企业邮箱完成人工登录；登录后会继续尝试打开写信页。',
-      compose_opening: '已进入写信流程，正在等待收件人输入框。',
-      mailbox_loading: '正在等待腾讯企业邮箱完成加载。'
-    };
-    if (status !== tencentEmailComposeJob.lastStatus) {
-      tencentEmailComposeJob.lastStatus = status;
-      emitTencentEmailProgress({ status, message: messages[status] || messages.mailbox_loading });
-    }
-  } catch (err) {
-    emitTencentEmailProgress({ status: 'waiting', message: '正在等待腾讯企业邮箱页面就绪。' });
-  } finally {
-    tencentEmailComposeJob.inFlight = false;
-  }
-  scheduleTencentEmailProgress(1400);
 }
 
 function makeRunId() {
@@ -1024,7 +935,6 @@ function createMainWindow() {
     try {
       const url = browserView?.webContents?.getURL?.() || '';
       mainWindow?.webContents.send('browser:url', { url });
-      if (tencentEmailComposeJob.active) scheduleTencentEmailProgress(350);
     } catch (_) {}
   });
 
@@ -1055,8 +965,6 @@ function createMainWindow() {
   } catch (_) {}
 
   mainWindow.on('closed', () => {
-    clearTencentEmailTimer();
-    tencentEmailComposeJob.active = false;
     mainWindow = null;
     browserView = null;
     taskRunner = null;
@@ -1322,9 +1230,6 @@ ipcMain.handle('browser:open', async (_e, url) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
   try {
-    if (tencentEmailComposeJob.active) {
-      finishTencentEmailCompose('canceled', '已切换到其他网页，停止自动填入收件人。');
-    }
     await browserView.webContents.loadURL(finalUrl);
     mainWindow?.webContents.send('browser:url', { url: finalUrl });
     return { ok: true };
@@ -1735,7 +1640,6 @@ ipcMain.handle('contacts:openPgyCreator', async (_e, creatorUrl) => {
   if (!isAllowedTaskUrl(url)) return { ok: false, code: 'PGY_TASK_URL_NOT_ALLOWED', error: '只允许打开蒲公英达人链接' };
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
-  if (tencentEmailComposeJob.active) finishTencentEmailCompose('canceled', '已转到蒲公英达人页面，停止自动填入收件人。');
   try {
     await browserView.webContents.loadURL(url);
     mainWindow?.webContents.send('browser:url', { url });
@@ -1745,50 +1649,21 @@ ipcMain.handle('contacts:openPgyCreator', async (_e, creatorUrl) => {
   }
 });
 
-ipcMain.handle('contacts:prepareTencentEmail', async (_e, payload = {}) => {
+ipcMain.handle('contacts:openTencentEmail', async () => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
   if (recordingEnabled) return { ok: false, code: 'RECORDING_RUNNING', error: '请先停止蒲公英录制排查，再打开企业邮箱' };
-  const normalized = normalizeTencentEmailRecipients(payload.recipients);
-  if (!normalized.ok) return normalized;
-
-  clearTencentEmailTimer();
-  tencentEmailComposeJob = {
-    active: true,
-    inFlight: false,
-    recipients: normalized.recipients,
-    startedAt: Date.now(),
-    timer: null,
-    lastStatus: 'opening'
-  };
-  emitTencentEmailProgress({
-    status: 'opening',
-    message: `正在打开腾讯企业邮箱，准备 ${normalized.recipients.length} 位收件人。`
-  });
   try {
     await browserView.webContents.loadURL(TENCENT_MAIL_HOME_URL);
   } catch (err) {
     const currentUrl = browserView.webContents.getURL() || '';
     if (!isAllowedTencentMailUrl(currentUrl)) {
-      finishTencentEmailCompose('error', `腾讯企业邮箱打开失败：${String(err?.message || err)}`);
-      return { ok: false, error: String(err?.message || err) };
+      return { ok: false, error: `腾讯企业邮箱打开失败：${String(err?.message || err)}` };
     }
   }
   mainWindow?.webContents.send('browser:url', { url: browserView.webContents.getURL() || TENCENT_MAIL_HOME_URL });
-  scheduleTencentEmailProgress(350);
-  return {
-    ok: true,
-    recipientCount: normalized.recipients.length,
-    invalidCount: normalized.invalid.length,
-    url: TENCENT_MAIL_HOME_URL
-  };
-});
-
-ipcMain.handle('contacts:cancelTencentEmail', async () => {
-  if (!tencentEmailComposeJob.active) return { ok: true, active: false };
-  finishTencentEmailCompose('canceled', '已停止自动填入收件人。');
-  return { ok: true, active: false };
+  return { ok: true, url: TENCENT_MAIL_HOME_URL };
 });
 
 ipcMain.handle('contacts:checkXhsLogin', async () => {

@@ -207,7 +207,7 @@ function readCandidateReviewMap(runDir) {
     if (!url || map.has(url)) continue;
     const status = cleanStr(item?.status || item?.candidateStatus);
     map.set(url, {
-      selected: status === 'excluded' ? false : true,
+      selected: false,
       followupStatus: status === 'excluded' ? '不建联' : '',
       priority: cleanStr(item?.priority),
       excludeReason: cleanStr(item?.excludeReason || item?.exclude_reason),
@@ -225,7 +225,7 @@ function normalizeReviewMap(reviewRows) {
     const rowId = cleanStr(row?.rowId);
     if (!rowId) continue;
     map.set(rowId, {
-      selected: row?.selected !== false,
+      selected: row?.selected === true,
       followupStatus: cleanStr(row?.followupStatus),
       priority: cleanStr(row?.priority),
       excludeReason: cleanStr(row?.excludeReason),
@@ -321,7 +321,7 @@ function buildContactPreviewRows(runDir, options = {}) {
     const migratedLegacyReview = legacyReviewMatchesCreator(legacyReview, creatorUrl) ? legacyReview : {};
     const candidateReview = candidateMap.get(normalizeUrl(creatorUrl)) || {};
     const review = { ...candidateReview, ...migratedLegacyReview, ...(reviewMap.get(rowId) || {}) };
-    const selected = review.selected !== false;
+    const selected = review.selected === true;
 
     return {
       rowId,
@@ -362,7 +362,7 @@ function buildContactPreviewRows(runDir, options = {}) {
 function defaultFollowupStatus(row) {
   const status = cleanStr(row?.followupStatus);
   if (status) return status;
-  return row?.selected === false ? '不建联' : '待建联';
+  return row?.selected === true ? '待建联' : '';
 }
 
 function contactRowFromPreview(row) {
@@ -518,13 +518,13 @@ function summarizeContactWorkbookRows(previewRows) {
   };
 
   rows.forEach((row) => {
-    const selected = row?.selected !== false;
+    const selected = row?.selected === true;
     const hasContact = hasContactInfo(row);
     const hasWechat = hasWechatContactInfo(row);
     const hasEmail = hasEmailInfo(row);
     const channel = selected ? resolveExecutionChannel(row) : '';
     const status = defaultFollowupStatus(row);
-    followupStatusCounts[status] = (followupStatusCounts[status] || 0) + 1;
+    if (status) followupStatusCounts[status] = (followupStatusCounts[status] || 0) + 1;
     if (selected) summary.selected += 1;
     else summary.excluded += 1;
     if (hasContact) summary.withContact += 1;

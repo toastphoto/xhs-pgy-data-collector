@@ -33,19 +33,21 @@ assert.strictEqual(normalized[0].xhsProfileUrl, 'https://www.xiaohongshu.com/use
 assert.strictEqual(normalized[0].contactSource, 'xiaohongshu_public_profile');
 assert.strictEqual(normalized[0].contactCollectionStatus, 'found');
 assert.strictEqual(normalized[0].contactChannel, '邮件建联');
+assert.strictEqual(normalizeReviewRows([{ rowId: 'new-row' }])[0].selected, false);
 
 let loaded = loadContactReview(tmp, runDir);
 assert.deepStrictEqual(loaded.reviewRows, []);
 
 const saved = saveContactReview(tmp, runDir, {
   reviewRows: normalized,
-  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '', xiaomifengSmartRemark: '{YYMMDD}-{昵称}', xiaomifengTaskWechat: '运营微信A' }
+  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '', xiaomifengSmartRemark: '{YYMMDD}-{昵称}', xiaomifengTaskWechat: '运营微信A', selectionPolicy: 'manual_opt_in_v1' }
 });
 assert.ok(saved.updatedAt);
 assert.strictEqual(saved.settings.defaultGroupTag, 'FILA');
 assert.strictEqual(saved.settings.contactChannel, '微信建联');
 assert.strictEqual(saved.settings.xiaomifengSmartRemark, '{YYMMDD}-{昵称}');
 assert.strictEqual(saved.settings.xiaomifengTaskWechat, '运营微信A');
+assert.strictEqual(saved.settings.selectionPolicy, 'manual_opt_in_v1');
 
 loaded = loadContactReview(tmp, runDir);
 assert.strictEqual(loaded.reviewRows.length, 1);

@@ -343,9 +343,9 @@
 - Impact: Natural language does not click PGY filters. Response parsing keeps only normalized public creator fields in memory and never persists raw response bodies or authentication material. Send/result/reply integrations remain outside this iteration.
 - Reevaluate when: An official PGY export/API is available and passes a new safety review. Do not lower the 50-person ceiling, risk-stop behavior, or human send approval as an ordinary UX optimization.
 
-## 2026-07-22: Email handoff may prepare recipients but never send
+## 2026-07-22: Email handoff is manual opt-in and copy/paste only
 
-- Decision: The review workbench may open the official Tencent enterprise-mail site and prepare up to 20 unique valid emails from selected creators in the current filter. Login remains manual. Automation is limited to opening a semantic compose action and filling the recipient field; it must never fill credentials, call a mail-send API, fill message content, or click send.
-- Why: Operators need to avoid copying addresses one by one, while every external communication must remain visible, reviewable, and explicitly sent by a person. A small cap and strict host/input validation reduce accidental bulk outreach and privacy mistakes.
-- Impact: Recipient preparation requires an in-app confirmation, uses only official Tencent enterprise-mail hosts, stops on security-verification or abnormal-access text, and warns that multiple `To` recipients may see one another. Pugongying profile links similarly use the existing PGY allowlist and never click invite/cooperation controls.
-- Reevaluate when: Tencent changes its official host or compose DOM, the team adopts a reviewed official mail API, or live testing shows that embedded-browser login causes unacceptable account verification. Human send confirmation and recipient privacy review must remain mandatory.
+- Decision: Contact-review checkboxes default to empty. Only creators explicitly checked by the operator may enter email preparation. The app may enrich missing public emails, show a copyable address list, and open the official Tencent enterprise-mail site; it must not click compose, fill recipients, or send.
+- Why: The operator wants explicit creator-by-creator choice and a visible, reviewable handoff. Manual copy/paste avoids unintended recipient preparation and keeps mailbox actions under direct human control.
+- Impact: Legacy auto-selected review rows migrate once to unselected state. The UI no longer reports the whole-list email count or exposes recipient-prefill IPC. Login, compose, paste, content/attachment review, and send remain human actions. Existing PGY/XHS batch limits and risk-stop behavior still apply to contact enrichment.
+- Reevaluate when: The team adopts a reviewed official mail API or a different approved workflow. Default-empty selection and human send confirmation remain mandatory.

@@ -57,16 +57,16 @@ let _xhsContactState = {
   session: 'unknown',
   message: ''
 };
-let _tencentEmailListenerBound = false;
-let _tencentEmailState = {
-  active: false,
+let _emailHandoffState = {
   status: 'idle',
-  recipientCount: 0,
+  emails: [],
+  missingNames: [],
   message: ''
 };
 
 const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
 const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
+const CONTACT_SELECTION_POLICY = 'manual_opt_in_v1';
 
 function setMsg(s) {
   _msg = s || '';
@@ -184,27 +184,16 @@ function ensureXhsContactProgressListener() {
   });
 }
 
-function ensureTencentEmailProgressListener() {
-  if (_tencentEmailListenerBound || !window.desktopAPI?.contacts?.onTencentEmailProgress) return;
-  _tencentEmailListenerBound = true;
-  window.desktopAPI.contacts.onTencentEmailProgress((payload = {}) => {
-    _tencentEmailState = {
-      active: Boolean(payload.active),
-      status: String(payload.status || _tencentEmailState.status || 'idle'),
-      recipientCount: Number(payload.recipientCount || _tencentEmailState.recipientCount || 0),
-      message: String(payload.message || '')
-    };
-    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-  });
-}
-
 async function startXhsContactRows(targets, scopeLabel = '当前筛选', options = {}) {
-  if (!targets.length) return setMsg(`${scopeLabel}中没有已选达人。`);
+  if (!targets.length) {
+    setMsg(`${scopeLabel}中没有已选达人。`);
+    return { ok: false, code: 'NO_SELECTED_CREATORS' };
+  }
   if (options.confirm !== false) {
     const confirmed = window.confirm(
       `确认开始补采${scopeLabel}的 ${targets.length} 位达人？\n\n系统会在右侧可见浏览器中低频串行打开个人主页，只读取公开简介中的联系方式，不会发送消息。`
     );
-    if (!confirmed) return;
+    if (!confirmed) return { ok: false, canceled: true };
   }
   _xhsContactState = { running: true, paused: false, total: targets.length, completed: 0, found: 0, failed: 0, session: _xhsContactState.session, message: '' };
   const result = await window.desktopAPI.contacts.enrichXhsBatch({
@@ -213,7 +202,8 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
   });
   if (!result?.ok) {
     _xhsContactState.running = false;
-    return setMsg(`小红书补采失败：${result?.error || 'unknown error'}`);
+    setMsg(`小红书补采失败：${result?.error || 'unknown error'}`);
+    return result;
   }
   (Array.isArray(result.updates) ? result.updates : []).forEach(applyXhsContactUpdate);
   await saveContactReviewNow();
@@ -226,6 +216,33 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
     failed: result.failed || 0
   };
   setMsg(`小红书补采完成：处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`);
+  return result;
+}
+
+function resetEmailHandoff() {
+  _emailHandoffState = { status: 'idle', emails: [], missingNames: [], message: '' };
+}
+
+function isValidEmail(value) {
+  return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(String(value || '').trim());
+}
+
+function getEmailHandoff(rows) {
+  const emails = [];
+  const missingNames = [];
+  const seen = new Set();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const review = ensureReviewRow(row);
+    const email = String(review?.email || row?.email || '').trim().toLowerCase();
+    if (!isValidEmail(email)) {
+      missingNames.push(row.creatorName || row.xhsId || '未命名达人');
+      return;
+    }
+    if (seen.has(email)) return;
+    seen.add(email);
+    emails.push(email);
+  });
+  return { emails, missingNames };
 }
 
 function normalizeContactUrl(value) {
@@ -277,7 +294,7 @@ function buildExportRowsFromContactRows(rows) {
     const review = ensureReviewRow(row) || {};
     return {
       ...row,
-      selected: review.selected !== false,
+      selected: review.selected === true,
       followupStatus: defaultFollowupStatus(review),
       priority: review.priority || '',
       excludeReason: review.excludeReason || '',
@@ -322,7 +339,7 @@ function summarizeContactReviewRows(rows) {
   return (Array.isArray(rows) ? rows : []).reduce(
     (acc, row) => {
       const review = ensureReviewRow(row);
-      const selected = review?.selected !== false;
+      const selected = review?.selected === true;
       const hasWechat = Boolean(String(review?.wechatId || '').trim() || String(review?.phone || '').trim());
       const hasEmail = Boolean(String(review?.email || row?.email || '').trim());
       const channel = getContactExecutionChannel(review);
@@ -377,6 +394,7 @@ function getContactSettings() {
     defaultGreeting: _contactGreeting,
     xiaomifengSmartRemark: _xiaomifengSmartRemark,
     xiaomifengTaskWechat: _xiaomifengTaskWechat,
+    selectionPolicy: CONTACT_SELECTION_POLICY,
     contactChannel: _contactChannelStrategy,
     emailSubject: _contactEmailSubject,
     emailBody: _contactEmailBody,
@@ -431,7 +449,7 @@ function getContactExecutionChannel(review) {
 function defaultFollowupStatus(review) {
   const status = String(review?.followupStatus || '').trim();
   if (status) return status;
-  return review?.selected === false ? '不建联' : '待建联';
+  return review?.selected === true ? '待建联' : '';
 }
 
 function markReviewSelected(review) {
@@ -441,12 +459,14 @@ function markReviewSelected(review) {
     review.followupStatus = '待建联';
   }
   review.excludeReason = '';
+  resetEmailHandoff();
 }
 
-function markReviewExcluded(review) {
+function clearReviewSelected(review) {
   if (!review) return;
   review.selected = false;
-  review.followupStatus = '不建联';
+  if (review.followupStatus === '待建联') review.followupStatus = '';
+  resetEmailHandoff();
 }
 
 function ensureReviewRow(row) {
@@ -455,8 +475,8 @@ function ensureReviewRow(row) {
   if (!_contactReviewMap.has(id)) {
     _contactReviewMap.set(id, {
       rowId: id,
-      selected: row?.selected !== false,
-      followupStatus: row?.followupStatus || (row?.selected === false ? '不建联' : '待建联'),
+      selected: row?.selected === true,
+      followupStatus: row?.followupStatus || (row?.selected === true ? '待建联' : ''),
       priority: row?.priority || '',
       excludeReason: row?.excludeReason || '',
       note: row?.note || '',
@@ -477,7 +497,7 @@ function getContactFilteredRows() {
   const search = String(_contactSearch || '').trim().toLowerCase();
   return (_contactPreviewRows || []).filter((row) => {
     const review = ensureReviewRow(row);
-    const selected = review?.selected !== false;
+    const selected = review?.selected === true;
     const hasContact = Boolean(String(review?.wechatId || '').trim() || String(review?.phone || '').trim() || String(review?.email || row?.email || '').trim());
     const hasPriority = Boolean(String(review?.priority || '').trim());
     const followupStatus = defaultFollowupStatus(review);
@@ -520,6 +540,7 @@ function resetContactPreviewState({ keepMeta = false } = {}) {
   _contactLoadedRunDir = '';
   _contactReviewMap = new Map();
   _contactSaveStatus = '';
+  resetEmailHandoff();
   if (!keepMeta) _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
 }
 
@@ -529,10 +550,17 @@ async function loadContactReviewForRun(force = false) {
   try {
     const r = await window.desktopAPI.exports.loadContactReview({ runDir: _selectedRunDir });
     if (!r?.ok) return;
+    const needsManualSelectionMigration = r.settings?.selectionPolicy !== CONTACT_SELECTION_POLICY;
     _contactReviewMap = new Map();
     (Array.isArray(r.reviewRows) ? r.reviewRows : []).forEach((row) => {
       const rowId = String(row?.rowId || '');
-      if (rowId) _contactReviewMap.set(rowId, { ...row });
+      if (!rowId) return;
+      const next = { ...row };
+      if (needsManualSelectionMigration) {
+        next.selected = false;
+        if (next.followupStatus === '待建联') next.followupStatus = '';
+      }
+      _contactReviewMap.set(rowId, next);
     });
     if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
     if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
@@ -611,7 +639,7 @@ async function importContactReviewWorkbookNow() {
     }
     const review = ensureReviewRow(preview);
     if (!review) return;
-    review.selected = row.selected !== false;
+    review.selected = row.selected === true;
     review.followupStatus = row.followupStatus || defaultFollowupStatus(review);
     review.priority = row.priority || '';
     review.excludeReason = row.excludeReason || '';
@@ -696,7 +724,6 @@ async function refreshContactPreview() {
 
 export function renderExports(state) {
   ensureXhsContactProgressListener();
-  ensureTencentEmailProgressListener();
   const requestedRunDir = state.exports?.selectedRunDir || '';
   if (requestedRunDir && requestedRunDir !== _selectedRunDir) {
     _selectedRunDir = requestedRunDir;
@@ -713,7 +740,7 @@ export function renderExports(state) {
     _autoPreviewRequestedRunDir = autoEnrichRunDir;
     setTimeout(async () => {
       await refreshContactPreview();
-      const targets = _contactPreviewRows.filter((row) => ensureReviewRow(row)?.selected !== false).slice(0, 50);
+      const targets = _contactPreviewRows.filter((row) => ensureReviewRow(row)?.selected === true).slice(0, 50);
       if (targets.length) {
         setMsg(`蒲公英采集已完成，正在继续补采 ${targets.length} 位达人的小红书公开联系方式。`);
         await startXhsContactRows(targets, '本次采集名单', { confirm: false });
@@ -1062,10 +1089,7 @@ export function renderExports(state) {
   pgyGrid.appendChild(emailBodyWrap);
 
   const filteredContactRows = getContactFilteredRows();
-  const selectedEmailRows = filteredContactRows.filter((row) => {
-    const review = ensureReviewRow(row);
-    return review?.selected !== false && Boolean(String(review?.email || row?.email || '').trim());
-  });
+  const selectedContactRows = filteredContactRows.filter((row) => ensureReviewRow(row)?.selected === true);
   const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
   const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
 
@@ -1073,7 +1097,6 @@ export function renderExports(state) {
   metrics.className = 'export-metrics';
   metrics.appendChild(makeMetricCard('已选建联', _contactPreviewRows.length ? `${allReviewSummary.selected}/${_contactPreviewRows.length}` : '-'));
   metrics.appendChild(makeMetricCard('蒲公英邀约', _contactPreviewRows.length ? String(allReviewSummary.pgyInvite) : '-', 'good'));
-  metrics.appendChild(makeMetricCard('邮件建联', _contactPreviewRows.length ? String(allReviewSummary.email) : '-', 'good'));
   metrics.appendChild(makeMetricCard('小蜜蜂导入', _contactPreviewRows.length ? String(allReviewSummary.wechat) : '-', 'good'));
   metrics.appendChild(makeMetricCard('待补联系方式', _contactPreviewRows.length ? String(allReviewSummary.pending) : '-', allReviewSummary.pending ? 'warn' : ''));
   contactSec.appendChild(metrics);
@@ -1114,7 +1137,7 @@ export function renderExports(state) {
   }, { disabled: _xhsContactState.running && !_xhsContactState.paused });
 
   const btnStartXhsContact = makeSoftButton('补采当前筛选', async () => {
-    const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected !== false);
+    const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
     await startXhsContactRows(targets, '当前筛选');
   }, { primary: true, disabled: !_contactPreviewRows.length || _xhsContactState.running });
 
@@ -1134,7 +1157,7 @@ export function renderExports(state) {
   const btnStartXhsFirstN = makeSoftButton('补采名单前 N 人', async () => {
     const targets = _contactPreviewRows
       .slice(0, _xhsContactBatchCount)
-      .filter((row) => ensureReviewRow(row)?.selected !== false);
+      .filter((row) => ensureReviewRow(row)?.selected === true);
     await startXhsContactRows(targets, `名单前 ${_xhsContactBatchCount} 人`);
   }, { disabled: !_contactPreviewRows.length || _xhsContactState.running });
 
@@ -1245,7 +1268,7 @@ export function renderExports(state) {
   const reviewStat = document.createElement('div');
   reviewStat.className = 'export-review-summary';
   reviewStat.textContent = _contactPreviewRows.length
-    ? `当前筛选：${filteredReviewSummary.total} 人，蒲公英邀约 ${filteredReviewSummary.pgyInvite} 人，邮件 ${filteredReviewSummary.email} 人，小蜜蜂 ${filteredReviewSummary.wechat} 人，待补 ${filteredReviewSummary.pending} 人`
+    ? `当前筛选 ${filteredReviewSummary.total} 人，已勾选 ${filteredReviewSummary.selected} 人。只会处理你明确勾选的达人。`
     : '还没有复核名单。点击“刷新名单”后可以逐个决定是否建联。';
 
   const btnPreview = document.createElement('button');
@@ -1287,31 +1310,15 @@ export function renderExports(state) {
     }
   });
 
-  const btnSelectAllContact = document.createElement('button');
-  btnSelectAllContact.className = 'btn ghost';
-  btnSelectAllContact.style.height = '34px';
-  btnSelectAllContact.textContent = '全部要建联';
-  btnSelectAllContact.disabled = !_contactPreviewRows.length;
-  btnSelectAllContact.addEventListener('click', () => {
-    _contactPreviewRows.forEach((row) => {
-      const review = ensureReviewRow(row);
-      if (review) {
-        markReviewSelected(review);
-      }
-    });
-    scheduleContactReviewSave();
-    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-  });
-
   const btnUnselectAllContact = document.createElement('button');
   btnUnselectAllContact.className = 'btn ghost';
   btnUnselectAllContact.style.height = '34px';
-  btnUnselectAllContact.textContent = '全部暂不建联';
+  btnUnselectAllContact.textContent = '清空全部勾选';
   btnUnselectAllContact.disabled = !_contactPreviewRows.length;
   btnUnselectAllContact.addEventListener('click', () => {
     _contactPreviewRows.forEach((row) => {
       const review = ensureReviewRow(row);
-      markReviewExcluded(review);
+      clearReviewSelected(review);
     });
     scheduleContactReviewSave();
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1324,39 +1331,52 @@ export function renderExports(state) {
   const btnTencentEmail = document.createElement('button');
   btnTencentEmail.className = 'btn primary';
   btnTencentEmail.style.height = '34px';
-  btnTencentEmail.textContent = _tencentEmailState.active
-    ? '正在准备邮箱...'
-    : `去邮箱建联${selectedEmailRows.length ? `（${selectedEmailRows.length}）` : ''}`;
-  btnTencentEmail.disabled = !selectedEmailRows.length || _tencentEmailState.active;
-  btnTencentEmail.title = '打开腾讯企业邮箱并填入当前筛选中已勾选且有邮箱的达人；不会发送邮件';
+  btnTencentEmail.textContent = _emailHandoffState.status === 'preparing' ? '正在采集邮箱...' : '去邮箱建联';
+  btnTencentEmail.disabled = !selectedContactRows.length || _emailHandoffState.status === 'preparing' || _xhsContactState.running;
+  btnTencentEmail.title = '补采已勾选达人的公开邮箱并打开腾讯企业邮箱；邮箱由你手动复制粘贴，不会自动填写或发送';
   btnTencentEmail.addEventListener('click', async () => {
-    const recipients = selectedEmailRows
-      .map((row) => String(ensureReviewRow(row)?.email || row?.email || '').trim())
-      .filter(Boolean);
-    if (!recipients.length) return setMsg('当前筛选中没有已勾选且带邮箱的达人。');
-    const confirmed = window.confirm(
-      `即将打开腾讯企业邮箱，并准备 ${recipients.length} 位收件人。\n\n` +
-      '系统只会尝试填入收件人，不会填写密码，不会点击发送。\n' +
-      '多位达人放在同一封邮件的收件人栏时可能互相看到邮箱地址，请在发送前人工检查收件人、正文、附件及隐私设置。\n\n' +
-      '确认继续？'
-    );
-    if (!confirmed) return;
-    _tencentEmailState = {
-      active: true,
-      status: 'opening',
-      recipientCount: recipients.length,
-      message: '正在打开腾讯企业邮箱。'
-    };
+    const selectedRows = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
+    if (!selectedRows.length) return setMsg('请先在达人名称前勾选“要建联”。');
+    _emailHandoffState = { status: 'preparing', emails: [], missingNames: [], message: '正在整理已勾选达人的公开邮箱。' };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-    const result = await window.desktopAPI.contacts.prepareTencentEmail({ recipients });
-    if (!result?.ok) {
-      _tencentEmailState = {
-        active: false,
+
+    const missingEmailRows = selectedRows.filter((row) => !isValidEmail(ensureReviewRow(row)?.email || row?.email));
+    if (missingEmailRows.length) {
+      const enrichment = await startXhsContactRows(missingEmailRows, '已勾选达人', { confirm: false });
+      if (!enrichment?.ok) {
+        _emailHandoffState = {
+          status: 'error',
+          emails: [],
+          missingNames: missingEmailRows.map((row) => row.creatorName || row.xhsId || '未命名达人'),
+          message: enrichment?.canceled ? '邮箱采集已取消。' : `邮箱采集未完成：${enrichment?.error || '请检查右侧页面'}`
+        };
+        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+        return;
+      }
+    }
+
+    const handoff = getEmailHandoff(selectedRows);
+    if (!handoff.emails.length) {
+      _emailHandoffState = {
         status: 'error',
-        recipientCount: recipients.length,
-        message: result?.error || '腾讯企业邮箱准备失败'
+        ...handoff,
+        message: '已处理勾选达人，但没有找到可用的公开邮箱。'
       };
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+      return;
+    }
+
+    const openResult = await window.desktopAPI.contacts.openTencentEmail();
+    _emailHandoffState = {
+      status: openResult?.ok ? 'ready' : 'error',
+      ...handoff,
+      message: openResult?.ok
+        ? '邮箱已整理。请复制后，在腾讯企业邮箱点击“写信”并粘贴到收件人栏。'
+        : `邮箱已整理，但腾讯企业邮箱打开失败：${openResult?.error || 'unknown error'}`
+    };
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    if (openResult?.ok) {
+      setMsg('已打开腾讯企业邮箱。系统不会自动点击“写信”、填写收件人或发送邮件。');
     }
   });
   reviewTop.appendChild(btnTencentEmail);
@@ -1378,27 +1398,39 @@ export function renderExports(state) {
   }
   contactSec.appendChild(reviewTop);
 
-  if (_tencentEmailState.status !== 'idle') {
-    const emailStatus = document.createElement('div');
-    const tone = _tencentEmailState.status === 'ready'
-      ? 'success'
-      : ['error', 'risk', 'timeout'].includes(_tencentEmailState.status) ? 'error' : '';
-    emailStatus.className = `email-compose-feedback ${tone}`.trim();
-    emailStatus.setAttribute('role', 'status');
-    emailStatus.setAttribute('aria-live', 'polite');
-    const statusText = document.createElement('div');
-    statusText.textContent = _tencentEmailState.message;
-    emailStatus.appendChild(statusText);
-    if (_tencentEmailState.active) {
-      const cancel = document.createElement('button');
-      cancel.className = 'btn ghost';
-      cancel.textContent = '停止填入';
-      cancel.addEventListener('click', async () => {
-        await window.desktopAPI.contacts.cancelTencentEmail();
-      });
-      emailStatus.appendChild(cancel);
+  if (_emailHandoffState.status !== 'idle') {
+    const emailHandoff = document.createElement('div');
+    emailHandoff.className = `email-handoff ${_emailHandoffState.status}`;
+    emailHandoff.setAttribute('role', 'status');
+    emailHandoff.setAttribute('aria-live', 'polite');
+
+    const emailHandoffText = document.createElement('div');
+    emailHandoffText.className = 'email-handoff-message';
+    emailHandoffText.textContent = _emailHandoffState.message;
+    emailHandoff.appendChild(emailHandoffText);
+
+    if (_emailHandoffState.emails.length) {
+      const emailList = document.createElement('textarea');
+      emailList.className = 'email-handoff-list';
+      emailList.readOnly = true;
+      emailList.value = _emailHandoffState.emails.join('; ');
+      emailList.setAttribute('aria-label', '已选达人邮箱');
+      emailHandoff.appendChild(emailList);
+
+      const copyEmails = makeSoftButton('复制邮箱', async () => {
+        const ok = await copyTextWithFallback(_emailHandoffState.emails.join('; '));
+        if (ok) setMsg('邮箱已复制。请在腾讯企业邮箱中点击“写信”，再粘贴到收件人栏。');
+      }, { primary: true });
+      emailHandoff.appendChild(copyEmails);
     }
-    contactSec.appendChild(emailStatus);
+
+    if (_emailHandoffState.missingNames.length) {
+      const missing = document.createElement('div');
+      missing.className = 'email-handoff-missing';
+      missing.textContent = `未找到公开邮箱：${_emailHandoffState.missingNames.join('、')}`;
+      emailHandoff.appendChild(missing);
+    }
+    contactSec.appendChild(emailHandoff);
   }
 
   if (_contactExportState.status !== 'idle') {
@@ -1423,7 +1455,6 @@ export function renderExports(state) {
     const reviewBatchActions = document.createElement('div');
     reviewBatchActions.className = 'export-filter-actions';
     reviewBatchActions.appendChild(btnImportReview);
-    reviewBatchActions.appendChild(btnSelectAllContact);
     reviewBatchActions.appendChild(btnUnselectAllContact);
     const reviewBatchDetails = createAdvancedSection({
       title: '整张名单批量处理',
@@ -1514,20 +1545,10 @@ export function renderExports(state) {
       b.addEventListener('click', onClick);
       return b;
     };
-    filterActions.appendChild(mkFilterBtn('当前结果全选', () => {
+    filterActions.appendChild(mkFilterBtn('清空当前勾选', () => {
       filteredContactRows.forEach((row) => {
         const review = ensureReviewRow(row);
-        if (review) {
-          markReviewSelected(review);
-        }
-      });
-      scheduleContactReviewSave();
-      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-    }));
-    filterActions.appendChild(mkFilterBtn('当前结果全不选', () => {
-      filteredContactRows.forEach((row) => {
-        const review = ensureReviewRow(row);
-        markReviewExcluded(review);
+        clearReviewSelected(review);
       });
       scheduleContactReviewSave();
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1604,7 +1625,7 @@ export function renderExports(state) {
         if (!review) return;
         review.followupStatus = _contactBatchFollowupStatus;
         if (_contactBatchFollowupStatus === '不建联') review.selected = false;
-        else if (review.selected === false) review.selected = true;
+        else if (review.selected !== true) review.selected = true;
       });
       scheduleContactReviewSave();
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1681,7 +1702,7 @@ export function renderExports(state) {
     filteredContactRows.forEach((row) => {
       const review = ensureReviewRow(row);
       const card = document.createElement('div');
-      card.className = `contact-review-card ${review?.selected === false ? 'is-excluded' : ''}`;
+      card.className = `contact-review-card ${defaultFollowupStatus(review) === '不建联' ? 'is-excluded' : ''}`;
 
       const main = document.createElement('div');
       main.className = 'contact-review-main';
@@ -1690,16 +1711,17 @@ export function renderExports(state) {
       selectedWrap.className = 'contact-review-check';
       const selectedInput = document.createElement('input');
       selectedInput.type = 'checkbox';
-      selectedInput.checked = review?.selected !== false;
+      selectedInput.checked = review?.selected === true;
       selectedInput.addEventListener('change', () => {
         if (!review) return;
         if (selectedInput.checked) markReviewSelected(review);
-        else markReviewExcluded(review);
+        else clearReviewSelected(review);
+        resetEmailHandoff();
         scheduleContactReviewSave();
         store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
       });
       const selectedText = document.createElement('span');
-      selectedText.textContent = review?.selected === false ? '暂不建联' : '要建联';
+      selectedText.textContent = '要建联';
       selectedWrap.appendChild(selectedInput);
       selectedWrap.appendChild(selectedText);
 
@@ -1781,7 +1803,7 @@ export function renderExports(state) {
         if (!review) return;
         review.followupStatus = followup.value;
         if (followup.value === '不建联') review.selected = false;
-        else if (review.selected === false) review.selected = true;
+        else if (review.selected !== true) review.selected = true;
         scheduleContactReviewSave();
         store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
       });

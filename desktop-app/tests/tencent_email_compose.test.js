@@ -1,11 +1,11 @@
 const assert = require('assert');
+const emailHandoff = require('../lib/tencent_email_compose');
 const {
   MAX_TENCENT_EMAIL_RECIPIENTS,
   TENCENT_MAIL_HOME_URL,
-  buildTencentRecipientPrefillScript,
   isAllowedTencentMailUrl,
   normalizeTencentEmailRecipients
-} = require('../lib/tencent_email_compose');
+} = emailHandoff;
 
 const normalized = normalizeTencentEmailRecipients([
   ' Creator@One.Example ',
@@ -30,15 +30,6 @@ assert.strictEqual(isAllowedTencentMailUrl('http://work.weixin.qq.com/mail/'), f
 assert.strictEqual(isAllowedTencentMailUrl('https://work.weixin.qq.com.evil.example/mail/'), false);
 assert.strictEqual(isAllowedTencentMailUrl('https://mail.qq.com/'), false);
 
-const script = buildTencentRecipientPrefillScript(['creator@example.com']);
-assert.ok(script.includes('creator@example.com'));
-assert.ok(script.includes('recipients_filled'));
-assert.ok(script.includes("['写信', '写邮件', '新建邮件']"));
-assert.ok(script.includes('login_required'));
-assert.ok(!script.includes('发送'));
-assert.ok(!script.includes("writeLabels = ['发送'"));
-assert.ok(!script.includes("textContent = '发送'"));
-assert.ok(!script.includes('ctrlKey: true'));
-assert.ok(!script.includes('metaKey: true'));
+assert.strictEqual(emailHandoff.buildTencentRecipientPrefillScript, undefined);
 
 console.log('tencent_email_compose.test.js passed');

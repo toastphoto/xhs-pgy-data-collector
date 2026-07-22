@@ -41,7 +41,7 @@ function normalizeReviewRows(rows) {
     seen.add(rowId);
     out.push({
       rowId,
-      selected: row?.selected !== false,
+      selected: row?.selected === true,
       followupStatus: cleanStr(row?.followupStatus),
       priority: cleanStr(row?.priority),
       excludeReason: cleanStr(row?.excludeReason),
@@ -66,6 +66,7 @@ function normalizeSettings(settings) {
     defaultGreeting: cleanStr(src.defaultGreeting),
     xiaomifengSmartRemark: cleanStr(src.xiaomifengSmartRemark || '{MMDD}-{昵称}') || '{MMDD}-{昵称}',
     xiaomifengTaskWechat: cleanStr(src.xiaomifengTaskWechat),
+    selectionPolicy: cleanStr(src.selectionPolicy),
     contactChannel: normalizeContactChannel(src.contactChannel || '微信') || '微信建联',
     emailSubject: cleanStr(src.emailSubject),
     emailBody: cleanStr(src.emailBody),

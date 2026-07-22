@@ -107,6 +107,7 @@ Finish the six-step operator flow: manual PGY filtering, natural-language first-
 
 Latest checks on 2026-07-22:
 
+- The public-contact enrichment action is now permanently visible in the Xiaohongshu status toolbar as `补采已选达人联系方式`. It is disabled at zero selected creators with an explicit selection hint, becomes enabled only after manual `要建联` selection, and no longer offers a conflicting first-N action inside a collapsed advanced section. The installed app was checked with the live Xiaohongshu session: zero selected, one temporary selection, and zero selected again; no enrichment or outreach was started. All 23 Node tests and the PGY safety audit passed. The final checkpoint and remote status remain volatile until this iteration is committed.
 - Repository branch is `main`; the mail/link iteration is preserved at `c68dc3e` / `snapshot-2026-07-22-email-handoff`, and the workbench layout iteration is preserved at `6efd2c9` / `snapshot-2026-07-22-workbench-layout`. Remote sync status remains volatile and must be rechecked.
 - The official Tencent enterprise-mail landing page resolved to `https://work.weixin.qq.com/mail/` in an isolated Electron profile. Login state, post-login DOM, recipient tokens, and account-specific verification remain volatile and require a user-authorized live check.
 - No real creator page, mailbox account, invitation, or send action was used in UI testing. Dummy addresses and dummy Pugongying URLs were stored only under a temporary test user-data directory.

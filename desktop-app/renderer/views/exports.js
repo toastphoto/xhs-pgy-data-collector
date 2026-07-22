@@ -40,7 +40,6 @@ let _contactFollowupFilter = 'all';
 let _contactChannelFilter = 'all';
 let _contactBatchFollowupStatus = '待建联';
 let _contactBatchChannel = '蒲公英邀约';
-let _xhsContactBatchCount = 20;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
 let _lastContactExportPath = '';
@@ -1113,7 +1112,9 @@ export function renderExports(state) {
   } else if (_xhsContactState.total) {
     xhsContactStatus.textContent = `上次补采：完成 ${_xhsContactState.completed}/${_xhsContactState.total}，找到联系方式 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
   } else if (_xhsContactState.session === 'ready') {
-    xhsContactStatus.textContent = '小红书页面可用，可以对已选达人补采公开简介中的联系方式。';
+    xhsContactStatus.textContent = selectedContactRows.length
+      ? `小红书页面可用，已选择 ${selectedContactRows.length} 位达人，可以开始补采公开简介中的联系方式。`
+      : '小红书页面可用。请先在下方达人名称前勾选“要建联”，再点击“补采已选达人联系方式”。';
   } else {
     xhsContactStatus.textContent = '先在右侧完成小红书人工登录，再串行补采公开邮箱、微信或手机号。';
   }
@@ -1136,30 +1137,13 @@ export function renderExports(state) {
     setMsg(result.loggedIn ? '小红书页面已可用。' : '尚未完成小红书登录。');
   }, { disabled: _xhsContactState.running && !_xhsContactState.paused });
 
-  const btnStartXhsContact = makeSoftButton('补采当前筛选', async () => {
+  const btnStartXhsContact = makeSoftButton('补采已选达人联系方式', async () => {
     const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
-    await startXhsContactRows(targets, '当前筛选');
-  }, { primary: true, disabled: !_contactPreviewRows.length || _xhsContactState.running });
-
-  const xhsBatchCountInput = document.createElement('input');
-  xhsBatchCountInput.className = 'tpl-input';
-  xhsBatchCountInput.type = 'number';
-  xhsBatchCountInput.min = '1';
-  xhsBatchCountInput.max = '50';
-  xhsBatchCountInput.value = String(_xhsContactBatchCount);
-  xhsBatchCountInput.title = '按建联表顺序补采的人数';
-  setStyles(xhsBatchCountInput, { width: '72px', height: '32px' });
-  xhsBatchCountInput.addEventListener('change', () => {
-    _xhsContactBatchCount = Math.max(1, Math.min(50, Number(xhsBatchCountInput.value) || 20));
-    xhsBatchCountInput.value = String(_xhsContactBatchCount);
-  });
-
-  const btnStartXhsFirstN = makeSoftButton('补采名单前 N 人', async () => {
-    const targets = _contactPreviewRows
-      .slice(0, _xhsContactBatchCount)
-      .filter((row) => ensureReviewRow(row)?.selected === true);
-    await startXhsContactRows(targets, `名单前 ${_xhsContactBatchCount} 人`);
-  }, { disabled: !_contactPreviewRows.length || _xhsContactState.running });
+    await startXhsContactRows(targets, '已选达人');
+  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running });
+  btnStartXhsContact.title = selectedContactRows.length
+    ? '只补采当前明确勾选的达人，并保留串行低频和风险暂停'
+    : '请先在下方达人名称前勾选“要建联”';
 
   const btnPauseXhsContact = makeSoftButton(_xhsContactState.paused ? '继续' : '暂停', async () => {
     const result = _xhsContactState.paused
@@ -1176,21 +1160,10 @@ export function renderExports(state) {
   xhsContactBar.appendChild(xhsContactStatus);
   xhsContactBar.appendChild(btnOpenXhsLogin);
   xhsContactBar.appendChild(btnCheckXhsLogin);
+  xhsContactBar.appendChild(btnStartXhsContact);
   xhsContactBar.appendChild(btnPauseXhsContact);
   xhsContactBar.appendChild(btnCancelXhsContact);
   contactSec.appendChild(xhsContactBar);
-
-  const manualXhsTools = document.createElement('div');
-  manualXhsTools.className = 'export-review-toolbar';
-  manualXhsTools.appendChild(btnStartXhsContact);
-  manualXhsTools.appendChild(xhsBatchCountInput);
-  manualXhsTools.appendChild(btnStartXhsFirstN);
-  const manualXhsSection = createAdvancedSection({
-    title: '需要时重新补采联系方式',
-    children: [manualXhsTools]
-  });
-  manualXhsSection.classList.add('contact-settings-section');
-  contactSec.appendChild(manualXhsSection);
 
   const contactSettings = createAdvancedSection({
     title: '填写建联话术',

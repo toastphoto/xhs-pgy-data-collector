@@ -33,6 +33,7 @@ const { loadApproval, saveApproval } = require('./lib/approval_store');
 const { approveRequest, buildXiaomifengApprovalPayload, checkApproval, createApprovalRequest, executionFingerprint } = require('./lib/execution_approval');
 const { buildFeishuSyncEnvelope } = require('./lib/feishu_contracts');
 const {
+  buildXhsRiskDetectionSnippet,
   contactFieldCount,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
@@ -91,6 +92,9 @@ const PGY_NOTE_CLICK_RESOLVE_LIMIT = 5;
 const XHS_CONTACT_BATCH_LIMIT = 50;
 const XHS_CONTACT_PAGE_WAIT_MS = 5500;
 const XHS_CONTACT_PAGE_JITTER_MS = 3500;
+const XHS_CONTACT_COOLDOWN_EVERY = 5;
+const XHS_CONTACT_COOLDOWN_MIN_MS = 35000;
+const XHS_CONTACT_COOLDOWN_JITTER_MS = 25000;
 const XHS_LOGIN_URL = 'https://www.xiaohongshu.com/explore';
 
 function getRecordingsDir() {
@@ -1473,7 +1477,7 @@ async function inspectXhsProfilePage() {
           );
           const loginModal = Array.from(document.querySelectorAll('[class*="login" i], [class*="modal" i], [class*="passport" i]'))
             .some((el) => visible(el) && /登录|扫码/.test(String(el.innerText || '')));
-          const riskMatch = bodyText.match(/(安全验证|请完成验证|操作频繁|账号异常|网络环境存在风险|滑动验证)/);
+          ${buildXhsRiskDetectionSnippet('url', 'bodyText')}
           const snippets = new Set();
           const add = (value) => {
             const text = String(value || '').replace(/\\s+/g, ' ').trim();
@@ -1499,8 +1503,8 @@ async function inspectXhsProfilePage() {
             ok: true,
             url,
             loginRequired: Boolean(loginInput || loginModal),
-            riskDetected: Boolean(riskMatch),
-            riskText: riskMatch?.[1] || '',
+            riskDetected,
+            riskText,
             profileReady,
             profileText
           };
@@ -1616,7 +1620,21 @@ async function runXhsContactBatch(rows) {
     emitXhsContactProgress({ type: 'item_result', index, completed: index + 1, total: rows.length, found, failed, update });
 
     if (index < rows.length - 1) {
-      await sleep(1200 + Math.round(Math.random() * 1600));
+      const processed = index + 1;
+      if (processed % XHS_CONTACT_COOLDOWN_EVERY === 0) {
+        const cooldownMs = XHS_CONTACT_COOLDOWN_MIN_MS + Math.round(Math.random() * XHS_CONTACT_COOLDOWN_JITTER_MS);
+        emitXhsContactProgress({
+          type: 'cooldown',
+          completed: processed,
+          total: rows.length,
+          found,
+          failed,
+          message: `已处理 ${processed} 位，正在进行风控冷却等待`
+        });
+        await sleep(cooldownMs);
+      } else {
+        await sleep(1800 + Math.round(Math.random() * 2200));
+      }
     }
   }
 
@@ -1685,6 +1703,18 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待蒲公英采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '小红书联系方式补采正在运行' };
+  const currentUrl = String(browserView.webContents.getURL() || '');
+  if (/^https:\/\/(?:www\.)?xiaohongshu\.com\//i.test(currentUrl)) {
+    const preflight = await inspectXhsProfilePage();
+    if (preflight?.riskDetected) {
+      return {
+        ok: false,
+        code: 'XHS_RISK_DETECTED',
+        riskText: preflight.riskText || '安全验证',
+        error: `小红书当前处于安全验证或访问频繁状态：${preflight.riskText || '请查看右侧页面'}。请勿继续重试，等待页面恢复后再检测登录。`
+      };
+    }
+  }
   const runDir = resolveInsideRuns(payload.runDir || '');
   if (!runDir) return { ok: false, error: '未选择有效运行结果' };
 

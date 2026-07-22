@@ -2,12 +2,29 @@ const assert = require('assert');
 
 const {
   contactFieldCount,
+  detectXhsRisk,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
   mergeContactFields,
   normalizeXhsProfileUrl,
   parsePublicContactText
 } = require('../lib/xhs_contact_enrichment');
+
+assert.deepStrictEqual(
+  detectXhsRisk(
+    'https://www.xiaohongshu.com/website-login/captcha?verifyType=124',
+    'Requests too frequent. Try again later.'
+  ),
+  { riskDetected: true, riskText: 'requests too frequent' }
+);
+assert.deepStrictEqual(
+  detectXhsRisk('https://www.xiaohongshu.com/website-login/captcha?verifyType=124', ''),
+  { riskDetected: true, riskText: '安全验证' }
+);
+assert.deepStrictEqual(
+  detectXhsRisk('https://www.xiaohongshu.com/user/profile/abc123', '普通达人简介'),
+  { riskDetected: false, riskText: '' }
+);
 
 assert.strictEqual(
   normalizeXhsProfileUrl('https://www.xiaohongshu.com/user/profile/abc123?xsec_token=do-not-store'),

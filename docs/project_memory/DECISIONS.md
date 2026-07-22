@@ -349,3 +349,10 @@
 - Why: The operator wants explicit creator-by-creator choice and a visible, reviewable handoff. Manual copy/paste avoids unintended recipient preparation and keeps mailbox actions under direct human control.
 - Impact: Legacy auto-selected review rows migrate once to unselected state. The UI no longer reports the whole-list email count or exposes recipient-prefill IPC. Login, compose, paste, content/attachment review, and send remain human actions. Existing PGY/XHS batch limits and risk-stop behavior still apply to contact enrichment.
 - Reevaluate when: The team adopts a reviewed official mail API or a different approved workflow. Default-empty selection and human send confirmation remain mandatory.
+
+## 2026-07-22: XHS enrichment stops on multilingual risk signals and uses periodic cooldowns
+
+- Decision: Treat the Xiaohongshu captcha URL and Chinese/English security or request-frequency text as immediate stop signals. Reject a new enrichment batch when the current XHS page is already risk-blocked, disable retry in the review UI, and pause for 35-60 seconds after every five completed profiles.
+- Why: A live security-verification page used English request-frequency wording. The previous Chinese-only detector misclassified nine such pages as ordinary profile failures and continued requesting.
+- Impact: Enrichment is slower but fails closed on known XHS risk pages. Risk detection stays in a shared, unit-tested module and is enforced by the safety audit. Operators wait for natural recovery, then check login and restart with a small batch; the app does not refresh, solve, or bypass verification.
+- Reevaluate when: An official API replaces browser visits or sanitized live validation shows the cooldown should be more conservative. Immediate stop and no verification bypass remain mandatory.

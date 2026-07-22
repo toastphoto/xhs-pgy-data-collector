@@ -1,4 +1,23 @@
 const XHS_PROFILE_HOSTS = Object.freeze(['xiaohongshu.com', 'www.xiaohongshu.com']);
+const XHS_RISK_PATTERNS = Object.freeze([
+  '安全验证',
+  '请完成验证',
+  '人机验证',
+  '滑动验证',
+  '操作频繁',
+  '请求过于频繁',
+  '访问过于频繁',
+  '访问异常',
+  '账号异常',
+  '网络环境存在风险',
+  'requests too frequent',
+  'request too frequent',
+  'too many requests',
+  'try again later',
+  'security verification',
+  'security check',
+  'captcha'
+]);
 
 function cleanStr(value) {
   if (value === undefined || value === null) return '';
@@ -26,6 +45,31 @@ function normalizeXhsProfileUrl(value) {
   } catch (_) {
     return '';
   }
+}
+
+function detectXhsRisk(urlValue, textValue) {
+  const url = cleanStr(urlValue);
+  const text = cleanStr(textValue).toLowerCase();
+  const matchedPattern = XHS_RISK_PATTERNS.find((pattern) => text.includes(String(pattern).toLowerCase())) || '';
+  const riskUrl = /xiaohongshu\.com\/website-login\/captcha(?:[/?#]|$)/i.test(url);
+  return {
+    riskDetected: Boolean(matchedPattern || riskUrl),
+    riskText: matchedPattern || (riskUrl ? '安全验证' : '')
+  };
+}
+
+function buildXhsRiskDetectionSnippet(urlVarName = 'url', textVarName = 'bodyText') {
+  const urlName = String(urlVarName || 'url').replace(/[^a-zA-Z0-9_$]/g, '') || 'url';
+  const textName = String(textVarName || 'bodyText').replace(/[^a-zA-Z0-9_$]/g, '') || 'bodyText';
+  return `
+          const xhsRiskPatterns = ${JSON.stringify(XHS_RISK_PATTERNS)};
+          const xhsRiskPattern = xhsRiskPatterns.find((pattern) =>
+            ${textName}.toLowerCase().includes(String(pattern).toLowerCase())
+          ) || '';
+          const xhsRiskUrl = /xiaohongshu\\.com\\/website-login\\/captcha(?:[/?#]|$)/i.test(${urlName});
+          const riskText = xhsRiskPattern || (xhsRiskUrl ? '安全验证' : '');
+          const riskDetected = Boolean(riskText);
+  `;
 }
 
 function firstProfileUrl(values) {
@@ -95,8 +139,11 @@ function isIgnorableXhsNavigationError(error, currentUrl, targetUrl) {
 
 module.exports = {
   XHS_PROFILE_HOSTS,
+  XHS_RISK_PATTERNS,
+  buildXhsRiskDetectionSnippet,
   cleanStr,
   contactFieldCount,
+  detectXhsRisk,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
   mergeContactFields,

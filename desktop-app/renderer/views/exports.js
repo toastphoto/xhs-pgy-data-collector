@@ -177,6 +177,7 @@ function ensureXhsContactProgressListener() {
       _xhsContactState.paused = false;
     }
     if (payload.type === 'paused') _xhsContactState.paused = true;
+    if (payload.code === 'XHS_RISK_DETECTED') _xhsContactState.session = 'risk';
     if (payload.type === 'finished' || payload.type === 'failed') {
       _xhsContactState.running = false;
       _xhsContactState.paused = false;
@@ -203,6 +204,10 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
   });
   if (!result?.ok) {
     _xhsContactState.running = false;
+    if (result.code === 'XHS_RISK_DETECTED') {
+      _xhsContactState.session = 'risk';
+      _xhsContactState.message = result.riskText || result.error || '安全验证';
+    }
     setMsg(`小红书补采失败：${result?.error || 'unknown error'}`);
     return result;
   }
@@ -1111,7 +1116,9 @@ export function renderExports(state) {
   if (_xhsContactState.running && _xhsContactState.paused) {
     xhsContactStatus.textContent = `小红书补采已暂停：${_xhsContactState.message || '请在右侧手工处理'}（${_xhsContactState.completed}/${_xhsContactState.total}）`;
   } else if (_xhsContactState.running) {
-    xhsContactStatus.textContent = `正在补采小红书公开联系方式：${_xhsContactState.completed}/${_xhsContactState.total}，已找到 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
+    xhsContactStatus.textContent = `正在补采小红书公开联系方式：${_xhsContactState.completed}/${_xhsContactState.total}，已找到 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}${_xhsContactState.message ? ` · ${_xhsContactState.message}` : ''}`;
+  } else if (_xhsContactState.session === 'risk') {
+    xhsContactStatus.textContent = `小红书已触发安全验证或访问频繁：${_xhsContactState.message || '请查看右侧页面'}。补采已停止，请勿反复刷新或重试；页面恢复后先点击“检测登录”。`;
   } else if (_xhsContactState.total) {
     xhsContactStatus.textContent = `上次补采：完成 ${_xhsContactState.completed}/${_xhsContactState.total}，找到联系方式 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
   } else if (_xhsContactState.session === 'ready') {
@@ -1143,7 +1150,7 @@ export function renderExports(state) {
   const btnStartXhsContact = makeSoftButton('补采已选达人联系方式', async () => {
     const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
     await startXhsContactRows(targets, '已选达人');
-  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running });
+  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running || _xhsContactState.session === 'risk' });
   btnStartXhsContact.title = selectedContactRows.length
     ? '只补采当前明确勾选的达人，并保留串行低频和风险暂停'
     : '请先在下方达人名称前勾选“要建联”';

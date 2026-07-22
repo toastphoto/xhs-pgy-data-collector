@@ -34,7 +34,9 @@ def main() -> int:
 
     task_runner = read("desktop-app/lib/task_runner.js")
     pgy_risk = read("desktop-app/lib/pgy_risk.js")
+    xhs_contact = read("desktop-app/lib/xhs_contact_enrichment.js")
     main_js = read("desktop-app/main.js")
+    exports_view = read("desktop-app/renderer/views/exports.js")
     tasks_view = read("desktop-app/renderer/views/tasks.js")
     recordings_view = read("desktop-app/renderer/views/recordings.js")
     package_json = read("desktop-app/package.json")
@@ -97,6 +99,30 @@ def main() -> int:
         errors,
     )
     require((ROOT / "desktop-app/tests/pgy_risk.test.js").is_file(), "PGY risk text unit test must exist", errors)
+    for phrase in ["requests too frequent", "website-login", "security verification"]:
+        require(phrase in xhs_contact, f"XHS contact enrichment must detect risk signal: {phrase}", errors)
+    require(
+        "buildXhsRiskDetectionSnippet" in xhs_contact and "detectXhsRisk" in xhs_contact,
+        "XHS risk detection must live in a testable shared module",
+        errors,
+    )
+    require(
+        "XHS_CONTACT_COOLDOWN_EVERY = 5" in main_js
+        and "XHS_CONTACT_COOLDOWN_MIN_MS = 35000" in main_js
+        and "XHS_RISK_DETECTED" in main_js,
+        "XHS contact enrichment must keep periodic cooldowns and stop on risk detection",
+        errors,
+    )
+    require(
+        "preflight?.riskDetected" in main_js and "请勿继续重试" in main_js,
+        "XHS contact enrichment must reject a new batch while the current page is risk-blocked",
+        errors,
+    )
+    require(
+        "_xhsContactState.session === 'risk'" in exports_view and "请勿反复刷新或重试" in exports_view,
+        "Contact review UI must disable enrichment and explain recovery while XHS is risk-blocked",
+        errors,
+    )
     require(
         "pgyDetectRiskOnCurrentPage" in main_js and "before_write_result" in main_js and "PGY_RISK_DETECTED" in main_js,
         "pgy extraction must recheck risk-control text during extraction and before writing results",

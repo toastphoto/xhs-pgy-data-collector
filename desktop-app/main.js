@@ -88,7 +88,10 @@ let tencentEmailComposeJob = {
   lastStatus: ''
 };
 
-const UI_WIDTH = 820;          // 左侧工作台默认宽度（renderer 可拖拽后动态更新）
+const UI_WIDTH_RATIO = 0.72;   // 默认优先保证左侧建联工作台的可读宽度
+const UI_MIN_WIDTH = 620;
+const UI_MAX_WIDTH = 1040;
+const BROWSER_MIN_WIDTH = 320; // 右侧仍保留登录、跳转和人工操作所需的最小宽度
 const SPLITTER_WIDTH = 10;     // renderer 分割条宽度（px）
 const TOPBAR_HEIGHT = 56;      // 顶部工具栏高度（与 renderer 里保持一致）
 const DEFAULT_API_HOST = '127.0.0.1';
@@ -958,13 +961,17 @@ function createMainWindow() {
   // 初始打开空白页
   browserView.webContents.loadURL('about:blank');
 
-  let uiWidth = UI_WIDTH;
+  const [initialWindowWidth] = mainWindow.getContentSize();
+  let uiWidth = Math.min(
+    UI_MAX_WIDTH,
+    Math.max(UI_MIN_WIDTH, Math.round(initialWindowWidth * UI_WIDTH_RATIO))
+  );
   const applyBounds = () => {
     if (!mainWindow || !browserView) return;
     const [w, h] = mainWindow.getContentSize();
     const x = Math.round(uiWidth + SPLITTER_WIDTH);
     const y = TOPBAR_HEIGHT;
-    const width = Math.max(420, w - x);
+    const width = Math.max(BROWSER_MIN_WIDTH, w - x);
     const height = Math.max(240, h - TOPBAR_HEIGHT);
     browserView.setBounds({ x, y, width, height });
     // width 由我们根据 uiWidth 控制；height 跟随窗口即可
@@ -980,10 +987,10 @@ function createMainWindow() {
     try {
       const cw = Number(payload?.consoleWidth || 0);
       if (Number.isFinite(cw) && cw > 0) {
-        // 限制范围（保持右侧浏览区至少 420）
+        // 工作台优先，但右侧仍保留可人工操作的最小宽度。
         const [w] = mainWindow.getContentSize();
-        const min = 620;
-        const max = Math.max(min, w - 420 - SPLITTER_WIDTH);
+        const min = UI_MIN_WIDTH;
+        const max = Math.max(min, w - BROWSER_MIN_WIDTH - SPLITTER_WIDTH);
         uiWidth = Math.max(min, Math.min(max, cw));
         applyBounds();
       }

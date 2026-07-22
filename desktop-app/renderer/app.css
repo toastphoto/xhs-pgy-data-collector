@@ -19,7 +19,7 @@
   --focus: 0 0 0 3px rgba(232, 90, 154, 0.22);
 
   /* layout widths (draggable) */
-  --w-console: 820px; /* 左侧工作台整体宽度（sidebar+content） */
+  --w-console: 960px; /* 启动时由 app.js 按 72% 窗口宽度重新计算 */
   --w-sidebar: 250px; /* 左侧导航宽度 */
 }
 
@@ -1903,7 +1903,7 @@ body {
 #browserHost {
   position: relative;
   flex: 1 1 auto;
-  min-width: 420px;
+  min-width: 320px;
   background: #fbfbfd;
   overflow: hidden;
 }

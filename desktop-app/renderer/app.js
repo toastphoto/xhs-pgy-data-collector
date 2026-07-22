@@ -182,6 +182,8 @@ function initSplitters() {
   if (!body || !consoleEl || !sidebar || !splitMain || !splitSidebar) return;
 
   const rootStyle = document.documentElement.style;
+  const browserMinWidth = 320;
+  const splitterWidth = 10;
 
   const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 
@@ -211,9 +213,13 @@ function initSplitters() {
     });
   };
 
-  // 初始化时把当前工作台宽度同步给主进程，避免右侧网页覆盖分割条
+  // 默认让日常操作台占主要空间；右侧网页保留登录和人工点击所需宽度。
   try {
-    const w = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--w-console') || '0', 10);
+    const rect = body.getBoundingClientRect();
+    const min = 620;
+    const max = Math.max(min, rect.width - browserMinWidth - splitterWidth);
+    const w = clamp(Math.round(rect.width * 0.72), min, max);
+    rootStyle.setProperty('--w-console', `${w}px`);
     if (w && window.desktopAPI?.browser?.setLayout) window.desktopAPI.browser.setLayout({ consoleWidth: w });
   } catch (_) {}
 
@@ -222,7 +228,7 @@ function initSplitters() {
     const x = e.clientX - rect.left;
     // 工作台宽度：控制左侧工具区与右侧网页区比例
     const min = 620;
-    const max = Math.max(min, rect.width - 420); // 右侧至少 420
+    const max = Math.max(min, rect.width - browserMinWidth - splitterWidth);
     const w = clamp(x, min, max);
     rootStyle.setProperty('--w-console', `${Math.round(w)}px`);
     try {

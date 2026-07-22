@@ -110,6 +110,7 @@ Latest checks on 2026-07-22:
 - Repository branch was `main`, two commits ahead of `origin/main`, based on `snapshot-2026-07-21-final`; the new mail/link iteration was uncommitted during implementation. Recheck after packaging/checkpoint creation.
 - The official Tencent enterprise-mail landing page resolved to `https://work.weixin.qq.com/mail/` in an isolated Electron profile. Login state, post-login DOM, recipient tokens, and account-specific verification remain volatile and require a user-authorized live check.
 - No real creator page, mailbox account, invitation, or send action was used in UI testing. Dummy addresses and dummy Pugongying URLs were stored only under a temporary test user-data directory.
+- The installed desktop app now defaults to about 72% workbench and 28% embedded browser, with a 320px browser minimum and a draggable splitter. The installed start and contact-review pages were visually checked at the normal application window size; 23 Node tests passed and the local service reached `服务正常`. Process ownership and running state remain volatile and must be rechecked after restart.
 
 Latest checks on 2026-07-20:
 

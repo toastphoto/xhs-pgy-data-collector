@@ -1168,6 +1168,34 @@ body {
   min-width: 0;
 }
 
+.candidate-clear-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  border-color: rgba(220, 38, 38, 0.38);
+  background: #fff5f5;
+  color: #b91c1c;
+  font-weight: 800;
+}
+
+.candidate-clear-all:hover:not(:disabled) {
+  border-color: rgba(185, 28, 28, 0.62);
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.candidate-clear-all-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid currentColor;
+  border-radius: 4px;
+  font-size: 17px;
+  line-height: 1;
+}
+
 .saved-task-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;

@@ -1360,8 +1360,47 @@ export function renderTasks(state) {
       _candidateQuery = candidateSearch.value;
       store.set({ tasks: { ...store.state.tasks } });
     });
+
+    const clearAllCandidates = document.createElement('button');
+    clearAllCandidates.className = 'btn candidate-clear-all';
+    clearAllCandidates.title = '清空全部候选，开始新一轮筛选';
+    clearAllCandidates.setAttribute('aria-label', `清空全部 ${_draftUrls.length} 位候选`);
+    clearAllCandidates.disabled = !!state.tasks?.running || !_draftUrls.length;
+    const clearAllIcon = document.createElement('span');
+    clearAllIcon.className = 'candidate-clear-all-icon';
+    clearAllIcon.setAttribute('aria-hidden', 'true');
+    clearAllIcon.textContent = '×';
+    const clearAllText = document.createElement('span');
+    clearAllText.textContent = '清空全部候选';
+    clearAllCandidates.appendChild(clearAllIcon);
+    clearAllCandidates.appendChild(clearAllText);
+    clearAllCandidates.addEventListener('click', () => {
+      const total = _draftUrls.length;
+      const confirmed = window.confirm([
+        `确定清空全部 ${total} 位候选吗？`,
+        '',
+        '这会清空候选列表中的优先、待复核和排除记录，方便开始新一轮筛选。',
+        '已经完成的采集结果和导出文件不会被删除。'
+      ].join('\n'));
+      if (!confirmed) return;
+      _draftUrls = [];
+      _draftItems = [];
+      _latestSegmentUrls = [];
+      _collectionScope = 'active';
+      _candidateQuery = '';
+      _candidateStatusFilter = 'all';
+      _importPreview = null;
+      _lastSearchSnapshot = null;
+      _candidateInstructionStatus = '候选列表已清空，可以开始新一轮筛选。';
+      syncDraftText();
+      textarea.value = '';
+      _candidateDirty = true;
+      store.set({ tasks: { ...store.state.tasks } });
+    });
+
     candidateFilters.appendChild(statusFilter);
     candidateFilters.appendChild(candidateSearch);
+    candidateFilters.appendChild(clearAllCandidates);
     candidateHead.appendChild(candidateTitle);
     candidateHead.appendChild(candidateFilters);
     candidatePanel.appendChild(candidateHead);
@@ -1443,10 +1482,10 @@ export function renderTasks(state) {
 
     const clearFiltered = document.createElement('button');
     clearFiltered.className = 'btn ghost';
-    clearFiltered.textContent = '移除当前筛选结果';
+    clearFiltered.textContent = '移除当前显示';
     clearFiltered.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
     clearFiltered.addEventListener('click', () => {
-      if (!window.confirm(`确定移除当前筛选出的 ${filteredDraftUrls.length} 条候选吗？`)) return;
+      if (!window.confirm(`确定只移除当前显示的 ${filteredDraftUrls.length} 条候选吗？其余候选会保留。`)) return;
       filteredDraftUrls.forEach((url) => removeDraftUrl(url));
       textarea.value = _draftText;
       store.set({ tasks: { ...store.state.tasks } });

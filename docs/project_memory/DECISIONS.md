@@ -363,3 +363,10 @@
 - Why: Operators need to continue with later creators after finishing an earlier batch. Treating “through rank 70” as “collect 70 people at once” would block valid segmented work or tempt a safety-limit increase.
 - Impact: Range pagination begins from the first result page, is bounded to 10 pages, checks PGY risk before every page turn, uses conservative waits, and does not restore the page after a risk signal. Saved tasks and candidate exports preserve the latest segment. Actual outreach approval rules are unchanged.
 - Reevaluate when: The current PGY page size or pagination controls change, a live rank-range test cannot preserve ordering, or an official export/API becomes available. Do not raise the 50-person run ceiling or weaken risk-stop behavior as part of ordinary range support.
+
+## 2026-07-23: Never embed real AI secrets in desktop packages
+
+- Decision: DMG and application bundles may include a placeholder `.env.example`, but must exclude real `.env` files and common private variants. Desktop AI credentials remain operator-supplied settings stored in the Mac user-data directory.
+- Why: DMG, app resources, and ASAR archives are extractable; embedding a shared API key would disclose it to every recipient and make rotation and access control unreliable.
+- Impact: Same-Mac upgrades retain the existing local AI configuration. A new Mac or user profile must configure the provider, endpoint, model, and key in the app before AI analysis works. Packaging checks must confirm no private environment file is present.
+- Reevaluate when: The product adopts a managed secret service, OS keychain integration, or a server-side AI gateway with per-user authentication. Do not put a real key into a distributable package.

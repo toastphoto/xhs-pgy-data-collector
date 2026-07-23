@@ -48,7 +48,12 @@
           "!**/*.pyc",
           "!logs/**",
           "!output/**",
-          "!data/**"
+          "!data/**",
+          "!.env",
+          "!.env.local",
+          "!.env.development",
+          "!.env.production",
+          "!.env.test"
         ]
       },
       {

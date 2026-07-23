@@ -21,6 +21,7 @@ const STATUS_LABELS = {
 };
 
 const SCOPE_LABELS = {
+  latest_segment: '最近加入的一段',
   active: '优先 + 待复核',
   selected: '只采优先',
   all: '全部候选'
@@ -31,9 +32,13 @@ function cleanStr(value) {
   return String(value).replace(/\s+/g, ' ').trim();
 }
 
-function isInCollectionScope(candidate, collectionScope) {
+function isInCollectionScope(candidate, collectionScope, latestSegmentUrls = []) {
   const scope = normalizeCollectionScope(collectionScope);
   const status = cleanStr(candidate?.status) || 'candidate';
+  if (scope === 'latest_segment') {
+    const latest = new Set(latestSegmentUrls.map(cleanStr).filter(Boolean));
+    return latest.has(cleanStr(candidate?.pgy_url)) && status !== 'excluded';
+  }
   if (scope === 'selected') return status === 'selected';
   if (scope === 'all') return true;
   return status !== 'excluded';
@@ -42,11 +47,12 @@ function isInCollectionScope(candidate, collectionScope) {
 function buildCandidateSheetRows(input = {}) {
   const task = normalizeSigningTask(input);
   const collectionScope = normalizeCollectionScope(input.collectionScope || task.collectionScope);
+  const latestSegmentUrls = task.latestSegmentUrls || [];
   const rows = task.candidates.map((candidate, index) => {
     const status = candidate.status || 'candidate';
     return {
       '序号': index + 1,
-      '采集范围内': isInCollectionScope(candidate, collectionScope) ? '是' : '否',
+      '采集范围内': isInCollectionScope(candidate, collectionScope, latestSegmentUrls) ? '是' : '否',
       '状态': STATUS_LABELS[status] || STATUS_LABELS.candidate,
       '优先级': candidate.priority || '',
       '达人/备注': candidate.creator_name || '',

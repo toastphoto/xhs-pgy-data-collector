@@ -51,6 +51,7 @@ const { loadIndexFromDisk, rebuildKbFromDb, searchIndex } = require('./lib/kb/in
 const { buildBrowserRiskDetectionSnippet } = require('./lib/pgy_risk');
 const {
   MAX_CANDIDATE_COUNT,
+  MAX_CANDIDATE_RANK,
   buildSearchCandidateExtractionScript,
   buildSearchPaginationScript,
   parseCandidateInstruction
@@ -87,6 +88,7 @@ const TOPBAR_HEIGHT = 56;      // 顶部工具栏高度（与 renderer 里保持
 const DEFAULT_API_HOST = '127.0.0.1';
 const DEFAULT_API_PORT = '8010';
 const PGY_MIN_TAB_WAIT_MS = 2500;
+const PGY_CANDIDATE_MAX_PAGES = 10;
 const PGY_ALLOW_NOTE_CLICK_RESOLVE = process.env.PGY_ALLOW_NOTE_CLICK_RESOLVE === 'true';
 const PGY_NOTE_CLICK_RESOLVE_LIMIT = 5;
 const XHS_CONTACT_BATCH_LIMIT = 50;
@@ -734,7 +736,12 @@ function attachPgyCandidateResponseCapture(webContents) {
   }
 }
 
-async function readPgyCandidatesFromResponsePages(requestedCount) {
+function candidateRangeLabel(startRank, endRank) {
+  return startRank === 1 ? `前 ${endRank} 位` : `第 ${startRank}-${endRank} 位`;
+}
+
+async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 } = {}) {
+  const requestedCount = endRank - startRank + 1;
   const firstPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
   if (!Array.isArray(firstPage?.items) || !firstPage.items.length) return null;
   const items = [];
@@ -746,21 +753,42 @@ async function readPgyCandidatesFromResponsePages(requestedCount) {
       items.push(row);
     }
   };
-  append(firstPage.items);
-  if (items.length >= requestedCount || !browserView) {
-    const resultItems = items.slice(0, requestedCount);
+  const waitForNewResponse = async (previous = {}) => {
+    const waitUntil = Date.now() + 6000;
+    while (Date.now() < waitUntil) {
+      const latest = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
+      const latestFirstUrl = latest?.items?.[0]?.pgy_url || '';
+      if (
+        latest?.items?.length
+        && (
+          Number(latest.capturedAt || 0) > Number(previous.capturedAt || 0)
+          || (latestFirstUrl && latestFirstUrl !== String(previous.firstUrl || ''))
+        )
+      ) {
+        return latest;
+      }
+      await sleep(450);
+    }
+    return null;
+  };
+
+  if (!browserView) {
+    append(firstPage.items);
+    const resultItems = items.slice(startRank - 1, endRank);
     return {
       ok: true,
       items: resultItems,
       stats: {
         requested: requestedCount,
+        startRank,
+        endRank,
         available: items.length,
         extracted: resultItems.length,
         source: 'pgy-list-response',
         pagesRead: 1,
         stoppedForRisk: false
       },
-      message: `已按当前排序读取前 ${requestedCount} 位达人。`
+      message: `已按当前排序读取${candidateRangeLabel(startRank, endRank)}达人。`
     };
   }
 
@@ -769,40 +797,87 @@ async function readPgyCandidatesFromResponsePages(requestedCount) {
     pagination = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect'), true);
   } catch (_) {}
   const startPage = Math.max(1, Number(pagination?.currentPage || 1));
-  let movedPages = 0;
+  let currentPage = startPage;
+  let pagesRead = 0;
   let stoppedForRisk = false;
 
-  while (items.length < requestedCount && movedPages < 2) {
+  if (startPage === 1) {
+    append(firstPage.items);
+    pagesRead = 1;
+  } else {
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (!risk?.ok || risk.riskDetected) {
+      stoppedForRisk = true;
+    } else {
+      const previous = {
+        capturedAt: firstPage.capturedAt,
+        firstUrl: firstPage.items?.[0]?.pgy_url || ''
+      };
+      let first = null;
+      try {
+        first = await browserView.webContents.executeJavaScript(
+          buildSearchPaginationScript('goto', 1),
+          true
+        );
+      } catch (_) {}
+      if (!first?.clicked) {
+        return {
+          ok: false,
+          error: '当前不在搜索结果第 1 页，且未能自动回到第 1 页。请手动切到第 1 页后重试。'
+        };
+      }
+      currentPage = 1;
+      await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
+      const page = await waitForNewResponse(previous);
+      if (page?.items?.length) {
+        append(page.items);
+        pagesRead = 1;
+      }
+    }
+  }
+
+  if (!stoppedForRisk && pagesRead === 0) {
+    if (currentPage !== startPage) {
+      try {
+        const restore = await browserView.webContents.executeJavaScript(
+          buildSearchPaginationScript('goto', startPage),
+          true
+        );
+        if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+      } catch (_) {}
+    }
+    return {
+      ok: false,
+      error: '已经定位到搜索结果第 1 页，但没有读取到列表数据。请稍候重试，或刷新右侧蒲公英页面。'
+    };
+  }
+
+  while (items.length < endRank && pagesRead < PGY_CANDIDATE_MAX_PAGES && !stoppedForRisk) {
     const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
     if (!risk?.ok || risk.riskDetected) {
       stoppedForRisk = true;
       break;
     }
-    const previousFirstUrl = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT)?.items?.[0]?.pgy_url || '';
+    const previousPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
+    const previous = {
+      capturedAt: previousPage?.capturedAt,
+      firstUrl: previousPage?.items?.[0]?.pgy_url || ''
+    };
     let next = null;
     try {
       next = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('next'), true);
     } catch (_) {}
     if (!next?.clicked) break;
-    movedPages += 1;
+    currentPage += 1;
     await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
 
-    let nextPage = null;
-    const waitUntil = Date.now() + 6000;
-    while (Date.now() < waitUntil) {
-      const latest = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
-      const latestFirstUrl = latest?.items?.[0]?.pgy_url || '';
-      if (latestFirstUrl && latestFirstUrl !== previousFirstUrl) {
-        nextPage = latest;
-        break;
-      }
-      await sleep(450);
-    }
+    const nextPage = await waitForNewResponse(previous);
     if (!nextPage?.items?.length) break;
     append(nextPage.items);
+    pagesRead += 1;
   }
 
-  if (movedPages > 0) {
+  if (currentPage !== startPage && !stoppedForRisk) {
     try {
       const restore = await browserView.webContents.executeJavaScript(
         buildSearchPaginationScript('goto', startPage),
@@ -812,24 +887,26 @@ async function readPgyCandidatesFromResponsePages(requestedCount) {
     } catch (_) {}
   }
 
-  const resultItems = items.slice(0, requestedCount);
+  const resultItems = items.slice(startRank - 1, endRank);
   const complete = resultItems.length >= requestedCount;
   return {
     ok: true,
     items: resultItems,
     stats: {
       requested: requestedCount,
+      startRank,
+      endRank,
       available: items.length,
       extracted: resultItems.length,
       source: 'pgy-list-response',
-      pagesRead: movedPages + 1,
+      pagesRead,
       stoppedForRisk
     },
     message: complete
-      ? `已按当前排序读取前 ${requestedCount} 位达人。`
+      ? `已按当前排序读取${candidateRangeLabel(startRank, endRank)}达人。`
       : (stoppedForRisk
         ? `检测到登录或安全提示，已停止翻页；本次只读取 ${resultItems.length} 位达人。`
-        : `当前结果可读取 ${resultItems.length} 位达人，少于指令中的 ${requestedCount} 位。`)
+        : `当前结果只能读取到第 ${items.length} 位，本次范围内取得 ${resultItems.length} 位达人。`)
   };
 }
 
@@ -2415,16 +2492,46 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('读取搜索结果');
   if (rejected) return rejected;
   try {
-    const requestedCount = Math.max(1, Math.min(
-      MAX_CANDIDATE_COUNT,
-      Number(options?.requestedCount || MAX_CANDIDATE_COUNT) || MAX_CANDIDATE_COUNT
+    const startRank = Math.max(1, Math.min(
+      MAX_CANDIDATE_RANK,
+      Math.trunc(Number(options?.startRank || 1) || 1)
     ));
+    const endRank = Math.max(startRank, Math.min(
+      MAX_CANDIDATE_RANK,
+      Math.trunc(
+        Number(options?.endRank || (startRank + Number(options?.requestedCount || 1) - 1))
+        || startRank
+      )
+    ));
+    const requestedCount = endRank - startRank + 1;
+    if (requestedCount > MAX_CANDIDATE_COUNT) {
+      return { ok: false, error: `为降低平台风控风险，单次最多加入 ${MAX_CANDIDATE_COUNT} 位达人。` };
+    }
     const runtimeResult = await browserView.webContents.executeJavaScript(
-      buildSearchCandidateExtractionScript(requestedCount),
+      buildSearchCandidateExtractionScript(endRank),
       true
     );
-    if (Array.isArray(runtimeResult?.items) && runtimeResult.items.length) return runtimeResult;
-    const responseResult = await readPgyCandidatesFromResponsePages(requestedCount);
+    if (Array.isArray(runtimeResult?.items) && runtimeResult.items.length >= endRank) {
+      const items = runtimeResult.items.slice(startRank - 1, endRank);
+      return {
+        ...runtimeResult,
+        items,
+        stats: {
+          ...(runtimeResult.stats || {}),
+          requested: requestedCount,
+          startRank,
+          endRank,
+          available: runtimeResult.items.length,
+          extracted: items.length
+        },
+        message: `已按当前排序读取${candidateRangeLabel(startRank, endRank)}达人。`
+      };
+    }
+    const responseResult = await readPgyCandidatesFromResponsePages({ startRank, endRank });
+    if (responseResult?.ok === false) return responseResult;
+    if (responseResult?.stats?.stoppedForRisk) {
+      return { ...responseResult, url: browserView.webContents.getURL() };
+    }
     if (Array.isArray(responseResult?.items) && responseResult.items.length) {
       return { ...responseResult, url: browserView.webContents.getURL() };
     }
@@ -2593,11 +2700,14 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
     `;
     const fallbackResult = await browserView.webContents.executeJavaScript(js, true);
     if (Array.isArray(fallbackResult?.items)) {
-      fallbackResult.items = fallbackResult.items.slice(0, requestedCount);
+      const available = fallbackResult.items.length;
+      fallbackResult.items = fallbackResult.items.slice(startRank - 1, endRank);
       fallbackResult.stats = {
         ...(fallbackResult.stats || {}),
         requested: requestedCount,
-        available: Number(fallbackResult?.stats?.extracted || fallbackResult.items.length),
+        startRank,
+        endRank,
+        available,
         extracted: fallbackResult.items.length,
         source: 'visible-links-fallback'
       };
@@ -2609,7 +2719,10 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
 });
 
 ipcMain.handle('pgy:parseCandidateInstruction', async (_e, instruction) => (
-  parseCandidateInstruction(instruction, { maxCount: MAX_CANDIDATE_COUNT })
+  parseCandidateInstruction(instruction, {
+    maxCount: MAX_CANDIDATE_COUNT,
+    maxRank: MAX_CANDIDATE_RANK
+  })
 ));
 
 // =========================

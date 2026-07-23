@@ -33,6 +33,7 @@ def main() -> int:
     require(runtime_probe.is_file(), "Runtime PGY safety probe must exist", errors)
 
     task_runner = read("desktop-app/lib/task_runner.js")
+    candidate_command = read("desktop-app/lib/pgy_candidate_command.js")
     pgy_risk = read("desktop-app/lib/pgy_risk.js")
     xhs_contact = read("desktop-app/lib/xhs_contact_enrichment.js")
     main_js = read("desktop-app/main.js")
@@ -174,6 +175,24 @@ def main() -> int:
     )
 
     require("const SAFE_BATCH_LIMIT = 50" in tasks_view, "Task UI must show the 50 creator ceiling", errors)
+    require(
+        "const MAX_CANDIDATE_COUNT = 50" in candidate_command
+        and "const MAX_CANDIDATE_RANK = 100" in candidate_command,
+        "Segmented candidate intake must keep a 50-person segment ceiling and rank-100 boundary",
+        errors,
+    )
+    require(
+        "PGY_CANDIDATE_MAX_PAGES = 10" in main_js
+        and "while (items.length < endRank" in main_js
+        and "pgyDetectRiskOnCurrentPage" in main_js,
+        "Segmented candidate paging must stay bounded and recheck PGY risk before page turns",
+        errors,
+    )
+    require(
+        "latest_segment" in tasks_view and "urls.length > SAFE_BATCH_LIMIT" in tasks_view,
+        "Task UI must support the latest segment without weakening the 50-person run ceiling",
+        errors,
+    )
     require("建议 10-30 人/批" in tasks_view, "Task UI must show recommended batch size", errors)
     require("批次间隔至少 5 分钟" in tasks_view, "Task UI must show cooldown guidance between batches", errors)
     require("task-safety-notice" in tasks_view, "Task UI must render a safety notice before collection", errors)

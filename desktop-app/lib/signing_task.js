@@ -68,7 +68,7 @@ function normalizeContactPlan(input) {
 
 function normalizeCollectionScope(value) {
   const scope = cleanText(value);
-  return ['active', 'selected', 'all'].includes(scope) ? scope : 'active';
+  return ['latest_segment', 'active', 'selected', 'all'].includes(scope) ? scope : 'active';
 }
 
 function normalizeSourceMode(value) {
@@ -104,6 +104,19 @@ function normalizeCandidates(input) {
   return out;
 }
 
+function normalizeCandidateUrls(input) {
+  const values = Array.isArray(input) ? input : [];
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const url = normalizeCandidateUrl(value);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
 function normalizeSigningTask(input) {
   const src = input && typeof input === 'object' ? input : {};
   const taskName = cleanText(src.taskName) || '未命名签约任务';
@@ -115,6 +128,7 @@ function normalizeSigningTask(input) {
     channels: normalizeChannels(src.channels),
     contactPlan: normalizeContactPlan(src.contactPlan),
     collectionScope: normalizeCollectionScope(src.collectionScope),
+    latestSegmentUrls: normalizeCandidateUrls(src.latestSegmentUrls).slice(0, 50),
     searchCriteria,
     searchCriteriaText: summarizeSearchCriteria(searchCriteria),
     candidates: normalizeCandidates(src.candidates || src.candidateItems || src.items)
@@ -126,6 +140,7 @@ module.exports = {
   SOURCE_MODES,
   cleanNumber,
   normalizeCandidateUrl,
+  normalizeCandidateUrls,
   normalizeCandidates,
   normalizeCollectionScope,
   normalizeSearchCriteria,

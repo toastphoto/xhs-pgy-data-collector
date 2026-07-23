@@ -103,6 +103,7 @@ class PgyCandidateResponseCache {
     const items = entry.rows.slice(0, requested);
     return {
       ok: true,
+      capturedAt: entry.capturedAt,
       items,
       stats: {
         requested,

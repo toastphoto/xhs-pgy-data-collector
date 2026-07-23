@@ -1,6 +1,7 @@
 const assert = require('assert');
 const {
   cleanNumber,
+  normalizeCandidateUrls,
   normalizeCandidates,
   normalizeCollectionScope,
   normalizeSearchCriteria,
@@ -49,7 +50,12 @@ assert.strictEqual(candidates[1].note, '优先看报价');
 assert.strictEqual(candidates[1].status, 'excluded');
 assert.strictEqual(candidates[1].excludeReason, '不匹配');
 assert.strictEqual(normalizeCollectionScope('selected'), 'selected');
+assert.strictEqual(normalizeCollectionScope('latest_segment'), 'latest_segment');
 assert.strictEqual(normalizeCollectionScope('bad'), 'active');
+assert.deepStrictEqual(
+  normalizeCandidateUrls(['pgy.xiaohongshu.com/a', 'pgy.xiaohongshu.com/a', 'https://pgy.xiaohongshu.com/b']),
+  ['https://pgy.xiaohongshu.com/a', 'https://pgy.xiaohongshu.com/b']
+);
 assert.strictEqual(normalizeSourceMode('search'), 'search');
 assert.strictEqual(normalizeSourceMode('bad'), 'import');
 
@@ -59,6 +65,7 @@ const task = normalizeSigningTask({
   channels: { pgy: true, xhs: true },
   contactPlan: { pgyInvite: true },
   collectionScope: 'selected',
+  latestSegmentUrls: ['pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/a'],
   searchCriteria: criteria,
   candidates
 });
@@ -69,6 +76,7 @@ assert.strictEqual(task.channels.pgy, true);
 assert.strictEqual(task.channels.xhs, true);
 assert.strictEqual(task.contactPlan.pgyInvite, true);
 assert.strictEqual(task.collectionScope, 'selected');
+assert.deepStrictEqual(task.latestSegmentUrls, ['https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/a']);
 assert.ok(task.searchCriteriaText.includes('报价上限: 30000'));
 assert.strictEqual(task.candidates.length, 2);
 

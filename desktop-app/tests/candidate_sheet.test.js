@@ -29,6 +29,22 @@ assert.strictEqual(isInCollectionScope({ status: 'excluded' }, 'active'), false)
 assert.strictEqual(isInCollectionScope({ status: 'excluded' }, 'all'), true);
 assert.strictEqual(isInCollectionScope({ status: 'candidate' }, 'selected'), false);
 assert.strictEqual(isInCollectionScope({ status: 'selected' }, 'selected'), true);
+assert.strictEqual(
+  isInCollectionScope(
+    { pgy_url: 'https://pgy.xiaohongshu.com/a', status: 'candidate' },
+    'latest_segment',
+    ['https://pgy.xiaohongshu.com/a']
+  ),
+  true
+);
+assert.strictEqual(
+  isInCollectionScope(
+    { pgy_url: 'https://pgy.xiaohongshu.com/b', status: 'candidate' },
+    'latest_segment',
+    ['https://pgy.xiaohongshu.com/a']
+  ),
+  false
+);
 
 const built = buildCandidateSheetRows(input);
 assert.strictEqual(built.summary.total, 3);

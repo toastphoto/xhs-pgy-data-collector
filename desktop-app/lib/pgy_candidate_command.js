@@ -1,4 +1,5 @@
 const MAX_CANDIDATE_COUNT = 50;
+const MAX_CANDIDATE_RANK = 100;
 
 const CHINESE_DIGITS = Object.freeze({
   '零': 0,
@@ -22,52 +23,124 @@ function cleanText(value) {
 function parseChineseNumber(value) {
   const text = cleanText(value);
   if (!text) return 0;
-  if (!text.includes('十')) {
-    return Object.prototype.hasOwnProperty.call(CHINESE_DIGITS, text)
-      ? CHINESE_DIGITS[text]
-      : 0;
+  if (Object.prototype.hasOwnProperty.call(CHINESE_DIGITS, text)) {
+    return CHINESE_DIGITS[text];
   }
-  const [left, right] = text.split('十');
-  const tens = left ? CHINESE_DIGITS[left] : 1;
-  const ones = right ? CHINESE_DIGITS[right] : 0;
-  if (!Number.isFinite(tens) || !Number.isFinite(ones)) return 0;
-  return tens * 10 + ones;
+  let total = 0;
+  let digit = 0;
+  for (const char of text) {
+    if (Object.prototype.hasOwnProperty.call(CHINESE_DIGITS, char)) {
+      digit = CHINESE_DIGITS[char];
+      continue;
+    }
+    if (char === '十') {
+      total += (digit || 1) * 10;
+      digit = 0;
+      continue;
+    }
+    if (char === '百') {
+      total += (digit || 1) * 100;
+      digit = 0;
+      continue;
+    }
+    return 0;
+  }
+  return total + digit;
 }
 
-function extractRequestedCount(text) {
-  const arabic = text.match(/(?:前\s*)?(\d{1,3})\s*(?:名|位|个|人)?/);
-  if (arabic) return Number(arabic[1]);
-  const chinese = text.match(/(?:前\s*)?([零〇一二两三四五六七八九十]{1,3})\s*(?:名|位|个|人)?/);
-  return chinese ? parseChineseNumber(chinese[1]) : 0;
+function parsePositionNumber(value) {
+  const text = cleanText(value);
+  if (/^\d{1,3}$/.test(text)) return Number(text);
+  return parseChineseNumber(text);
+}
+
+function extractRequestedRange(text) {
+  const number = '(\\d{1,3}|[零〇一二两三四五六七八九十百]{1,5})';
+  const rangePattern = new RegExp(
+    `(?:从\\s*)?第?\\s*${number}\\s*(?:名|位|个|人)?\\s*(?:达人|博主)?\\s*(?:到|至|[-—~～])\\s*第?\\s*${number}\\s*(?:名|位|个|人)?`,
+    'i'
+  );
+  const range = text.match(rangePattern);
+  if (range) {
+    return {
+      mode: 'range',
+      startRank: parsePositionNumber(range[1]),
+      endRank: parsePositionNumber(range[2])
+    };
+  }
+
+  const prefixPattern = new RegExp(
+    `前\\s*${number}\\s*(?:名|位|个|人)?`,
+    'i'
+  );
+  const prefix = text.match(prefixPattern);
+  if (prefix) {
+    const endRank = parsePositionNumber(prefix[1]);
+    return { mode: 'prefix', startRank: 1, endRank };
+  }
+
+  const countPattern = new RegExp(
+    `(?:取|查找|选择|选取)\\s*${number}\\s*(?:名|位|个|人)`,
+    'i'
+  );
+  const count = text.match(countPattern);
+  if (count) {
+    const endRank = parsePositionNumber(count[1]);
+    return { mode: 'prefix', startRank: 1, endRank };
+  }
+  return null;
 }
 
 function parseCandidateInstruction(value, options = {}) {
   const instruction = cleanText(value);
   const maxCount = Math.max(1, Number(options.maxCount || MAX_CANDIDATE_COUNT));
+  const maxRank = Math.max(maxCount, Number(options.maxRank || MAX_CANDIDATE_RANK));
   if (!instruction) {
-    return { ok: false, code: 'CANDIDATE_COMMAND_EMPTY', error: '请输入需求，例如“将当前页面前30位达人加入候选”。' };
+    return { ok: false, code: 'CANDIDATE_COMMAND_EMPTY', error: '请输入需求，例如“将当前页面前30位达人加入候选”或“将第42位到第50位达人加入候选”。' };
   }
-  if (!/(候选|达人|博主)/.test(instruction) || !/(加入|添加|导入|放入|列入|查找|取)/.test(instruction)) {
-    return { ok: false, code: 'CANDIDATE_COMMAND_UNSUPPORTED', error: '当前只支持从右侧蒲公英结果中取前 N 位达人加入候选。' };
+  if (!/(候选|达人|博主)/.test(instruction) || !/(加入|添加|导入|放入|列入|查找|取|选择|选取)/.test(instruction)) {
+    return { ok: false, code: 'CANDIDATE_COMMAND_UNSUPPORTED', error: '当前支持从右侧蒲公英结果中取前 N 位，或取第 A 位到第 B 位达人加入候选。' };
   }
-  const count = extractRequestedCount(instruction);
-  if (!Number.isInteger(count) || count < 1) {
-    return { ok: false, code: 'CANDIDATE_COMMAND_COUNT_MISSING', error: '请在指令中写明人数，例如“前20位”。' };
+  const range = extractRequestedRange(instruction);
+  if (!range) {
+    return { ok: false, code: 'CANDIDATE_COMMAND_COUNT_MISSING', error: '请写明范围，例如“前20位”或“第42位到第50位”。' };
   }
+  const { mode, startRank, endRank } = range;
+  if (!Number.isInteger(startRank) || !Number.isInteger(endRank) || startRank < 1 || endRank < startRank) {
+    return { ok: false, code: 'CANDIDATE_COMMAND_RANGE_INVALID', error: '范围顺序不正确，请按“第 A 位到第 B 位”填写，并确保 A 不大于 B。' };
+  }
+  if (endRank > maxRank) {
+    return {
+      ok: false,
+      code: 'CANDIDATE_COMMAND_RANK_EXCEEDED',
+      error: `当前支持定位到第 ${maxRank} 位达人。更靠后的达人请调整筛选条件后再分批加入。`,
+      startRank,
+      endRank,
+      maxRank
+    };
+  }
+  const count = endRank - startRank + 1;
   if (count > maxCount) {
     return {
       ok: false,
       code: 'CANDIDATE_COMMAND_LIMIT_EXCEEDED',
       error: `为降低平台风控风险，单次最多加入 ${maxCount} 位达人。`,
       requestedCount: count,
-      maxCount
+      startRank,
+      endRank,
+      maxCount,
+      maxRank
     };
   }
   return {
     ok: true,
     instruction,
+    mode,
+    startRank,
+    endRank,
     requestedCount: count,
     maxCount,
+    maxRank,
     scope: 'current_pgy_search'
   };
 }
@@ -338,6 +411,7 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1) {
 
 module.exports = {
   MAX_CANDIDATE_COUNT,
+  MAX_CANDIDATE_RANK,
   buildSearchCandidateExtractionScript,
   buildSearchPaginationScript,
   parseCandidateInstruction,

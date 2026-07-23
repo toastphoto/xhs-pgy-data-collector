@@ -1,13 +1,16 @@
 # Active Context
 
-Last reviewed: 2026-07-22.
+Last reviewed: 2026-07-23.
 
 ## Current Goal
 
-Finish the six-step operator flow: manual PGY filtering, natural-language first-N candidate intake, serial PGY collection with automatic public-XHS-contact enrichment, outreach-copy review, and workbook export. Preserve every conservative PGY safety boundary and the mandatory human approval gate for all actual sending. First-3 live intake, the 50-person hard limit, and contact-workbook export feedback are verified; first-30/50 pagination is implemented and installed but still needs a separate live test.
+Finish the six-step operator flow: manual PGY filtering, natural-language ranked candidate intake, serial PGY collection with automatic public-XHS-contact enrichment, outreach-copy review, and workbook export. Candidate intake now accepts both first-N and explicit A-B rank ranges through rank 100, while each intake and collection run remains capped at 50 creators. Preserve every conservative PGY safety boundary and the mandatory human approval gate for all actual sending. First-3 live intake, the 50-person hard limit, and contact-workbook export feedback are verified; range pagination still needs a separate live PGY test.
 
 ## Completed Important Stages
 
+- On 2026-07-23, candidate commands gained explicit rank ranges such as `第42位到第50位` and `第50位到第70位`. Rank position and batch size are validated separately: the farthest supported rank is 100, while one intake/collection segment remains capped at 50. Multi-page reads start from rank 1, stay bounded to 10 response pages, recheck PGY risk before each page turn, wait conservatively, deduplicate, and restore the original page only when no risk signal is active.
+- The task page now persists a `最近加入的一段` scope. A successful range instruction merges creators into the durable candidate pool but switches the next collection run to only that latest segment, so later batches do not repeat earlier candidates or exceed the 50-person run ceiling. Saved signing tasks and candidate-sheet exports preserve this scope.
+- All 23 desktop test files, syntax checks, the extended PGY safety audit, and project-memory verification passed. The packaged app was installed to `/Applications`, its backend reached `服务正常`, and the live UI showed the new range prompt and latest-segment scope. No PGY result read, page turn, collection, enrichment, export, or outreach was started during installation QA. Live range ordering, pagination, restore, and risk-stop behavior remain pending.
 - On 2026-07-22, the contact-review cards gained a restricted Pugongying profile link that opens only an allowlisted `pgy.xiaohongshu.com` creator URL in the visible BrowserView. The prominent per-card execution-channel chip was removed; underlying channel/export data remains intact.
 - Added a Tencent enterprise-mail handoff for selected creators in the current review filter who have valid emails. It opens the official visible mailbox page, waits for manual login, may click only a semantic compose action, and fills only the recipient field. It never fills credentials, invokes a mail API, fills content, or clicks send. The action is capped at 20 unique valid recipients, requires an in-app confirmation, stops on security/risk text, and warns about multi-recipient privacy.
 - The 23-test desktop chain, syntax checks, PGY safety audit, and project-memory verification passed on 2026-07-22. An isolated dummy-data UI test verified recipient-count changes, the confirmation/cancel gate, visible Pugongying links, and the official Tencent enterprise-mail landing page. Post-login recipient filling still needs a user-authorized live mailbox test; no real email or invitation was sent.

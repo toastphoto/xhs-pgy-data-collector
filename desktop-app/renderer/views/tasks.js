@@ -8,6 +8,7 @@ const PRESETS = [
 
 const PGY_DISCOVERY_URL = 'https://pgy.xiaohongshu.com/solar/pre-trade/note/kol';
 const SAFE_BATCH_LIMIT = 50;
+const MAX_CANDIDATE_RANK = 100;
 const RECOMMENDED_BATCH_TEXT = '建议 10-30 人/批，上限 50 人/批，批次间隔至少 5 分钟';
 
 const SOURCE_MODE_OPTIONS = [
@@ -22,6 +23,7 @@ let _draftItems = []; // {pgy_url, creator_name}[]
 let _candidateQuery = '';
 let _candidateStatusFilter = 'all';
 let _collectionScope = 'active';
+let _latestSegmentUrls = [];
 let _presetKey = 'standard';
 let _selectedTemplatePath = '';
 let _importPreview = null; // {stats, items, filePath} | null
@@ -267,8 +269,12 @@ function buildCandidateItems() {
 function getCollectionUrls() {
   const urls = _draftUrls.length ? _draftUrls : parseUrls(_draftText);
   if (!_draftUrls.length) return urls;
+  const latestSegment = new Set(_latestSegmentUrls.map(normalizeDraftUrl));
   return urls.filter((url) => {
     const status = String(getDraftItem(url)?.status || 'candidate').trim() || 'candidate';
+    if (_collectionScope === 'latest_segment') {
+      return latestSegment.has(normalizeDraftUrl(url)) && status !== 'excluded';
+    }
     if (_collectionScope === 'selected') return status === 'selected';
     if (_collectionScope === 'all') return true;
     return status !== 'excluded';
@@ -277,6 +283,7 @@ function getCollectionUrls() {
 
 function collectionScopeLabel() {
   const map = {
+    latest_segment: '最近加入的一段',
     active: '优先 + 待复核',
     selected: '只采优先',
     all: '全部候选'
@@ -350,6 +357,7 @@ function buildSigningTaskPayload() {
     id: _selectedSigningTaskId || undefined,
     ...JSON.parse(JSON.stringify(_signingTaskDraft)),
     collectionScope: _collectionScope,
+    latestSegmentUrls: [..._latestSegmentUrls],
     candidates: buildCandidateItems()
   };
 }
@@ -427,7 +435,14 @@ function applySigningTask(task) {
     .filter((x) => x.pgy_url);
   _candidateQuery = '';
   _candidateStatusFilter = 'all';
-  _collectionScope = ['active', 'selected', 'all'].includes(String(task.collectionScope || '')) ? task.collectionScope : 'active';
+  _collectionScope = ['latest_segment', 'active', 'selected', 'all'].includes(String(task.collectionScope || ''))
+    ? task.collectionScope
+    : 'active';
+  const candidateUrlSet = new Set(_draftUrls.map(normalizeDraftUrl));
+  const savedLatestSegmentUrls = Array.isArray(task.latestSegmentUrls) ? task.latestSegmentUrls : [];
+  _latestSegmentUrls = parseUrls(savedLatestSegmentUrls.join('\n'))
+    .filter((url) => candidateUrlSet.has(normalizeDraftUrl(url)))
+    .slice(0, SAFE_BATCH_LIMIT);
   _importPreview = null;
   _candidateDirty = false;
   syncDraftText();
@@ -842,7 +857,11 @@ export function renderTasks(state) {
         store.set({ tasks: { ...store.state.tasks } });
         return;
       }
-      const r = await window.desktopAPI.pgy.extractSearchCandidates({ requestedCount: command.requestedCount });
+      const r = await window.desktopAPI.pgy.extractSearchCandidates({
+        requestedCount: command.requestedCount,
+        startRank: command.startRank,
+        endRank: command.endRank
+      });
       if (!r?.ok) {
         _candidateInstructionStatus = r?.error || '读取失败';
         alert(`读取失败：${r?.error || 'unknown error'}`);
@@ -851,6 +870,14 @@ export function renderTasks(state) {
       }
       const items = (Array.isArray(r.items) ? r.items : []).slice(0, command.requestedCount);
       const mergeResult = applyImportedCandidateItems(items, { merge: true });
+      _latestSegmentUrls = items
+        .map((item) => normalizeDraftUrl(item?.pgy_url || item?.url || ''))
+        .filter(Boolean)
+        .slice(0, SAFE_BATCH_LIMIT);
+      if (_latestSegmentUrls.length) _collectionScope = 'latest_segment';
+      const rangeLabel = command.startRank === 1
+        ? `前 ${command.endRank} 位`
+        : `第 ${command.startRank}-${command.endRank} 位`;
       _lastSearchSnapshot = {
         url: r.url || '',
         filters: r.filters || null,
@@ -871,13 +898,14 @@ export function renderTasks(state) {
         items: items.slice(0, 10)
       };
       _candidateInstructionStatus = items.length
-        ? `已读取 ${items.length} 位，候选池现有 ${_draftUrls.length} 位`
+        ? `已读取${rangeLabel}中的 ${items.length} 位；本次采集已切到最近加入的一段`
         : '未读取到达人，请确认右侧停留在蒲公英筛选结果页。';
       store.set({ tasks: { ...store.state.tasks } });
       const filterText = summarizeSearchFilters(r.filters);
       alert([
         r.message || '读取完成。',
-        `指令要求 ${command.requestedCount} 位，本次读取 ${items.length} 位，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
+        `指令范围：${rangeLabel}；本次读取 ${items.length} 位，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
+        items.length ? '采集范围已自动切换为“最近加入的一段”，开始采集时不会重复带上前一批候选。' : '',
         filterText ? `\n已记录当前筛选结构：\n${filterText.slice(0, 500)}` : ''
       ].filter(Boolean).join('\n'));
     } catch (e) {
@@ -891,12 +919,12 @@ export function renderTasks(state) {
   commandWrap.className = 'candidate-command';
   const commandLabel = document.createElement('label');
   commandLabel.className = 'candidate-command-label';
-  commandLabel.textContent = '告诉工具要取多少位达人';
+  commandLabel.textContent = '告诉工具要取哪些达人';
   const commandInputRow = document.createElement('div');
   commandInputRow.className = 'candidate-command-input-row';
   const commandInput = document.createElement('input');
   commandInput.className = 'tpl-input candidate-command-input';
-  commandInput.placeholder = '例如：将当前页面前30位达人加入候选';
+  commandInput.placeholder = '例如：前30位，或第42位到第50位达人加入候选';
   commandInput.value = _candidateInstruction;
   commandInput.disabled = !!state.tasks?.running;
   commandInput.addEventListener('input', () => {
@@ -914,7 +942,8 @@ export function renderTasks(state) {
   commandWrap.appendChild(commandInputRow);
   const commandStatus = document.createElement('div');
   commandStatus.className = 'muted-line candidate-command-status';
-  commandStatus.textContent = _candidateInstructionStatus || `当前候选 ${_draftUrls.length} 位，单次最多 ${SAFE_BATCH_LIMIT} 位`;
+  commandStatus.textContent = _candidateInstructionStatus
+    || `支持前 N 位或第 A-B 位；单次最多 ${SAFE_BATCH_LIMIT} 位，可定位到第 ${MAX_CANDIDATE_RANK} 位`;
   commandWrap.appendChild(commandStatus);
 
   const addCurrentBtn = document.createElement('button');
@@ -943,7 +972,7 @@ export function renderTasks(state) {
 
   const discoveryHint = document.createElement('div');
   discoveryHint.className = 'muted-line discovery-hint';
-  discoveryHint.textContent = '筛选条件仍由用户在右侧蒲公英中设置；工具只按当前排序取前 N 位达人。';
+  discoveryHint.textContent = '筛选条件仍由用户在右侧蒲公英中设置；候选可分段累计，实际采集仍按单批最多 50 位执行。';
 
   discoveryRow.appendChild(openPgyBtn);
   discoveryRow.appendChild(commandWrap);
@@ -1631,6 +1660,7 @@ export function renderTasks(state) {
   scopeSel.style.width = '180px';
   scopeSel.style.height = '34px';
   [
+    ['latest_segment', '最近加入的一段'],
     ['active', '优先 + 待复核'],
     ['selected', '只采优先'],
     ['all', '全部候选']

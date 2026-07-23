@@ -356,3 +356,10 @@
 - Why: A live security-verification page used English request-frequency wording. The previous Chinese-only detector misclassified nine such pages as ordinary profile failures and continued requesting.
 - Impact: Enrichment is slower but fails closed on known XHS risk pages. Risk detection stays in a shared, unit-tested module and is enforced by the safety audit. Operators wait for natural recovery, then check login and restart with a small batch; the app does not refresh, solve, or bypass verification.
 - Reevaluate when: An official API replaces browser visits or sanitized live validation shows the cooldown should be more conservative. Immediate stop and no verification bypass remain mandatory.
+
+## 2026-07-23: Separate candidate rank position from safe batch size
+
+- Decision: Natural-language candidate intake supports both first-N and explicit A-B rank ranges through rank 100. The rank endpoint is only a list position; each intake segment and actual collection run remains capped at 50 creators. The latest successful instruction becomes an explicit `latest_segment` collection scope while the full candidate pool continues to accumulate.
+- Why: Operators need to continue with later creators after finishing an earlier batch. Treating “through rank 70” as “collect 70 people at once” would block valid segmented work or tempt a safety-limit increase.
+- Impact: Range pagination begins from the first result page, is bounded to 10 pages, checks PGY risk before every page turn, uses conservative waits, and does not restore the page after a risk signal. Saved tasks and candidate exports preserve the latest segment. Actual outreach approval rules are unchanged.
+- Reevaluate when: The current PGY page size or pagination controls change, a live rank-range test cannot preserve ordering, or an official export/API becomes available. Do not raise the 50-person run ceiling or weaken risk-stop behavior as part of ordinary range support.

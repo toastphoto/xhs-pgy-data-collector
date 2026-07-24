@@ -370,3 +370,10 @@
 - Why: DMG, app resources, and ASAR archives are extractable; embedding a shared API key would disclose it to every recipient and make rotation and access control unreliable.
 - Impact: Same-Mac upgrades retain the existing local AI configuration. A new Mac or user profile must configure the provider, endpoint, model, and key in the app before AI analysis works. Packaging checks must confirm no private environment file is present.
 - Reevaluate when: The product adopts a managed secret service, OS keychain integration, or a server-side AI gateway with per-user authentication. Do not put a real key into a distributable package.
+
+## 2026-07-24: Mac and Windows require separate artifacts and acceptance
+
+- Decision: The current Apple Silicon DMG is only a Mac artifact. Windows requires its own installer and backend executable, followed by Windows-native validation of login, collection, risk stops, workbook export, and local configuration.
+- Why: Windows cannot run a DMG or an arm64 Mac application, and the current backend packaging script is macOS-specific. A configured Electron NSIS target is not evidence that a usable Windows release exists.
+- Impact: Distribution notes must identify platform and architecture. Mac acceptance results must not be reused as Windows acceptance evidence, and an untested cross-compiled file must not be described as deliverable.
+- Reevaluate when: A Windows build passes regression testing on the target company device and Windows version.

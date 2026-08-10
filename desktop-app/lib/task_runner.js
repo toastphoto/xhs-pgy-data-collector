@@ -6,6 +6,8 @@ const { normalizeSigningTask } = require('./signing_task');
 const SAFE_BATCH_LIMIT = 50;
 const SAFE_RUN_COOLDOWN_MS = 5 * 60 * 1000;
 const SAFE_RUN_COOLDOWN_FILE = '.pgy_task_cooldown.json';
+const TASK_STATE_FILE = 'task_state.json';
+const TASK_STATE_SCHEMA_VERSION = 2;
 const ALLOWED_TASK_HOSTS = Object.freeze(['pgy.xiaohongshu.com']);
 
 const TASK_PRESETS = {
@@ -43,10 +45,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function jitteredDelayMs(baseMs, jitterMs = 0) {
   const base = Math.max(0, Number(baseMs || 0));
   const jitter = Math.max(0, Number(jitterMs || 0));
@@ -71,6 +69,27 @@ function isAllowedTaskUrl(value) {
   try {
     const url = new URL(normalizeTaskUrl(value));
     return ALLOWED_TASK_HOSTS.includes(url.hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
+function isPathInside(parentDir, candidateDir) {
+  const parent = path.resolve(String(parentDir || ''));
+  const candidate = path.resolve(String(candidateDir || ''));
+  const relative = path.relative(parent, candidate);
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function isSameTaskPage(expectedValue, currentValue) {
+  try {
+    const expected = new URL(normalizeTaskUrl(expectedValue));
+    const current = new URL(normalizeTaskUrl(currentValue));
+    const normalizePath = (value) => String(value || '/').replace(/\/+$/, '') || '/';
+    return (
+      expected.hostname.toLowerCase() === current.hostname.toLowerCase()
+      && normalizePath(expected.pathname) === normalizePath(current.pathname)
+    );
   } catch (_) {
     return false;
   }
@@ -148,17 +167,32 @@ class TaskRunner {
       runDir: '',
       queue: [],
       currentId: null,
-      logs: []
+      logs: [],
+      pausePending: false,
+      pauseRequestedAt: null,
+      stopPending: false,
+      stopRequestedAt: null,
+      stopReason: '',
+      finishReason: '',
+      finishedAt: null,
+      skipPending: false,
+      skipRequestedAt: null,
+      recoveryPending: false,
+      recoveredAt: null,
+      persistenceError: null
     };
 
     this._loopPromise = null;
     this._pauseGate = null;
     this._pauseGateResolve = null;
-    this._skipAfterCurrent = false;
+    this._skipRequested = false;
+    this._stopRequested = false;
+    this._controlWaiters = new Set();
+    this._recoveryPending = false;
     this._lastFinishedAt = 0;
   }
 
-  _log(level, message, extra) {
+  _appendLogLine(level, message, extra) {
     const line = {
       t: Date.now(),
       ts: new Date().toLocaleString('zh-CN', { hour12: false }),
@@ -168,16 +202,41 @@ class TaskRunner {
     };
     this.state.logs.push(line);
     if (this.state.logs.length > 200) this.state.logs = this.state.logs.slice(-200);
+    return line;
+  }
+
+  _log(level, message, extra) {
+    this._appendLogLine(level, message, extra);
     this._emitState();
   }
 
+  _recordPersistenceFailure(scope, err) {
+    const detail = String(err?.message || err || 'unknown error');
+    const message = `${scope} 持久化失败：${detail}`;
+    this.state.persistenceError = {
+      t: Date.now(),
+      scope: String(scope || 'unknown'),
+      message
+    };
+    this._appendLogLine('error', message);
+    try {
+      console.error(`[TaskRunner] ${message}`);
+    } catch (_) {
+      // Console availability must not decide whether the task can be controlled.
+    }
+  }
+
   _emitState() {
+    this._writeTaskState();
     try {
       this.deps.sendState(JSON.parse(JSON.stringify(this.state)));
-    } catch (_) {
-      // ignore
+    } catch (err) {
+      try {
+        console.error(`[TaskRunner] sendState failed: ${String(err?.message || err)}`);
+      } catch (_) {
+        // No additional reporting channel is available here.
+      }
     }
-    this._writeTaskState();
   }
 
   _writeMeta() {
@@ -217,7 +276,7 @@ class TaskRunner {
   }
 
   _writeTaskState() {
-    if (!this.state.runDir) return;
+    if (!this.state.runDir) return true;
     try {
       const queue = Array.isArray(this.state.queue) ? this.state.queue : [];
       const counts = queue.reduce((acc, item) => {
@@ -226,20 +285,38 @@ class TaskRunner {
         return acc;
       }, {});
       const payload = {
+        schemaVersion: TASK_STATE_SCHEMA_VERSION,
         runId: this.state.runId,
         runDir: this.state.runDir,
         updatedAt: nowIso(),
         running: Boolean(this.state.running),
         paused: Boolean(this.state.paused),
         pauseReason: this.state.pauseReason || '',
+        pausePending: Boolean(this.state.pausePending),
+        pauseRequestedAt: this.state.pauseRequestedAt || null,
+        stopPending: Boolean(this.state.stopPending),
+        stopRequestedAt: this.state.stopRequestedAt || null,
+        stopReason: this.state.stopReason || '',
+        finishReason: this.state.finishReason || '',
+        finishedAt: this.state.finishedAt || null,
+        skipPending: Boolean(this.state.skipPending),
+        skipRequestedAt: this.state.skipRequestedAt || null,
+        recoveryPending: Boolean(this.state.recoveryPending),
+        recoveredAt: this.state.recoveredAt || null,
         currentId: this.state.currentId || null,
         presetKey: this.state.presetKey,
+        templatePath: this.state.templatePath,
+        options: this.state.options || {},
         signingTask: this.state.signingTask || null,
         counts,
         queue: queue.map((item) => ({
           id: item.id,
           url: item.url,
           label: item.label || '',
+          note: item.note || '',
+          candidateStatus: item.candidateStatus || 'candidate',
+          priority: item.priority || '',
+          excludeReason: item.excludeReason || '',
           status: item.status,
           startedAt: item.startedAt || null,
           finishedAt: item.finishedAt || null,
@@ -251,9 +328,11 @@ class TaskRunner {
         logs: this.state.logs.slice(-80)
       };
       fs.mkdirSync(this.state.runDir, { recursive: true });
-      fs.writeFileSync(path.join(this.state.runDir, 'task_state.json'), JSON.stringify(payload, null, 2), 'utf-8');
-    } catch (_) {
-      // 状态文件是辅助产物，不能影响采集主流程。
+      fs.writeFileSync(path.join(this.state.runDir, TASK_STATE_FILE), JSON.stringify(payload, null, 2), 'utf-8');
+      return true;
+    } catch (err) {
+      this._recordPersistenceFailure(TASK_STATE_FILE, err);
+      return false;
     }
   }
 
@@ -269,42 +348,255 @@ class TaskRunner {
       const runsDir = this.deps.getRunsDir();
       fs.mkdirSync(runsDir, { recursive: true });
       return path.join(runsDir, SAFE_RUN_COOLDOWN_FILE);
-    } catch (_) {
+    } catch (err) {
+      this._recordPersistenceFailure(SAFE_RUN_COOLDOWN_FILE, err);
       return '';
     }
   }
 
-  _readLastFinishedAt() {
-    let fromFile = 0;
+  _readCooldownState() {
     const cooldownPath = this._getCooldownPath();
-    if (cooldownPath && fs.existsSync(cooldownPath)) {
-      try {
-        const payload = JSON.parse(fs.readFileSync(cooldownPath, 'utf-8'));
-        fromFile = Number(payload?.lastFinishedAt || 0);
-      } catch (_) {
-        fromFile = 0;
-      }
+    if (!cooldownPath) return { ok: false, error: '无法访问冷却状态文件' };
+    if (!fs.existsSync(cooldownPath)) {
+      return {
+        ok: true,
+        lastFinishedAt: Number(this._lastFinishedAt || 0),
+        activeRunId: '',
+        activeRunDir: '',
+        activeAt: null
+      };
     }
-    const value = Math.max(Number(this._lastFinishedAt || 0), Number(fromFile || 0));
-    if (Number.isFinite(value) && value > 0) this._lastFinishedAt = value;
-    return Number.isFinite(value) ? value : 0;
+    try {
+      const payload = JSON.parse(fs.readFileSync(cooldownPath, 'utf-8'));
+      const fromFile = Number(payload?.lastFinishedAt || 0);
+      if (!Number.isFinite(fromFile) || fromFile < 0) {
+        throw new Error('lastFinishedAt 不是合法时间戳');
+      }
+      const value = Math.max(Number(this._lastFinishedAt || 0), fromFile);
+      if (value > 0) this._lastFinishedAt = value;
+      return {
+        ok: true,
+        lastFinishedAt: value,
+        activeRunId: String(payload?.activeRunId || '').trim(),
+        activeRunDir: String(payload?.activeRunDir || '').trim(),
+        activeAt: Number(payload?.activeAt || 0) || null
+      };
+    } catch (err) {
+      this._recordPersistenceFailure(`${SAFE_RUN_COOLDOWN_FILE} 读取`, err);
+      return { ok: false, error: String(err?.message || err) };
+    }
+  }
+
+  _readLastFinishedAt() {
+    const result = this._readCooldownState();
+    return result.ok ? Number(result.lastFinishedAt || 0) : 0;
+  }
+
+  _writeCooldownState(payload) {
+    const cooldownPath = this._getCooldownPath();
+    if (!cooldownPath) return false;
+    try {
+      fs.writeFileSync(cooldownPath, JSON.stringify(payload, null, 2), 'utf-8');
+      return true;
+    } catch (err) {
+      this._recordPersistenceFailure(SAFE_RUN_COOLDOWN_FILE, err);
+      return false;
+    }
+  }
+
+  _markRunActive(runId, runDir, lastFinishedAt = 0) {
+    return this._writeCooldownState({
+      lastFinishedAt: Number(lastFinishedAt || 0),
+      lastFinishedAtIso: lastFinishedAt ? new Date(lastFinishedAt).toISOString() : null,
+      activeRunId: String(runId || ''),
+      activeRunDir: String(runDir || ''),
+      activeAt: Date.now(),
+      activeAtIso: nowIso()
+    });
   }
 
   _writeLastFinishedAt(ts = Date.now()) {
     const value = Number(ts || Date.now());
-    if (!Number.isFinite(value) || value <= 0) return;
+    if (!Number.isFinite(value) || value <= 0) return false;
     this._lastFinishedAt = value;
-    const cooldownPath = this._getCooldownPath();
-    if (!cooldownPath) return;
-    try {
-      fs.writeFileSync(
-        cooldownPath,
-        JSON.stringify({ lastFinishedAt: value, lastFinishedAtIso: new Date(value).toISOString() }, null, 2),
-        'utf-8'
-      );
-    } catch (_) {
-      // 冷却文件写入失败时仍保留内存冷却，不能影响当前收尾。
+    return this._writeCooldownState({
+      lastFinishedAt: value,
+      lastFinishedAtIso: new Date(value).toISOString(),
+      activeRunId: '',
+      activeRunDir: '',
+      activeAt: null,
+      activeAtIso: null
+    });
+  }
+
+  _launchLoop() {
+    if (this._loopPromise) return this._loopPromise;
+    const loopPromise = this._runLoop()
+      .catch((err) => {
+        this.state.running = false;
+        this.state.paused = false;
+        this.state.pauseReason = '任务循环异常，需从任务状态恢复';
+        this.state.pausePending = false;
+        this.state.pauseRequestedAt = null;
+        this.state.stopPending = false;
+        this.state.stopRequestedAt = null;
+        this.state.skipPending = false;
+        this.state.skipRequestedAt = null;
+        this.state.recoveryPending = true;
+        this.state.currentId = null;
+        this._skipRequested = false;
+        this._stopRequested = false;
+        this._recoveryPending = true;
+        this._appendLogLine('error', `任务循环异常，活动任务边界保持锁定：${String(err?.message || err)}`);
+        this._emitState();
+      })
+      .finally(() => {
+        if (this._loopPromise === loopPromise) this._loopPromise = null;
+      });
+    this._loopPromise = loopPromise;
+    return loopPromise;
+  }
+
+  recoverFromTaskState(runDir) {
+    if (this.state.running || this._loopPromise) {
+      return { ok: false, code: 'PGY_TASK_ALREADY_RUNNING', error: '当前已有运行中或待恢复的任务' };
     }
+
+    let runsDir;
+    let resolvedRunDir;
+    try {
+      runsDir = path.resolve(this.deps.getRunsDir());
+      resolvedRunDir = path.resolve(String(runDir || ''));
+    } catch (err) {
+      return { ok: false, code: 'PGY_TASK_STATE_PATH_INVALID', error: String(err?.message || err) };
+    }
+    if (!isPathInside(runsDir, resolvedRunDir)) {
+      return { ok: false, code: 'PGY_TASK_STATE_PATH_INVALID', error: '恢复目录必须位于本地 runs 目录内' };
+    }
+
+    const taskStatePath = path.join(resolvedRunDir, TASK_STATE_FILE);
+    let payload;
+    try {
+      payload = JSON.parse(fs.readFileSync(taskStatePath, 'utf-8'));
+    } catch (err) {
+      this._recordPersistenceFailure(`${TASK_STATE_FILE} 读取`, err);
+      return { ok: false, code: 'PGY_TASK_STATE_INVALID', error: `任务状态不可读：${String(err?.message || err)}` };
+    }
+
+    const runId = String(payload?.runId || '').trim();
+    const templatePath = String(payload?.templatePath || '').trim();
+    const rawQueue = Array.isArray(payload?.queue) ? payload.queue : [];
+    const allowedStatuses = new Set(['pending', 'running', 'paused', 'ok', 'fail', 'skipped']);
+    const ids = new Set();
+    const invalidQueue = rawQueue.length < 1
+      || rawQueue.length > SAFE_BATCH_LIMIT
+      || rawQueue.some((item) => {
+        const id = String(item?.id || '').trim();
+        const status = String(item?.status || '').trim();
+        if (!id || ids.has(id) || !allowedStatuses.has(status) || !isAllowedTaskUrl(item?.url)) return true;
+        ids.add(id);
+        return false;
+      });
+    const hasUnfinished = rawQueue.some((item) => ['pending', 'running', 'paused'].includes(String(item?.status || '')));
+    if (
+      Number(payload?.schemaVersion || 0) < TASK_STATE_SCHEMA_VERSION
+      || !runId
+      || !templatePath
+      || invalidQueue
+      || !hasUnfinished
+    ) {
+      return {
+        ok: false,
+        code: hasUnfinished ? 'PGY_TASK_STATE_INVALID' : 'PGY_TASK_ALREADY_FINISHED',
+        error: hasUnfinished
+          ? '任务状态缺少可安全恢复的版本、模板或合法队列信息'
+          : '该任务已经结束，没有可恢复的未完成项'
+      };
+    }
+
+    const cooldownState = this._readCooldownState();
+    if (!cooldownState.ok) {
+      return { ok: false, code: 'PGY_COOLDOWN_STATE_INVALID', error: '无法确认恢复任务的冷却边界' };
+    }
+    if (cooldownState.activeRunId && cooldownState.activeRunId !== runId) {
+      return {
+        ok: false,
+        code: 'PGY_UNFINISHED_RUN',
+        runId: cooldownState.activeRunId,
+        error: `冷却状态指向另一未完成任务 ${cooldownState.activeRunId}`
+      };
+    }
+    if (
+      cooldownState.activeRunId
+      && cooldownState.activeRunDir
+      && path.resolve(cooldownState.activeRunDir) !== resolvedRunDir
+    ) {
+      return { ok: false, code: 'PGY_TASK_STATE_PATH_INVALID', error: '未完成任务目录与冷却状态不一致' };
+    }
+    if (!cooldownState.activeRunId && !this._markRunActive(runId, resolvedRunDir, cooldownState.lastFinishedAt)) {
+      return { ok: false, code: 'PGY_COOLDOWN_PERSIST_FAILED', error: '无法持久化恢复任务的活动边界' };
+    }
+
+    const presetKey = normalizePresetKey(payload?.presetKey || 'standard');
+    const preset = TASK_PRESETS[presetKey] || TASK_PRESETS.standard;
+    const requestedOptions = payload?.options && typeof payload.options === 'object' ? payload.options : {};
+    const requestedTabWaitMs = Number(requestedOptions.tabWaitMs || 0);
+    const recoveredAt = Date.now();
+    this.state = {
+      ...this.state,
+      running: true,
+      paused: true,
+      pauseReason: '检测到未完成任务，等待人工确认后继续',
+      pausePending: false,
+      pauseRequestedAt: null,
+      stopPending: false,
+      stopRequestedAt: null,
+      stopReason: '',
+      finishReason: '',
+      finishedAt: null,
+      skipPending: false,
+      skipRequestedAt: null,
+      recoveryPending: true,
+      recoveredAt,
+      presetKey: preset.key,
+      templatePath,
+      options: {
+        ...requestedOptions,
+        tabWaitMs: Number.isFinite(requestedTabWaitMs) && requestedTabWaitMs > 0
+          ? Math.max(preset.tabWaitMs, requestedTabWaitMs)
+          : preset.tabWaitMs,
+        resolveNoteUrlByClick: false,
+        resolveLimit: 0
+      },
+      signingTask: normalizeSigningTask(payload?.signingTask || {}),
+      runId,
+      runDir: resolvedRunDir,
+      currentId: null,
+      queue: rawQueue.map((item) => ({
+        id: String(item.id),
+        url: normalizeTaskUrl(item.url),
+        label: String(item.label || ''),
+        note: String(item.note || ''),
+        candidateStatus: String(item.candidateStatus || 'candidate'),
+        priority: String(item.priority || ''),
+        excludeReason: String(item.excludeReason || ''),
+        status: ['running', 'paused'].includes(String(item.status)) ? 'pending' : String(item.status),
+        startedAt: ['running', 'paused'].includes(String(item.status)) ? null : (item.startedAt || null),
+        finishedAt: item.finishedAt || null,
+        error: ['running', 'paused'].includes(String(item.status)) ? '' : String(item.error || ''),
+        subRunId: String(item.subRunId || ''),
+        subRunDir: String(item.subRunDir || ''),
+        jsonPath: String(item.jsonPath || '')
+      })),
+      logs: Array.isArray(payload?.logs) ? payload.logs.slice(-79) : [],
+      persistenceError: null
+    };
+    this._skipRequested = false;
+    this._stopRequested = false;
+    this._recoveryPending = true;
+    this._appendLogLine('warn', '已恢复未完成任务；当前保持暂停，需人工确认后继续');
+    this._emitState();
+    return { ok: true, runId, runDir: resolvedRunDir, recoveryPending: true };
   }
 
   async start(payload) {
@@ -332,7 +624,24 @@ class TaskRunner {
         error: `为了降低平台风控风险，单次最多采集 ${SAFE_BATCH_LIMIT} 个达人。请拆成多批，或先导出候选表分批执行。`
       };
     }
-    const lastFinishedAt = this._readLastFinishedAt();
+    const cooldownState = this._readCooldownState();
+    if (!cooldownState.ok) {
+      return {
+        ok: false,
+        code: 'PGY_COOLDOWN_STATE_INVALID',
+        error: `无法确认已有冷却边界，已停止新任务：${cooldownState.error || '冷却状态不可读'}`
+      };
+    }
+    if (cooldownState.activeRunId) {
+      return {
+        ok: false,
+        code: 'PGY_UNFINISHED_RUN',
+        runId: cooldownState.activeRunId,
+        runDir: cooldownState.activeRunDir || '',
+        error: `检测到未完成任务 ${cooldownState.activeRunId}。请先恢复并处理该任务，不能通过重启直接开始新批次。`
+      };
+    }
+    const lastFinishedAt = Number(cooldownState.lastFinishedAt || 0);
     const elapsedSinceLastRun = Date.now() - Number(lastFinishedAt || 0);
     if (lastFinishedAt && elapsedSinceLastRun < SAFE_RUN_COOLDOWN_MS) {
       const remainingMs = SAFE_RUN_COOLDOWN_MS - elapsedSinceLastRun;
@@ -348,6 +657,13 @@ class TaskRunner {
     const runId = this.deps.makeRunId();
     const runDir = path.join(this.deps.getRunsDir(), runId);
     fs.mkdirSync(runDir, { recursive: true });
+    if (!this._markRunActive(runId, runDir, lastFinishedAt)) {
+      return {
+        ok: false,
+        code: 'PGY_COOLDOWN_PERSIST_FAILED',
+        error: '无法持久化当前批次的冷却边界，已停止启动，避免崩溃重启后绕过安全间隔。'
+      };
+    }
 
     const requestedOptions = payload?.options && typeof payload.options === 'object' ? payload.options : {};
     const requestedTabWaitMs = Number(requestedOptions.tabWaitMs || 0);
@@ -388,49 +704,81 @@ class TaskRunner {
         subRunDir: '',
         jsonPath: ''
       })),
-      logs: []
+      logs: [],
+      pausePending: false,
+      pauseRequestedAt: null,
+      stopPending: false,
+      stopRequestedAt: null,
+      stopReason: '',
+      finishReason: '',
+      finishedAt: null,
+      skipPending: false,
+      skipRequestedAt: null,
+      recoveryPending: false,
+      recoveredAt: null,
+      persistenceError: null
     };
 
-    this._skipAfterCurrent = false;
+    this._skipRequested = false;
+    this._stopRequested = false;
+    this._recoveryPending = false;
     this._log('info', `任务开始：${items.length} 条，预设=${preset.label}，签约任务=${signingTask.taskName}`);
     this._writeMeta();
     this._emitState();
 
-    this._loopPromise = this._runLoop().catch((err) => {
-      this._log('error', `任务循环异常：${String(err?.message || err)}`);
-      this.state.running = false;
-      this.state.paused = false;
-      this.state.pauseReason = '';
-      this._writeLastFinishedAt(Date.now());
-      this._emitState();
-    });
+    this._launchLoop();
 
     return { ok: true, runId, runDir };
   }
 
   async pause(reason = 'user') {
     if (!this.state.running) return { ok: false, error: '当前没有运行中的任务' };
-    if (this.state.paused) return { ok: true };
+    if (this.state.paused) return { ok: true, pending: false, paused: true };
+    if (this.state.pausePending) {
+      return { ok: true, pending: true, message: '暂停请求已登记：完成当前达人后暂停' };
+    }
+
+    const pauseReason = reason === 'user' ? '用户请求：完成当前达人后暂停' : String(reason || '暂停');
+    if (this.state.currentId) {
+      this.state.pausePending = true;
+      this.state.pauseRequestedAt = Date.now();
+      this._log('warn', `已请求暂停：完成当前达人后暂停（${this.state.currentId}）`);
+      return { ok: true, pending: true, message: '完成当前达人后暂停' };
+    }
+
     this.state.paused = true;
-    this.state.pauseReason = reason === 'user' ? '用户暂停' : String(reason || '暂停');
-    this._log('warn', `已暂停：${this.state.pauseReason}`);
+    this.state.pauseReason = pauseReason;
     this._newPauseGate();
-    this._emitState();
-    return { ok: true };
+    this._log('warn', `已暂停：${this.state.pauseReason}`);
+    return { ok: true, pending: false, paused: true };
   }
 
   async resume() {
     if (!this.state.running) return { ok: false, error: '当前没有运行中的任务' };
+    if (this.state.pausePending && !this.state.paused) {
+      this.state.pausePending = false;
+      this.state.pauseRequestedAt = null;
+      this._log('info', '已取消“完成当前达人后暂停”的请求');
+      return { ok: true, cancelledPendingPause: true };
+    }
     if (!this.state.paused) return { ok: true };
     this.state.paused = false;
     const reason = this.state.pauseReason;
     this.state.pauseReason = '';
-    this._log('info', `继续执行（上次暂停原因：${reason || '-'}）`);
+    this.state.pausePending = false;
+    this.state.pauseRequestedAt = null;
+    if (this._recoveryPending) {
+      this._recoveryPending = false;
+      this.state.recoveryPending = false;
+      this._log('info', `继续恢复任务（暂停原因：${reason || '-'}）`);
+      this._launchLoop();
+      return { ok: true, recovered: true };
+    }
     const r = this._pauseGateResolve;
     this._pauseGateResolve = null;
     this._pauseGate = null;
     r?.('resume');
-    this._emitState();
+    this._log('info', `继续执行（上次暂停原因：${reason || '-'}）`);
     return { ok: true };
   }
 
@@ -438,22 +786,117 @@ class TaskRunner {
     if (!this.state.running) return { ok: false, error: '当前没有运行中的任务' };
     if (!this.state.currentId) return { ok: false, error: '当前没有正在处理的任务' };
 
-    // 若在暂停点，直接解锁并跳过；若正在执行中，则标记“结束后跳过”
+    // 人工介入暂停点已经是安全点，可立即结束当前项。
     if (this.state.paused && this._pauseGateResolve) {
-      this._log('warn', `跳过当前（${this.state.currentId}）`);
       const r = this._pauseGateResolve;
       this._pauseGateResolve = null;
       this._pauseGate = null;
       this.state.paused = false;
       this.state.pauseReason = '';
+      this.state.skipPending = false;
+      this.state.skipRequestedAt = null;
+      this._skipRequested = false;
       r('skip');
-      this._emitState();
-      return { ok: true };
+      this._log('warn', `在安全暂停点跳过当前（${this.state.currentId}）`);
+      return { ok: true, pending: false };
     }
 
-    this._skipAfterCurrent = true;
-    this._log('warn', `已标记：当前任务结束后跳过（${this.state.currentId}）`);
-    return { ok: true };
+    if (this._skipRequested) return { ok: true, pending: true };
+    this._skipRequested = true;
+    this.state.skipPending = true;
+    this.state.skipRequestedAt = Date.now();
+    this._wakeControlWaiters('skip');
+    this._log('warn', `已请求跳过：将在下一个安全点停止当前项（${this.state.currentId}）`);
+    return { ok: true, pending: true, message: '将在下一个安全点停止当前项' };
+  }
+
+  async stop(reason = 'user') {
+    if (!this.state.running) return { ok: false, error: '当前没有运行中的任务' };
+    if (this._stopRequested) {
+      return { ok: true, pending: true, message: '停止请求已登记，正在等待安全点' };
+    }
+
+    this._stopRequested = true;
+    this.state.stopPending = true;
+    this.state.stopRequestedAt = Date.now();
+    this.state.stopReason = reason === 'user' ? '用户停止整批任务' : String(reason || '停止整批任务');
+    this.state.pausePending = false;
+    this.state.pauseRequestedAt = null;
+    this._wakeControlWaiters('stop');
+    if (this._pauseGateResolve) {
+      const resolve = this._pauseGateResolve;
+      this._pauseGateResolve = null;
+      this._pauseGate = null;
+      this.state.paused = false;
+      this.state.pauseReason = '';
+      resolve('stop');
+    }
+    this._log('warn', this.state.currentId
+      ? `已请求停止整批任务：将在下一个安全点结束当前达人（${this.state.currentId}）`
+      : '已请求停止整批任务：将在启动下一位达人前结束');
+    return { ok: true, pending: true, message: '将在下一个安全点停止整批任务' };
+  }
+
+  _wakeControlWaiters(action) {
+    for (const resolve of Array.from(this._controlWaiters)) resolve(action);
+  }
+
+  _waitForSafePoint(ms) {
+    if (this._stopRequested) return Promise.resolve('stop');
+    if (this._skipRequested) return Promise.resolve('skip');
+    const delayMs = Math.max(0, Number(ms || 0));
+    if (!delayMs) return Promise.resolve('continue');
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (action) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this._controlWaiters.delete(finish);
+        resolve(action || 'continue');
+      };
+      const timer = setTimeout(() => finish('continue'), delayMs);
+      this._controlWaiters.add(finish);
+    });
+  }
+
+  _stopItemIfSkipRequested(item) {
+    if (!this._skipRequested) return false;
+    item.status = 'skipped';
+    item.finishedAt = Date.now();
+    item.error = '用户请求跳过；已在安全点停止';
+    this._skipRequested = false;
+    this.state.skipPending = false;
+    this.state.skipRequestedAt = null;
+    this._appendLogLine('warn', `已在安全点跳过：${item.url}`);
+    this._emitState();
+    return true;
+  }
+
+  _stopRunIfRequested(item) {
+    if (!this._stopRequested) return false;
+    const now = Date.now();
+    if (item && ['pending', 'running', 'paused'].includes(String(item.status || ''))) {
+      item.status = 'skipped';
+      item.finishedAt = now;
+      item.error = '用户停止整批任务；当前项已在安全点结束';
+    }
+    for (const queued of this.state.queue) {
+      if (queued === item || String(queued.status || '') !== 'pending') continue;
+      queued.status = 'skipped';
+      queued.finishedAt = now;
+      queued.error = '整批任务已停止，未执行';
+    }
+    this.state.skipPending = false;
+    this.state.skipRequestedAt = null;
+    this._skipRequested = false;
+    this._appendLogLine('warn', '整批任务已在安全点停止，后续达人不会继续执行');
+    this._emitState();
+    return true;
+  }
+
+  _stopItemIfControlRequested(item) {
+    return this._stopRunIfRequested(item) || this._stopItemIfSkipRequested(item);
   }
 
   async _waitIfPaused() {
@@ -466,36 +909,49 @@ class TaskRunner {
   async _pauseForManualIntervention(reason, item) {
     this.state.paused = true;
     this.state.pauseReason = reason;
+    this.state.pausePending = false;
+    this.state.pauseRequestedAt = null;
     if (item) item.status = 'paused';
-    this._log('warn', `需要手工介入：${reason}`);
     this._newPauseGate();
-    this._emitState();
+    this._log('warn', `需要手工介入：${reason}`);
     const action = await this._waitIfPaused();
     return action;
+  }
+
+  async _pauseBetweenItemsIfRequested(hasMorePendingItems) {
+    if (!this.state.pausePending) return;
+    if (!hasMorePendingItems) {
+      this.state.pausePending = false;
+      this.state.pauseRequestedAt = null;
+      return;
+    }
+    this.state.pausePending = false;
+    this.state.pauseRequestedAt = null;
+    this.state.paused = true;
+    this.state.pauseReason = '用户请求：已完成当前达人，现已暂停';
+    this._newPauseGate();
+    this._log('warn', '当前达人已完成，任务现已暂停');
+    await this._waitIfPaused();
   }
 
   async _runLoop() {
     const preset = TASK_PRESETS[this.state.presetKey] || TASK_PRESETS.standard;
     for (let i = 0; i < this.state.queue.length; i++) {
+      if (this._stopRequested) break;
       const item = this.state.queue[i];
       if (item.status !== 'pending') continue;
+
+      // 任务间暂停不把下一位达人伪装成 running。
+      if (this.state.paused) await this._waitIfPaused();
+      if (this._stopRequested) break;
 
       this.state.currentId = item.id;
       item.status = 'running';
       item.startedAt = Date.now();
-      this._skipAfterCurrent = false;
+      this._skipRequested = false;
+      this.state.skipPending = false;
+      this.state.skipRequestedAt = null;
       this._emitState();
-
-      // 整体暂停点（用户点暂停）
-      if (this.state.paused) {
-        const action = await this._waitIfPaused();
-        if (action === 'skip') {
-          item.status = 'skipped';
-          item.finishedAt = Date.now();
-          this._emitState();
-          continue;
-        }
-      }
 
       const creatorId = safeName(`${i + 1}_${item.url}`).slice(0, 60);
       const subRunId = `${this.state.runId}/${creatorId}`;
@@ -503,12 +959,21 @@ class TaskRunner {
       // 为每个 URL 做“可重试”的 loop：遇到登录态/抽取失败时暂停，resume 后重试
       let done = false;
       while (!done) {
+        if (this._stopItemIfControlRequested(item)) {
+          done = true;
+          continue;
+        }
         // 1) 打开 creator_url
         try {
           this._log('info', `打开：${item.url}`);
           await this.deps.openUrl(item.url);
-          await sleep(jitteredDelayMs(preset.pageWaitMs, preset.pageWaitJitterMs));
+          // 跳过会立即结束页面等待，但仍需先做一次登录/风控检查。
+          await this._waitForSafePoint(jitteredDelayMs(preset.pageWaitMs, preset.pageWaitJitterMs));
         } catch (err) {
+          if (this._stopItemIfControlRequested(item)) {
+            done = true;
+            continue;
+          }
           item.error = `打开失败：${String(err?.message || err)}`;
           const action = await this._pauseForManualIntervention(item.error, item);
           if (action === 'skip') {
@@ -519,6 +984,11 @@ class TaskRunner {
             item.status = 'running';
           }
           this._emitState();
+          continue;
+        }
+
+        if (this._stopItemIfControlRequested(item)) {
+          done = true;
           continue;
         }
 
@@ -537,8 +1007,24 @@ class TaskRunner {
             this._emitState();
             continue;
           }
+          if (!isSameTaskPage(item.url, curUrl)) {
+            const action = await this._pauseForManualIntervention(
+              '页面已离开当前达人，已停止抽取。请不要在采集运行时导航或切换网页；点击继续后会重新打开当前达人。',
+              item
+            );
+            if (action === 'skip') {
+              item.status = 'skipped';
+              item.finishedAt = Date.now();
+              done = true;
+            } else {
+              item.status = 'running';
+            }
+            this._emitState();
+            continue;
+          }
 
           const login = await this.deps.checkLogin();
+          // 风控结果优先于用户跳过，防止跳过当前项后继续请求下一位。
           if (login?.ok && login?.riskDetected) {
             const action = await this._pauseForManualIntervention(
               `检测到页面可能触发安全验证/风控：${login.riskText || '请在右侧手工确认后继续'}`,
@@ -552,6 +1038,10 @@ class TaskRunner {
               item.status = 'running';
             }
             this._emitState();
+            continue;
+          }
+          if (this._stopItemIfControlRequested(item)) {
+            done = true;
             continue;
           }
           if (login?.ok && login?.loggedIn === false) {
@@ -568,23 +1058,26 @@ class TaskRunner {
           }
         } catch (_) {
           // best-effort：不阻断
+          if (this._stopItemIfControlRequested(item)) {
+            done = true;
+            continue;
+          }
         }
 
         // 3) 调用抽取（使用当前模板）
+        if (this._stopItemIfControlRequested(item)) {
+          done = true;
+          continue;
+        }
         this._log('info', `抽取中：${item.url}`);
         const r = await this.deps.extractCurrentMultiPage(this.state.templatePath, {
           ...this.state.options,
-          runId: subRunId
+          runId: subRunId,
+          expectedCreatorName: item.label || ''
         });
 
-        if (this._skipAfterCurrent) {
-          item.status = 'skipped';
-          item.finishedAt = Date.now();
-          item.error = '用户请求跳过';
-          this._skipAfterCurrent = false;
-          this._log('warn', `已跳过：${item.url}`);
+        if (this._stopItemIfControlRequested(item)) {
           done = true;
-          this._emitState();
           continue;
         }
 
@@ -592,6 +1085,10 @@ class TaskRunner {
           item.error = r?.riskDetected
             ? `检测到页面可能触发安全验证/风控：${r?.riskText || r?.error || '请在右侧手工确认后继续'}`
             : `抽取失败：${r?.error || 'unknown error'}`;
+          if (!r?.riskDetected && this._stopItemIfControlRequested(item)) {
+            done = true;
+            continue;
+          }
           const action = await this._pauseForManualIntervention(item.error, item);
           if (action === 'skip') {
             item.status = 'skipped';
@@ -601,6 +1098,11 @@ class TaskRunner {
             item.status = 'running';
           }
           this._emitState();
+          continue;
+        }
+
+        if (this._stopItemIfControlRequested(item)) {
+          done = true;
           continue;
         }
 
@@ -614,15 +1116,35 @@ class TaskRunner {
         this._emitState();
         done = true;
       }
+
+      this.state.currentId = null;
+      if (this._stopRequested) break;
+      const hasMorePendingItems = this.state.queue.slice(i + 1).some((queued) => queued.status === 'pending');
+      await this._pauseBetweenItemsIfRequested(hasMorePendingItems);
     }
 
+    if (this._stopRequested) this._stopRunIfRequested(null);
+    const stoppedByUser = this._stopRequested;
+    const finishedAt = Date.now();
     this.state.running = false;
     this.state.paused = false;
     this.state.pauseReason = '';
+    this.state.pausePending = false;
+    this.state.pauseRequestedAt = null;
+    this.state.stopPending = false;
+    this.state.stopRequestedAt = null;
+    this.state.stopReason = stoppedByUser ? (this.state.stopReason || '用户停止整批任务') : '';
+    this.state.finishReason = stoppedByUser ? 'stopped_by_user' : 'completed';
+    this.state.finishedAt = finishedAt;
+    this.state.skipPending = false;
+    this.state.skipRequestedAt = null;
+    this.state.recoveryPending = false;
     this.state.currentId = null;
-    this._writeLastFinishedAt(Date.now());
-    this._log('info', '任务队列已结束');
-    this._emitState();
+    this._skipRequested = false;
+    this._stopRequested = false;
+    this._recoveryPending = false;
+    this._writeLastFinishedAt(finishedAt);
+    this._log(stoppedByUser ? 'warn' : 'info', stoppedByUser ? '任务已由用户安全停止' : '任务队列已完成');
   }
 }
 
@@ -632,8 +1154,11 @@ module.exports = {
   SAFE_BATCH_LIMIT,
   SAFE_RUN_COOLDOWN_MS,
   SAFE_RUN_COOLDOWN_FILE,
+  TASK_STATE_FILE,
+  TASK_STATE_SCHEMA_VERSION,
   ALLOWED_TASK_HOSTS,
   isAllowedTaskUrl,
+  isSameTaskPage,
   jitteredDelayMs,
   normalizePresetKey,
   normalizeTaskUrl

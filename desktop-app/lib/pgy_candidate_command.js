@@ -180,11 +180,11 @@ function buildSearchCandidateExtractionScript(requestedCount = MAX_CANDIDATE_COU
       const normalizeRecord = (raw) => {
         const obj = unwrap(raw);
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
-        const id = first(obj, ['userId', 'kolId', 'bloggerId', 'creatorId', 'user_id', 'kol_id', 'id']);
-        const name = first(obj, ['name', 'kolName', 'creatorName', 'nickName', 'nickname', 'userName']);
-        const fans = first(obj, ['fansNum', 'fansCnt', 'fansCount', 'followers', 'followerCount']);
-        const read = first(obj, ['clickMidNum', 'readCnt', 'readMedian', 'readCount']);
-        const interact = first(obj, ['mEngagementNum', 'interCnt', 'interactMedian', 'engagementCount']);
+        const id = first(obj, ['userId', 'kolId', 'bloggerId', 'creatorId', 'authorId', 'accountId', 'user_id', 'kol_id', 'author_id', 'account_id', 'id']);
+        const name = first(obj, ['name', 'kolName', 'bloggerName', 'creatorName', 'nickName', 'nickname', 'nick_name', 'userName']);
+        const fans = first(obj, ['fansNum', 'fansCnt', 'fansCount', 'fans_count', 'followers', 'followerCount']);
+        const read = first(obj, ['clickMidNum', 'readCnt', 'readMedian', 'readCount', 'read_count']);
+        const interact = first(obj, ['mEngagementNum', 'interCnt', 'interactMedian', 'engagementCount', 'engagement_count']);
         const existingUrl = first(obj, ['pgyUrl', 'detailUrl', 'profileUrl', 'url']);
         const idLooksValid = /^[A-Za-z0-9_-]{6,128}$/.test(id);
         const businessSignals = [fans, read, interact, first(obj, ['picturePrice', 'videoPrice', 'contentTags', 'personalTags'])].filter(Boolean).length;
@@ -266,19 +266,38 @@ function buildSearchCandidateExtractionScript(requestedCount = MAX_CANDIDATE_COU
         let names = [];
         try { names = Object.getOwnPropertyNames(node); } catch (_) {}
         for (const prop of names) {
-          if (!/^__vueParentComponent|^__vue_app__/.test(prop)) continue;
-          let component = null;
-          try { component = node[prop]?._instance || node[prop]; } catch (_) {}
-          for (let depth = 0; component && depth < 14; depth += 1) {
-            if (components.has(component)) break;
-            components.add(component);
-            const name = clean(component.type && (component.type.__name || component.type.name), 80) || 'component';
-            inspectContainer(component.props, name + '.props');
-            inspectContainer(component.setupState, name + '.setupState');
-            inspectContainer(component.data, name + '.data');
-            inspectContainer(component.ctx, name + '.ctx');
-            inspectContainer(component.subTree && component.subTree.props, name + '.subTree.props');
-            component = component.parent;
+          if (/^__vueParentComponent|^__vue_app__/.test(prop)) {
+            let component = null;
+            try { component = node[prop]?._instance || node[prop]; } catch (_) {}
+            for (let depth = 0; component && depth < 14; depth += 1) {
+              if (components.has(component)) break;
+              components.add(component);
+              const name = clean(component.type && (component.type.__name || component.type.name), 80) || 'component';
+              inspectContainer(component.props, name + '.props');
+              inspectContainer(component.setupState, name + '.setupState');
+              inspectContainer(component.data, name + '.data');
+              inspectContainer(component.ctx, name + '.ctx');
+              inspectContainer(component.subTree && component.subTree.props, name + '.subTree.props');
+              component = component.parent;
+            }
+            continue;
+          }
+          if (/^__reactProps\$/.test(prop)) {
+            try { inspectContainer(node[prop], 'react.props'); } catch (_) {}
+            continue;
+          }
+          if (/^__reactFiber\$/.test(prop)) {
+            let fiber = null;
+            try { fiber = node[prop]; } catch (_) {}
+            for (let depth = 0; fiber && depth < 16; depth += 1) {
+              if (components.has(fiber)) break;
+              components.add(fiber);
+              const name = clean(fiber.elementType && (fiber.elementType.displayName || fiber.elementType.name), 80) || 'react-fiber';
+              inspectContainer(fiber.memoizedProps, name + '.memoizedProps');
+              inspectContainer(fiber.pendingProps, name + '.pendingProps');
+              inspectContainer(fiber.memoizedState, name + '.memoizedState');
+              fiber = fiber.return;
+            }
           }
         }
       }
@@ -324,13 +343,15 @@ function buildSearchCandidateExtractionScript(requestedCount = MAX_CANDIDATE_COU
   `;
 }
 
-function buildSearchPaginationScript(action = 'inspect', targetPage = 1) {
+function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options = {}) {
   const safeAction = ['inspect', 'next', 'goto'].includes(action) ? action : 'inspect';
   const safeTargetPage = Math.max(1, Number(targetPage || 1));
+  const paginationSelector = String(options?.paginationSelector || '').trim().slice(0, 500);
   return `
     (function(){
       const action = ${JSON.stringify(safeAction)};
       const targetPage = ${JSON.stringify(safeTargetPage)};
+      const paginationSelector = ${JSON.stringify(paginationSelector)};
       const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
       const visible = (element) => {
         if (!element || element.nodeType !== 1) return false;
@@ -339,50 +360,212 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1) {
         const style = getComputedStyle(element);
         return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
       };
-      const jumpInput = Array.from(document.querySelectorAll('input')).find((input) => {
+      const numericPage = (element) => {
+        const parts = clean(element?.innerText || element?.textContent).split(/\\s+/).filter(Boolean);
+        if (!parts.length || parts.some((part) => !/^\\d+$/.test(part))) return null;
+        if (new Set(parts).size !== 1) return null;
+        const value = Number(parts[0]);
+        return Number.isInteger(value) && value >= 1 ? value : null;
+      };
+      const paginationControlsWithin = (element) => Array.from(element?.querySelectorAll?.(
+        'button,a,[role="button"],[tabindex],[class*="page" i],[class*="next" i],[class*="prev" i]'
+      ) || []).filter((candidate) => candidate !== element && visible(candidate));
+      const paginationSequenceSize = (element) => new Set(
+        paginationControlsWithin(element).map(numericPage).filter((value) => value != null)
+      ).size;
+      let calibratedRoot = null;
+      if (paginationSelector) {
+        try {
+          const selected = document.querySelector(paginationSelector);
+          if (visible(selected)) calibratedRoot = selected;
+        } catch (_) {}
+      }
+      const inputScope = calibratedRoot || document;
+      const inputCandidates = Array.from(inputScope.querySelectorAll('input')).filter(visible);
+      const findPaginationAncestor = (input) => {
+        for (let ancestor = input?.parentElement, depth = 0; ancestor && depth < 10; ancestor = ancestor.parentElement, depth += 1) {
+          const className = String(ancestor.className || '');
+          if (/pagination|pager/i.test(className) && visible(ancestor) && paginationSequenceSize(ancestor) >= 2) {
+            return ancestor;
+          }
+        }
+        return null;
+      };
+      const semanticJumpInput = inputCandidates.find((input) => {
+        const ancestor = findPaginationAncestor(input);
+        if (!visible(ancestor)) return false;
+        const text = clean(ancestor.innerText || ancestor.textContent);
+        return text.includes('跳至') && text.includes('页') && paginationSequenceSize(ancestor) >= 2;
+      });
+      const jumpInput = semanticJumpInput || inputCandidates.find((input) => {
         if (!visible(input)) return false;
         let parent = input.parentElement;
         for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
           const text = clean(parent.innerText || parent.textContent);
-          if (text.includes('跳至') && text.includes('页')) return true;
+          const rect = parent.getBoundingClientRect?.();
+          if (
+            rect && rect.height <= 180
+            && text.includes('跳至') && text.includes('页')
+            && paginationSequenceSize(parent) >= 2
+          ) return true;
         }
         return false;
       });
-      let root = jumpInput?.parentElement || null;
+      const paginationAncestor = findPaginationAncestor(jumpInput);
+      let root = calibratedRoot || (visible(paginationAncestor) ? paginationAncestor : null);
+      if (!root && jumpInput) {
+        for (let ancestor = jumpInput.parentElement, depth = 0; ancestor && depth < 8; ancestor = ancestor.parentElement, depth += 1) {
+          if (visible(ancestor) && paginationSequenceSize(ancestor) >= 2) {
+            root = ancestor;
+            break;
+          }
+        }
+      }
+      if (!root) root = jumpInput?.parentElement || null;
       for (let depth = 0; root && depth < 7; depth += 1) {
+        if (calibratedRoot) break;
         const rect = root.getBoundingClientRect?.();
         const text = clean(root.innerText || root.textContent);
-        if (rect && rect.width >= 180 && rect.height <= 140 && text.includes('跳至') && text.includes('页')) break;
+        if (
+          rect && rect.width >= 180 && rect.height <= 180
+          && text.includes('跳至') && text.includes('页')
+          && paginationSequenceSize(root) >= 2
+        ) break;
         root = root.parentElement;
       }
       if (!root) {
-        const explicit = document.querySelector('[class*="pagination" i],[class*="pager" i]');
-        if (visible(explicit)) root = explicit;
+        const explicit = Array.from(document.querySelectorAll('[class*="pagination" i],[class*="pager" i]'))
+          .filter(visible)
+          .sort((left, right) => paginationSequenceSize(right) - paginationSequenceSize(left))[0]
+          || document.querySelector('[class*="pagination" i],[class*="pager" i]');
+        if (explicit) root = explicit;
       }
-      if (!root) return { ok: false, clicked: false, error: '未识别到分页控件' };
+      if (!root) {
+        return {
+          ok: false,
+          clicked: false,
+          currentPage: null,
+          currentPageKnown: false,
+          firstPageKnown: false,
+          atFirstPage: false,
+          error: '未识别到分页控件'
+        };
+      }
+      const selectorFor = (element) => {
+        if (!element || element.nodeType !== 1) return '';
+        const escape = (value) => {
+          try { return CSS.escape(value); } catch (_) { return String(value).replace(/[^A-Za-z0-9_-]/g, '\\$&'); }
+        };
+        if (element.id) {
+          const byId = '#' + escape(element.id);
+          try { if (document.querySelectorAll(byId).length === 1) return byId; } catch (_) {}
+        }
+        const classes = String(element.className || '').split(/\\s+/)
+          .filter((value) => /^[A-Za-z_][A-Za-z0-9_-]{1,80}$/.test(value))
+          .filter((value) => /pagination|pager/i.test(value))
+          .slice(0, 3);
+        if (classes.length) {
+          const byClass = classes.map((value) => '.' + escape(value)).join('');
+          try { if (document.querySelectorAll(byClass).length === 1) return byClass; } catch (_) {}
+          return byClass;
+        }
+        return '';
+      };
+      const rootSelector = paginationSelector || selectorFor(root);
       const isDisabled = (element) => Boolean(
         element.disabled
         || element.getAttribute?.('aria-disabled') === 'true'
         || /disabled/.test(String(element.className || '').toLowerCase())
       );
       const rawControls = Array.from(root.querySelectorAll('button,a,[role="button"],[tabindex],[class*="page" i],[class*="next" i],[class*="prev" i]'));
-      const controls = rawControls.filter((element, index) => (
+      const allControls = rawControls.filter((element, index) => (
         element !== root
         && visible(element)
-        && !isDisabled(element)
         && rawControls.indexOf(element) === index
       ));
-      const current = controls.find((element) => (
+      const controls = allControls.filter((element) => !isDisabled(element));
+      const pageControls = allControls.filter((element) => numericPage(element) != null);
+      const pageNumbers = Array.from(new Set(pageControls.map(numericPage)));
+      const current = pageControls.find((element) => (
         element.getAttribute?.('aria-current') === 'page'
-        || /active|current|selected/.test(String(element.className || '').toLowerCase())
+        || /active|current|selected|--color-bg-primary-light|\\bbold\\b/.test(String(element.className || '').toLowerCase())
+        || /active|current|selected|--color-bg-primary-light|\\bbold\\b/.test(String(element.parentElement?.className || '').toLowerCase())
       ));
-      const currentPage = Number(clean(current?.innerText || current?.textContent)) || 1;
-      if (action === 'inspect') return { ok: true, clicked: false, currentPage, controlCount: controls.length };
+      const currentPage = current ? numericPage(current) : null;
+      const currentPageKnown = Number.isInteger(currentPage) && currentPage >= 1;
+      const previousControl = allControls.find((element) => {
+        const label = clean([
+          element.getAttribute?.('aria-label'),
+          element.getAttribute?.('title'),
+          element.className,
+          element.innerText,
+          element.textContent
+        ].join(' ')).toLowerCase();
+        return /上一页|previous|prev/.test(label) && !/下一页|next/.test(label);
+      }) || allControls.find((element) => {
+        const text = clean(element.innerText || element.textContent);
+        const rect = element.getBoundingClientRect?.();
+        const firstPageRect = pageControls
+          .find((control) => numericPage(control) === 1)
+          ?.getBoundingClientRect?.();
+        return rect && firstPageRect && rect.right <= firstPageRect.left + 4 && /^(<|‹|«|←)?$/.test(text);
+      });
+      const previousDisabled = Boolean(previousControl && isDisabled(previousControl));
+      const atFirstPage = currentPageKnown ? currentPage === 1 : previousDisabled;
+      const firstPageKnown = currentPageKnown || previousDisabled;
+      const pageEvidence = currentPageKnown
+        ? 'active-page'
+        : previousDisabled
+          ? 'previous-disabled'
+          : 'unknown';
+      if (action === 'inspect') {
+        return {
+          ok: true,
+          clicked: false,
+          currentPage,
+          currentPageKnown,
+          firstPageKnown,
+          atFirstPage,
+          pageEvidence,
+          previousDisabled,
+          controlCount: allControls.length,
+          pageNumbers,
+          selector: rootSelector,
+          calibrated: Boolean(calibratedRoot)
+        };
+      }
       if (action === 'goto') {
-        const pageControl = controls.find((element) => clean(element.innerText || element.textContent) === String(targetPage));
-        if (!pageControl) return { ok: false, clicked: false, currentPage, error: '未找到目标页码' };
-        pageControl.click();
-        return { ok: true, clicked: true, currentPage, targetPage };
+        if (targetPage === 1 && firstPageKnown && atFirstPage) {
+          return {
+            ok: true,
+            clicked: false,
+            alreadyAtTarget: true,
+            currentPage: 1,
+            currentPageKnown: true,
+            firstPageKnown,
+            atFirstPage,
+            pageEvidence,
+            targetPage,
+            method: 'visible-page-evidence'
+          };
+        }
+        const pageControl = controls.find((element) => numericPage(element) === targetPage);
+        if (pageControl) {
+          pageControl.click();
+          return { ok: true, clicked: true, currentPage, currentPageKnown, targetPage, method: 'page-control' };
+        }
+        if (jumpInput) {
+          const prototype = Object.getPrototypeOf(jumpInput);
+          const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'value');
+          if (descriptor?.set) descriptor.set.call(jumpInput, String(targetPage));
+          else jumpInput.value = String(targetPage);
+          jumpInput.dispatchEvent(new Event('input', { bubbles: true }));
+          jumpInput.dispatchEvent(new Event('change', { bubbles: true }));
+          jumpInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+          jumpInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+          return { ok: true, clicked: true, currentPage, currentPageKnown, targetPage, method: 'jump-input' };
+        }
+        return { ok: false, clicked: false, currentPage, currentPageKnown, error: '未找到目标页码或跳转输入框' };
       }
       let nextControl = controls.find((element) => {
         const label = clean([
@@ -402,18 +585,253 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1) {
           })
           .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
       }
-      if (!nextControl) return { ok: false, clicked: false, currentPage, error: '未找到下一页按钮' };
+      if (!nextControl) {
+        return { ok: false, clicked: false, currentPage, currentPageKnown, error: '未找到下一页按钮' };
+      }
       nextControl.click();
-      return { ok: true, clicked: true, currentPage, targetPage: currentPage + 1 };
+      return {
+        ok: true,
+        clicked: true,
+        currentPage,
+        currentPageKnown,
+        targetPage: currentPageKnown ? currentPage + 1 : null
+      };
     })()
   `;
+}
+
+function buildCandidatePageIdentityScript(items = [], options = {}) {
+  const names = [];
+  const seen = new Set();
+  for (const item of Array.isArray(items) ? items : []) {
+    const name = String(item?.creator_name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const key = name.toLowerCase();
+    if (name.length < 2 || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+    if (names.length >= 5) break;
+  }
+  const rowSelector = String(options?.rowSelector || '').trim().slice(0, 500);
+  const nameSelector = String(options?.nameSelector || '').trim().slice(0, 500);
+  return `
+    (function(){
+      const names = ${JSON.stringify(names)};
+      const rowSelector = ${JSON.stringify(rowSelector)};
+      const nameSelector = ${JSON.stringify(nameSelector)};
+      const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const calibrated = Boolean(rowSelector || nameSelector);
+      const required = Math.min(calibrated ? 8 : 3, names.length);
+      const visible = (element) => {
+        if (!element || element.nodeType !== 1) return false;
+        const rect = element.getBoundingClientRect?.();
+        if (!rect || rect.width < 2 || rect.height < 2) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
+      };
+      let visibleNames = [];
+      let calibratedRows = [];
+      if (rowSelector) {
+        try { calibratedRows = Array.from(document.querySelectorAll(rowSelector)).filter(visible); } catch (_) {}
+      }
+      if (calibratedRows.length >= 2 && nameSelector) {
+        visibleNames = calibratedRows.map((row) => {
+          let target = null;
+          try {
+            if (row.matches?.(nameSelector)) target = row;
+            else target = Array.from(row.querySelectorAll(nameSelector)).find(visible) || null;
+          } catch (_) {}
+          return clean(target?.innerText || target?.textContent || target?.getAttribute?.('aria-label') || '');
+        }).filter(Boolean).slice(0, 80);
+      } else if (nameSelector) {
+        try {
+          visibleNames = Array.from(document.querySelectorAll(nameSelector))
+            .filter(visible)
+            .map((element) => clean(element.innerText || element.textContent || element.getAttribute?.('aria-label') || ''))
+            .filter(Boolean)
+            .slice(0, 80);
+        } catch (_) {}
+      }
+      if (calibratedRows.length >= 2 && visibleNames.length !== calibratedRows.length) {
+        return {
+          ok: false,
+          orderedMatch: false,
+          required,
+          matchedCount: 0,
+          candidateNameCount: names.length,
+          visibleNameCount: visibleNames.length,
+          calibratedRowCount: calibratedRows.length,
+          evidence: 'calibrated-row-name-count-mismatch'
+        };
+      }
+      if (calibrated && visibleNames.length < required) {
+        return {
+          ok: false,
+          orderedMatch: false,
+          required,
+          matchedCount: 0,
+          candidateNameCount: names.length,
+          visibleNameCount: visibleNames.length,
+          calibratedRowCount: calibratedRows.length,
+          evidence: 'calibrated-name-count-insufficient'
+        };
+      }
+      if (required >= 2 && visibleNames.length >= required) {
+        let visibleCursor = 0;
+        let visibleMatched = 0;
+        for (const rawName of names) {
+          const name = clean(rawName);
+          let found = -1;
+          for (let index = visibleCursor; index < visibleNames.length; index += 1) {
+            if (visibleNames[index] === name) {
+              found = index;
+              break;
+            }
+          }
+          if (found < 0) break;
+          visibleMatched += 1;
+          visibleCursor = found + 1;
+          if (visibleMatched >= required) break;
+        }
+        return {
+          ok: true,
+          orderedMatch: visibleMatched >= required,
+          required,
+          matchedCount: visibleMatched,
+          candidateNameCount: names.length,
+          visibleNameCount: visibleNames.length,
+          calibratedRowCount: calibratedRows.length,
+          evidence: calibratedRows.length >= 2
+            ? 'calibrated-row-name-order'
+            : 'calibrated-name-selector'
+        };
+      }
+      const pageText = clean(document.body?.innerText || '');
+      if (!pageText || required < 2) {
+        return {
+          ok: false,
+          orderedMatch: false,
+          required,
+          matchedCount: 0,
+          candidateNameCount: names.length,
+          visibleNameCount: visibleNames.length,
+          calibratedRowCount: calibratedRows.length,
+          evidence: 'body-text'
+        };
+      }
+      let cursor = 0;
+      let matchedCount = 0;
+      for (const name of names) {
+        const index = pageText.indexOf(clean(name), cursor);
+        if (index < 0) break;
+        matchedCount += 1;
+        cursor = index + clean(name).length;
+        if (matchedCount >= required) break;
+      }
+      return {
+        ok: true,
+        orderedMatch: matchedCount >= required,
+        required,
+        matchedCount,
+        candidateNameCount: names.length,
+        visibleNameCount: visibleNames.length,
+        calibratedRowCount: calibratedRows.length,
+        evidence: 'body-text'
+      };
+    })()
+  `;
+}
+
+function buildCandidateSearchLayoutScript(options = {}) {
+  const rowSelector = String(options?.rowSelector || '').trim().slice(0, 500);
+  const nameSelector = String(options?.nameSelector || '').trim().slice(0, 500);
+  return `
+    (function(){
+      const rowSelector = ${JSON.stringify(rowSelector)};
+      const nameSelector = ${JSON.stringify(nameSelector)};
+      const clean = (value, max = 120) => String(value || '')
+        .replace(/\\u00a0/g, ' ')
+        .replace(/\\s+/g, ' ')
+        .trim()
+        .slice(0, max);
+      const visible = (element) => {
+        if (!element || element.nodeType !== 1) return false;
+        const rect = element.getBoundingClientRect?.();
+        if (!rect || rect.width < 2 || rect.height < 2) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
+      };
+      const queryVisible = (selector) => {
+        if (!selector) return [];
+        try { return Array.from(document.querySelectorAll(selector)).filter(visible); } catch (_) { return []; }
+      };
+      const rows = queryVisible(rowSelector);
+      const globalNameElements = queryVisible(nameSelector);
+      const rowCandidates = rows.map((row) => {
+        let nameElement = null;
+        try {
+          if (nameSelector && row.matches?.(nameSelector)) nameElement = row;
+          else if (nameSelector) nameElement = Array.from(row.querySelectorAll(nameSelector)).find(visible) || null;
+        } catch (_) {}
+        let linkElement = null;
+        try {
+          linkElement = row.matches?.('a[href*="/blogger-detail/"]')
+            ? row
+            : row.querySelector('a[href*="/blogger-detail/"]');
+          if (!linkElement) {
+            linkElement = Array.from(row.querySelectorAll('a[href]')).find((element) => (
+              /blogger|creator|kol/i.test(String(element.getAttribute?.('href') || ''))
+            )) || null;
+          }
+        } catch (_) {}
+        let href = '';
+        try { href = linkElement ? new URL(linkElement.href || linkElement.getAttribute('href'), location.href).href : ''; } catch (_) {}
+        return {
+          name: clean(nameElement?.innerText || nameElement?.textContent || nameElement?.getAttribute?.('aria-label') || '', 80),
+          href: clean(href, 500)
+        };
+      });
+      const rowNames = rowCandidates.map((candidate) => candidate.name).filter(Boolean);
+      const names = (rows.length >= 2 ? rowNames : globalNameElements
+        .map((element) => clean(element.innerText || element.textContent || element.getAttribute?.('aria-label') || '', 80))
+        .filter(Boolean))
+        .slice(0, 80);
+      return {
+        ok: true,
+        url: location.href,
+        rowCount: rows.length,
+        nameCount: names.length,
+        rowsWithName: rowCandidates.filter((candidate) => candidate.name).length,
+        rowsWithLink: rowCandidates.filter((candidate) => candidate.href).length,
+        names,
+        candidates: rowCandidates.filter((candidate) => candidate.name).slice(0, 80),
+        rowSamples: rows.slice(0, 5).map((element) => clean(element.innerText || element.textContent || '', 180)),
+        selectors: { rowSelector, nameSelector },
+        calibrated: Boolean(rowSelector || nameSelector)
+      };
+    })()
+  `;
+}
+
+function hasCompleteCandidateSearchCalibration(options = {}) {
+  const rowSelector = String(options?.rowSelector || '').trim();
+  const nameSelector = String(options?.nameSelector || '').trim();
+  const paginationSelector = String(options?.paginationSelector || '').trim();
+  return Boolean(
+    rowSelector
+    && nameSelector
+    && paginationSelector
+    && rowSelector !== nameSelector
+  );
 }
 
 module.exports = {
   MAX_CANDIDATE_COUNT,
   MAX_CANDIDATE_RANK,
+  buildCandidatePageIdentityScript,
+  buildCandidateSearchLayoutScript,
   buildSearchCandidateExtractionScript,
   buildSearchPaginationScript,
+  hasCompleteCandidateSearchCalibration,
   parseCandidateInstruction,
   parseChineseNumber
 };

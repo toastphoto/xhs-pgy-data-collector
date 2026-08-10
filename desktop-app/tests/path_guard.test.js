@@ -13,4 +13,10 @@ assert.strictEqual(resolveInsideRoot(path.join(root, '..', 'outside'), root), nu
 assert.strictEqual(resolveInsideAny(child, [path.join(os.tmpdir(), 'other'), root]), path.resolve(child));
 assert.strictEqual(resolveInsideAny('/etc/passwd', [root]), null);
 
+if (process.platform === 'win32') {
+  const mixedCaseRoot = 'C:\\Users\\Example\\Runs';
+  const mixedCaseChild = 'c:\\users\\example\\runs\\run_1';
+  assert.strictEqual(resolveInsideRoot(mixedCaseChild, mixedCaseRoot), path.resolve(mixedCaseChild));
+}
+
 console.log('path_guard.test.js OK');

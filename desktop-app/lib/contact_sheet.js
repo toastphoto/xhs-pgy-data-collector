@@ -237,6 +237,8 @@ function normalizeReviewMap(reviewRows) {
       contactSource: cleanStr(row?.contactSource),
       contactCollectedAt: cleanStr(row?.contactCollectedAt),
       contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
+      contactCollectionCode: cleanStr(row?.contactCollectionCode),
+      contactCollectionError: cleanStr(row?.contactCollectionError),
       contactChannel: normalizeContactChannel(row?.contactChannel || '', '')
     });
   }
@@ -307,9 +309,11 @@ function buildContactPreviewRows(runDir, options = {}) {
     const summary = obj.creator_summary || {};
     const metrics = obj.metrics || {};
     const qualityReport = obj.quality_report || {};
-    const creatorName = firstFilled(summary.creator_name, summary.name);
     const xhsId = firstFilled(summary.xhs_id, summary.xhsId);
+    const xhsProfileUrl = firstFilled(summary.xhs_profile_url, summary.xhsProfileUrl);
     const creatorUrl = firstFilled(summary.creator_url, obj.creator_url);
+    const candidateReview = candidateMap.get(normalizeUrl(creatorUrl)) || {};
+    const creatorName = firstFilled(candidateReview.creatorName, summary.creator_name, summary.name);
     const tags = firstFilled(summary.tags, metrics['内容标签']);
     const region = firstFilled(summary.location, summary.region, metrics['地区']);
     const followers = firstFilled(metrics['粉丝数'], summary.followers);
@@ -319,7 +323,6 @@ function buildContactPreviewRows(runDir, options = {}) {
     const rowId = makeRowId({ creatorUrl, xhsId, creatorName, index });
     const legacyReview = reviewMap.get(makeLegacyRowId({ creatorUrl, xhsId, creatorName, index })) || {};
     const migratedLegacyReview = legacyReviewMatchesCreator(legacyReview, creatorUrl) ? legacyReview : {};
-    const candidateReview = candidateMap.get(normalizeUrl(creatorUrl)) || {};
     const review = { ...candidateReview, ...migratedLegacyReview, ...(reviewMap.get(rowId) || {}) };
     const selected = review.selected === true;
 
@@ -342,10 +345,12 @@ function buildContactPreviewRows(runDir, options = {}) {
       email: review.email || findEmailInObject(obj),
       wechatId: review.wechatId || '',
       phone: review.phone || '',
-      xhsProfileUrl: review.xhsProfileUrl || '',
+      xhsProfileUrl: review.xhsProfileUrl || xhsProfileUrl,
       contactSource: review.contactSource || '',
       contactCollectedAt: review.contactCollectedAt || '',
       contactCollectionStatus: review.contactCollectionStatus || '',
+      contactCollectionCode: review.contactCollectionCode || '',
+      contactCollectionError: review.contactCollectionError || '',
       contactChannel: normalizeContactChannel(review.contactChannel || contactChannel),
       groupTag: defaultGroupTag,
       greeting: defaultGreeting,

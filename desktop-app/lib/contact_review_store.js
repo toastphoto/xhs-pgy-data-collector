@@ -53,6 +53,8 @@ function normalizeReviewRows(rows) {
       contactSource: cleanStr(row?.contactSource),
       contactCollectedAt: cleanStr(row?.contactCollectedAt),
       contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
+      contactCollectionCode: cleanStr(row?.contactCollectionCode),
+      contactCollectionError: cleanStr(row?.contactCollectionError),
       contactChannel: normalizeContactChannel(row?.contactChannel)
     });
   }

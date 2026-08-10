@@ -33,7 +33,10 @@ def main() -> int:
     require(runtime_probe.is_file(), "Runtime PGY safety probe must exist", errors)
 
     task_runner = read("desktop-app/lib/task_runner.js")
+    backend_runtime = read("desktop-app/lib/backend_runtime.js")
     candidate_command = read("desktop-app/lib/pgy_candidate_command.js")
+    candidate_response_cache = read("desktop-app/lib/pgy_candidate_response_cache.js")
+    candidate_checkpoint = read("desktop-app/lib/pgy_candidate_checkpoint.js")
     pgy_risk = read("desktop-app/lib/pgy_risk.js")
     xhs_contact = read("desktop-app/lib/xhs_contact_enrichment.js")
     main_js = read("desktop-app/main.js")
@@ -55,6 +58,10 @@ def main() -> int:
     live_validator_text = read("scripts/validate_pgy_live_validation.py")
     live_validator_test_text = read("scripts/test_pgy_live_validation.py")
     task_runner_test = read("desktop-app/tests/task_runner_safety.test.js")
+    candidate_response_test = read("desktop-app/tests/pgy_candidate_response_cache.test.js")
+    email_handoff_segment = exports_view.split("const btnTencentEmail", 1)[-1].split(
+        "reviewTop.appendChild(btnTencentEmail)", 1
+    )[0]
 
     require("const SAFE_BATCH_LIMIT = 50" in task_runner, "TaskRunner must keep SAFE_BATCH_LIMIT at 50", errors)
     require("ALLOWED_TASK_HOSTS" in task_runner and "pgy.xiaohongshu.com" in task_runner, "TaskRunner must restrict automated batches to PGY task URLs", errors)
@@ -64,6 +71,7 @@ def main() -> int:
     require("PGY_RUN_COOLDOWN" in task_runner and "_lastFinishedAt" in task_runner, "TaskRunner must reject immediate back-to-back batches", errors)
     require("_readLastFinishedAt" in task_runner and "_writeLastFinishedAt" in task_runner, "TaskRunner cooldown must survive app restarts", errors)
     require("SAFE_RUN_COOLDOWN_FILE" in task_runner_test and "persisted-cooldown" in task_runner_test, "TaskRunner safety tests must cover persisted cooldown", errors)
+    require("activeRunId" in task_runner and "PGY_UNFINISHED_RUN" in task_runner and "recoverFromTaskState" in task_runner, "TaskRunner must keep unfinished runs locked and recoverable across restart", errors)
     require("PGY_TASK_URL_NOT_ALLOWED" in task_runner_test and "example.com/not-pgy" in task_runner_test, "TaskRunner safety tests must cover non-PGY URL rejection", errors)
     require("items.length > SAFE_BATCH_LIMIT" in task_runner, "TaskRunner must reject over-limit batches", errors)
     require("allowLargeBatch" not in task_runner, "TaskRunner must not expose a hidden large-batch bypass", errors)
@@ -183,9 +191,70 @@ def main() -> int:
     )
     require(
         "PGY_CANDIDATE_MAX_PAGES = 10" in main_js
-        and "while (items.length < endRank" in main_js
+        and (
+            "while (items.length < endRank" in main_js
+            or (
+                "while (pagesRead <= PGY_CANDIDATE_MAX_PAGES)" in main_js
+                and "if (items.length >= endRank) break" in main_js
+                and "if (pagesRead >= PGY_CANDIDATE_MAX_PAGES) break" in main_js
+            )
+        )
         and "pgyDetectRiskOnCurrentPage" in main_js,
         "Segmented candidate paging must stay bounded and recheck PGY risk before page turns",
+        errors,
+    )
+    require(
+        "PGY_CANDIDATE_CHECKPOINT_WAIT_MS = 90 * 1000" in candidate_checkpoint
+        and "findPendingCheckpoint" in main_js
+        and "findCheckpointBeforeNextPage" in main_js
+        and "continueSearchCandidates" in tasks_view,
+        "Candidate paging must pause for at least 90 seconds at 40-rank checkpoints and require a manual continue",
+        errors,
+    )
+    require(
+        "PGY_PAGINATION_RESPONSE_TIMEOUT" in main_js
+        and "本次部分结果不会自动加入候选" in main_js,
+        "Incomplete candidate pagination must not be reported or merged as a complete range",
+        errors,
+    )
+    require(
+        "beginCommandWindow" in candidate_response_cache
+        and "endCommandWindow" in candidate_response_cache
+        and "commandWindow" in main_js,
+        "Candidate response reads must be scoped to an explicit command window",
+        errors,
+    )
+    require(
+        "seedCommandWindow" in candidate_response_cache
+        and "sourceContext" in candidate_response_cache
+        and "seedCandidateCommandFromVisiblePage" in main_js
+        and "if (!pending?.commandWindow) return;" not in main_js
+        and "PGY_CANDIDATE_RESPONSE_NOT_READY" in main_js,
+        "Candidate first-page reads must adopt only a same-navigation sanitized snapshot instead of dropping pre-command responses",
+        errors,
+    )
+    require(
+        "PGY_PAGINATION_PAGE_OVERLAP" in candidate_response_cache
+        and "overlapCount > 0" in candidate_response_cache
+        and "PGY_PAGINATION_PAGE_OVERLAP" in candidate_response_test,
+        "Candidate paging must reject any cross-page creator overlap to preserve rank positions",
+        errors,
+    )
+    require(
+        "requestSingleInstanceLock" in main_js and "BACKEND_IDENTITY_MISMATCH" in backend_runtime,
+        "Desktop collection must reject duplicate app instances and stale backend identity",
+        errors,
+    )
+    require(
+        "startXhsContactRows" not in email_handoff_segment and "不会启动补采" in email_handoff_segment,
+        "Email handoff must not silently start public-contact enrichment without confirmation",
+        errors,
+    )
+    require(
+        "isSameTaskPage" in task_runner
+        and "页面已离开当前达人" in task_runner
+        and "event.sender?.id !== browserView?.webContents?.id" in main_js,
+        "Collection work and recording events must remain bound to the fixed collection page",
         errors,
     )
     require(

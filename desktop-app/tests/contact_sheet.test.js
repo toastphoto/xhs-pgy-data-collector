@@ -52,6 +52,7 @@ fs.writeFileSync(
       creator_summary: {
         creator_name: '测试达人',
         xhs_id: 'xhs_001',
+        xhs_profile_url: 'https://www.xiaohongshu.com/user/profile/saved_profile',
         creator_url: 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/abc',
         tags: '家居, 好物',
         location: '上海'
@@ -77,7 +78,7 @@ const rows = buildContactRowsFromRun(runDir, {
 
 assert.strictEqual(rows.files, 1);
 assert.strictEqual(rows.contactRows.length, 1);
-assert.strictEqual(rows.contactRows[0]['达人昵称'], '测试达人');
+assert.strictEqual(rows.contactRows[0]['达人昵称'], '候选达人');
 assert.strictEqual(rows.contactRows[0]['跟进状态'], '不建联');
 assert.strictEqual(rows.contactRows[0]['微信分组标签'], 'FILA');
 assert.strictEqual(rows.contactRows[0]['打招呼内容'], '您好，想沟通一下合作。');
@@ -99,6 +100,7 @@ assert.ok(preview.rows[0].rowId);
 assert.strictEqual(preview.rows[0].priority, 'P2');
 assert.strictEqual(preview.rows[0].excludeReason, '候选阶段排除');
 assert.strictEqual(preview.rows[0].note, '候选备注');
+assert.strictEqual(preview.rows[0].xhsProfileUrl, 'https://www.xiaohongshu.com/user/profile/saved_profile');
 
 const manualOptInRunDir = path.join(tmp, 'run_manual_opt_in');
 const manualOptInChildDir = path.join(manualOptInRunDir, '1_creator');
@@ -162,7 +164,7 @@ assert.strictEqual(pendingSummary.find((row) => row['指标'] === '待补联系�
 assert.strictEqual(pendingSummary.find((row) => row['指标'] === '小蜜蜂导入行')['数量'], 0);
 assert.strictEqual(pendingSummary.find((row) => row['指标'] === '跟进状态：待建联')['数量'], 1);
 const pendingContact = XLSX.utils.sheet_to_json(pendingWb.Sheets['建联表']);
-assert.strictEqual(pendingContact[0]['达人昵称'], '测试达人');
+assert.strictEqual(pendingContact[0]['达人昵称'], '候选达人');
 assert.strictEqual(pendingContact[0]['选择建联'], '是');
 const pendingXmf = XLSX.utils.sheet_to_json(pendingWb.Sheets['小蜜蜂导入表']);
 assert.strictEqual(pendingXmf.length, 0);
@@ -171,7 +173,7 @@ assert.strictEqual(pendingPgyInvite.length, 0);
 const pendingEmail = XLSX.utils.sheet_to_json(pendingWb.Sheets['邮件建联表']);
 assert.strictEqual(pendingEmail.length, 0);
 const pendingRows = XLSX.utils.sheet_to_json(pendingWb.Sheets['待补联系方式'], { defval: '' });
-assert.strictEqual(pendingRows[0]['达人昵称'], '测试达人');
+assert.strictEqual(pendingRows[0]['达人昵称'], '候选达人');
 assert.ok(Object.prototype.hasOwnProperty.call(pendingRows[0], '微信号'));
 assert.ok(Object.prototype.hasOwnProperty.call(pendingRows[0], '手机号'));
 assert.strictEqual(pendingRows[0]['跟进状态'], '待建联');
@@ -197,7 +199,7 @@ assert.ok(wb.SheetNames.includes('小蜜蜂导入表'));
 assert.ok(wb.SheetNames.includes('待补联系方式'));
 
 const contact = XLSX.utils.sheet_to_json(wb.Sheets['建联表']);
-assert.strictEqual(contact[0]['达人昵称'], '测试达人');
+assert.strictEqual(contact[0]['达人昵称'], '候选达人');
 assert.strictEqual(contact[0]['选择建联'], '是');
 assert.strictEqual(contact[0]['跟进状态'], '待建联');
 const xmf = XLSX.utils.sheet_to_json(wb.Sheets['小蜜蜂导入表']);
@@ -347,10 +349,14 @@ const migratedPreview = getContactPreview(collisionRunDir, {
     rowId: legacyId,
     email: 'only-one@example.com',
     xhsProfileUrl: 'https://www.xiaohongshu.com/user/profile/creator_one',
-    contactCollectionStatus: 'found'
+    contactCollectionStatus: 'profile_unavailable',
+    contactCollectionCode: 'XHS_PROFILE_CONTENT_NOT_READY',
+    contactCollectionError: '公开资料区域尚未出现'
   }]
 });
 assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人一').email, 'only-one@example.com');
+assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人一').contactCollectionCode, 'XHS_PROFILE_CONTENT_NOT_READY');
+assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人一').contactCollectionError, '公开资料区域尚未出现');
 assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人二').email, '');
 
 assert.strictEqual(timestampForFilename(new Date(2026, 5, 30, 9, 8, 7)), '20260630-090807');

@@ -21,6 +21,27 @@
 - Impact: Avoid captcha/risk-control bypasses, high-concurrency crawling, or hidden account/session manipulation.
 - Reevaluate when: An official API or approved data source replaces browser-based collection.
 
+## 2026-08-05: Visible pagination defines the current PGY page
+
+- Decision: Use the visible active numeric page or disabled previous control as primary current-page evidence. Candidate-list response metadata is fallback and cross-check evidence only.
+- Why: A third-party response can contain multiple unrelated pagers, while the visible paginator describes the page the operator is actually viewing.
+- Impact: A response/DOM conflict cannot force a false page-1 redirect or silently import candidates. Payload page extraction stays local to the selected candidate-list branch, and unresolved conflicts fail closed.
+- Reevaluate when: PGY removes visible pagination or an official API supplies a single authoritative page identity.
+
+## 2026-08-05: Detail and XHS work use a dedicated role tab
+
+- Decision: Keep the collection BrowserView protected and route creator-detail resolution, XHS login/profile reads, enrichment, and mail to separate explicit role tabs.
+- Why: Browser back navigation and renderer rerender recovery cannot reliably reconstruct PGY filters, page number, history, and scroll after the collection page has been replaced.
+- Impact: Automation targets explicit BrowserViews instead of the active tab. The collection tab survives round trips unchanged; renderer list state is restored independently by run/filter context and creator anchor.
+- Reevaluate when: The desktop browser architecture changes to a different multi-view model with equivalent role isolation.
+
+## 2026-08-05: XHS readiness requires stable target-page evidence
+
+- Decision: Classify XHS profile reads from canonical target URL, login/risk signals, document/profile evidence, and consecutive stable visible snapshots; parse only the resulting public contact snapshot.
+- Why: A fixed delay followed by one DOM read races SPA rendering and creates both missed emails and false profile failures.
+- Impact: Bounded polling may wait longer on slow pages, but it does not reload repeatedly, bypass login/risk prompts, or treat a skeleton/profile mismatch as success.
+- Reevaluate when: XHS exposes a stable approved structured source for public profile contacts.
+
 ## Do not commit real runtime data
 
 - Decision: Keep cookies, `.env`, task sheets, real creator links, runs, logs, and local databases out of Git.
@@ -377,3 +398,115 @@
 - Why: Windows cannot run a DMG or an arm64 Mac application, and the current backend packaging script is macOS-specific. A configured Electron NSIS target is not evidence that a usable Windows release exists.
 - Impact: Distribution notes must identify platform and architecture. Mac acceptance results must not be reused as Windows acceptance evidence, and an untested cross-compiled file must not be described as deliverable.
 - Reevaluate when: A Windows build passes regression testing on the target company device and Windows version.
+
+## 2026-07-27: Package The Windows Backend As PyInstaller Onedir
+
+- Decision: build the compatibility FastAPI backend natively on Windows with PyInstaller `--onedir`, embed it in the Electron resources, and produce an x64 NSIS installer. Packaged Electron resolves `xhs-pgy-backend.exe` on Windows and must fail clearly if it is absent instead of falling back to a system Python installation.
+- Why: Windows cannot run the macOS backend binary, and target users should not need Node, Python, or project dependencies. `--onedir` starts faster and has more predictable resource paths than a self-extracting `--onefile` backend.
+- Impact: Windows builds require a local `content-analyzer/.venv` installed from `requirements_packaging_win.txt`. Backend build output is excluded from the copied source tree and added once as a dedicated resource. Windows release claims require native artifact and installation evidence.
+- Reevaluate when: the compatibility backend is replaced by a Node service, a smaller dedicated desktop backend is introduced, or another packaging system provides equivalent local-only startup and resource guarantees.
+
+## 2026-07-28: Treat Every 40 Ranks As A Manual Candidate Checkpoint
+
+- Decision: Candidate paging that must cross rank 40 or 80 pauses for at least 90 seconds and requires an explicit user continue. Partial rows remain in memory and are not merged until the complete requested range is verified. Continue fails closed if the collection tab, URL, page number, page anchors, cache window, or risk state changed.
+- Why: The former reader silently stopped after 40 rows when the next control or response was not confirmed, then returned `ok: true`; a rank 35-50 request therefore merged only ranks 35-40. A sleep alone would hide the failure without proving page continuity or safety.
+- Impact: Rank-range intake is slower and may require a user click, but incomplete, duplicate, stale, or risk-blocked pages cannot be presented as a complete result. The existing rank-100 locator boundary and 50-person intake/run ceilings remain unchanged. Ninety seconds is a conservative engineering default, not an official platform value or a risk guarantee.
+- Reevaluate when: Sanitized visible tests establish a more conservative pause, the PGY pagination structure changes, or an official export/API replaces page turning. Manual continue, risk recheck, and no partial auto-merge remain the default safety posture.
+
+## 2026-07-28: Separate Visible Browser Tabs From The Collection Target
+
+- Decision: Keep one protected `collection` BrowserView as the only target for PGY automation and recording. Open Tencent enterprise mail in a separate closable `mail` BrowserView with its own persistent Electron session and no recording preload. Active-tab navigation controls operate only on the visible tab, while automation always resolves the fixed collection view.
+- Why: Reassigning the global collection target to the active tab would allow email or another page to receive extraction, replay, or recorded actions. The prior single-view email handoff also destroyed PGY history and made returning to collection awkward.
+- Impact: Users can switch between collection and enterprise mail after automation finishes. Automation locks tab switching, toolbar navigation, and collection-page pointer input; task manual-intervention pauses restore pointer input without changing the fixed collection identity. Recording actions are accepted only from the collection webContents sender.
+- Reevaluate when: XHS contact enrichment is moved to its own role tab or ordinary user-created tabs are added. Any expansion must preserve fixed-role targeting, session boundaries, sender validation, and automation leases.
+
+## 2026-07-28: Packaged GUI Logging Must Not Depend On A Parent Console
+
+- Decision: Install process stdout/stderr error guards at Electron main-process startup and spawn the packaged backend with ignored stdio. Development mode may still pipe backend logs to its terminal.
+- Why: Launching `win-unpacked` from a short-lived parent process left Electron with a closed output pipe. Backend log forwarding then raised an uncaught `EPIPE` and opened a main-process error dialog even though the backend executable itself was valid.
+- Impact: Distributed GUI startup no longer depends on a console remaining attached. Backend operational data must be written through its configured user-data log directory or surfaced through structured status events, not assumed to be available on stdout.
+- Reevaluate when: A durable file logger or Windows event-log integration replaces the current logging path. A GUI package must still tolerate absent or closed standard streams.
+
+## 2026-07-31: Confirm Candidate Page Changes From Response Evidence First
+
+- Decision: identify a PGY candidate page primarily from in-memory list-response page metadata and the ordered creator URL fingerprint. Treat a narrowly matched numeric active-page DOM control as secondary evidence. When returning to page 1, use a visible page control first and the visible jump input as a fallback.
+- Why: the PGY response had changed in the reported failure, but the active-page CSS/DOM marker was not recognized. Requiring that marker as the only proof created a false failure after a real page turn.
+- Impact: an unknown DOM page number may proceed only when the response fingerprint changes and new unique creators appear. An explicit response-page conflict, duplicate fingerprint, missing response, or risk signal still fails without merging partial candidates.
+- Reevaluate when: PGY removes stable page metadata from its list responses, response ordering becomes unstable, or a sanitized live fixture shows the response-page parser is ambiguous.
+
+## 2026-07-31: Windows Builds Need Distinct Visible Versions
+
+- Decision: increment the desktop version for the pagination/tab delivery and show it in the top bar. Installed acceptance must inspect the installed ASAR, shortcut target, visible version, and tab UI.
+- Why: the July 27 and July 28 artifacts both used `0.1.0`, so an operator could not tell that their installed app predated the tab work.
+- Impact: this correction ships as `0.1.1`; future Windows fixes must not overwrite the same version number while claiming a different installed behavior.
+- Reevaluate when: an automatic updater or richer build-information panel provides a stronger release identity.
+
+## 2026-08-03: Scope Candidate Response Evidence To One Instruction
+
+- Decision: Open a candidate-response command window when an intake instruction starts, accept only candidate-shaped list responses inside that window, and reject page-number conflicts, duplicate fingerprints, or any overlap between adjacent pages.
+- Why: A process-wide response cache can accidentally consume an old or unrelated response, while partial page overlap makes rank ordering ambiguous even if some creators are new.
+- Impact: Initial visible-page rows seed the command window, checkpoint state retains only sanitized page evidence, and no partial range is merged until the complete requested range is proven.
+- Reevaluate when: PGY changes the list-response contract or an official export/API replaces visible pagination. Instruction scoping and fail-closed completion evidence remain required.
+
+## 2026-08-03: Recover Unfinished Runs Instead Of Starting Over Silently
+
+- Decision: Persist schema-v2 task state with an active run identity, expose honest pending-pause/skip states, and require explicit recovery when an unfinished run exists. A new run is rejected until the old run is recovered or deliberately resolved.
+- Why: Process crashes or renderer failures must not make an active queue look finished, clear the cooldown owner, or allow an accidental overlapping run.
+- Impact: Task-runner persistence failures are visible, run-loop failures preserve recovery state, and renderer controls describe when pause/skip can actually take effect.
+- Reevaluate when: A transactional queue service replaces local JSON state. Explicit unfinished-run ownership and no overlapping automation remain mandatory.
+
+## 2026-08-03: Ship Both Installer And Self-Contained Portable Windows Builds
+
+- Decision: Release Windows x64 as both NSIS installer and portable executable, with the same bundled Electron and PyInstaller onedir backend. Enforce one Electron instance and verify backend ownership with a per-launch token plus protocol version.
+- Why: Colleagues may not have Python, Node, or project dependencies, and a stale process listening on port 8010 is not evidence that the current desktop launch owns a compatible backend.
+- Impact: Windows recipients can run either artifact without installing language runtimes. Release acceptance checks both artifact hashes, visible version, backend identity, second-launch behavior, and backend cleanup.
+- Reevaluate when: The backend moves in-process, a signed managed installer is adopted, or automatic updates replace manual distribution. Do not fall back to a target machine's system Python.
+
+## 2026-08-04: Seed Candidate Reads From The Same Navigation Context
+
+- Decision: Capture candidate-shaped PGY responses continuously as sanitized creator rows, tag them with the protected collection BrowserView ID and main-navigation epoch, and seed a new instruction only from a matching context. Keep later page responses inside the explicit command window.
+- Why: Real operators wait for the result list to load before clicking the instruction. Requiring the first response to arrive after the click discarded the valid page-one response and produced a stable rank-0 failure, while restoring a process-wide cache would reintroduce stale-response risk.
+- Impact: Page-loaded-before-command is now a tested sequence. No response body, header, cookie, token, or query string is retained; cross-navigation snapshots cannot seed a command, and page conflicts, duplicate pages, overlap, incomplete ranges, and risk signals still fail without merging.
+- Reevaluate when: PGY changes its response structure, Electron replaces BrowserView, or an official export/API is available. Same-context proof and sanitized-only storage remain required.
+
+## 2026-08-05: Bind Global Rank Pages To Visible Creator Identity
+
+- Decision: Treat first-N and A-B candidate instructions as global ordered ranks across the paginated result set. If a sanitized same-navigation response lacks trustworthy page metadata, accept it only when the visible paginator matches the expected page and multiple visible creator names match the response in order. If no usable response exists, current-page Vue or React component rows may provide the same read-only page evidence.
+- Why: The live first page contained about 20 creators, so first 50 necessarily spans pages 1-3. The reader failed before turning the page because a rendered list was not equivalent to a page-tagged network snapshot; simply clicking next would have made rank continuity unprovable.
+- Impact: The bounded pagination loop continues until the requested global endpoint is present, rather than assuming one page contains 50. Every page still needs visible page identity, a new ordered fingerprint, no adjacent-page overlap, and no risk signal. Partial rows remain temporary and are never merged as success.
+- Reevaluate when: PGY changes its virtual-list/component implementation, creator names are no longer visible or sufficiently distinctive, page size becomes unstable within one search, or an official export/API replaces page reading. Never replace page identity with blind next-page clicks.
+
+## 2026-08-06: Calibrate Fields And Containers As Different Structures
+
+- Decision: store three distinct search-result selectors: a repeated creator-row container, a repeated nickname field, and the semantic pagination root. The picker returns an exact click path, a same-field selector, and a repeated-container selector; nickname calibration uses the field selector, row calibration uses the container selector, and identical row/name selectors are invalid. Ranked paging requires a read-only live `page 1 -> page 2 -> page 1` validation.
+- Why: row and nickname counts could both equal 20 when both selectors targeted the whole row, producing a false pass while names included location and tags. The pagination picker could also stop at the small `d-pagination-goto` wrapper instead of the root containing multiple numeric pages.
+- Impact: calibration now proves nickname order separately from row count and page identity. A stale broad template fails closed before cross-page reading, while the validated template can locate all 20 nicknames and the full paginator without hardcoding one clicked row.
+- Reevaluate when: PGY changes the creator-row or pagination DOM, the list becomes virtualized with fewer mounted nickname nodes, or an official ordered export/API replaces DOM calibration. Do not relax selector separation merely to recover a matching count.
+
+## 2026-08-06: Model Long-Running Controls As Requested And Effective States
+
+- Decision: represent pause and stop as two-stage transitions for creator collection and contact enrichment. The renderer shows the request immediately, but the backend declares `paused` or `stopped` only after reaching an interruption-safe point.
+- Why: an IPC acknowledgement proves that a click was received, not that navigation, extraction, or persistence has stopped. Presenting it as effective creates false operator confidence and can cause overlapping work.
+- Impact: waits and cooldowns are interruptible, in-flight writes remain atomic, a stopped queue is explicitly resolved as skipped, and stopped runs do not silently advance to the next workflow.
+- Reevaluate when: the jobs move to a transactional worker that can atomically suspend and resume individual operations. Honest transitional states remain mandatory.
+
+## 2026-08-06: Return To Results By Restoring Browser History
+
+- Decision: the explicit return action activates the protected collection tab and searches its navigation history for the PGY creator-result route. A fresh result URL is only a warned fallback.
+- Why: activating a role tab does not restore filters when that same BrowserView was navigated to a detail page. Blindly opening a default URL can silently discard page, filter, history, and scroll context.
+- Impact: task, contact, and calibration views share one recoverable return command and reject it while automation owns the browser. Operators are told to recheck filters when exact history restoration is impossible.
+- Reevaluate when: creator detail navigation is fully isolated from the collection BrowserView in every path, or PGY provides a stable serializable search-state contract.
+
+## 2026-08-06: Preserve Contact-Enrichment Diagnostics Per Creator
+
+- Decision: store a normalized enrichment outcome code and readable error alongside each creator, and prefer a previously saved XHS profile URL before resolving it through PGY again.
+- Why: a single `补采失败` label hides whether the cause is page readiness, missing PGY-to-XHS link, login, risk control, timeout, or a genuinely non-public contact. Without this evidence, repeated retries are blind.
+- Impact: the review UI exposes actionable failure categories, retries avoid unnecessary PGY navigation where possible, and not-public remains distinct from technical failure.
+- Reevaluate when: an official profile-link/contact API replaces visible-page reading. Outcome provenance and operator-readable diagnostics remain required.
+
+## 2026-08-10: Bind XHS Profiles To PGY Creator Identity
+
+- Decision: resolve an XHS profile only after the PGY creator-detail identity region is stable, derive the canonical profile route from that creator-detail identity, and accept a saved profile URL only when the two route identities match. Page-wide links and visible-ID click navigation are not identity evidence.
+- Why: a live batch reused the first creator's saved profile URL for later rows because the resolver trusted prior state and scanned unrelated page links. The visible XHS-ID anchor also had no stable `href`, so click navigation was not a reliable mapping contract.
+- Impact: a cross-creator URL is rejected before reading or persistence; current live rows resolve deterministically without destroying the protected collection tab. Profile readiness ignores unrelated nested feed loaders only after stable profile identity is visible. Contact review prefers the selected candidate name over broad account/company headings.
+- Reevaluate when: PGY stops using the creator-detail route identity as the XHS profile route identity, or an official creator mapping API becomes available. Any replacement still needs per-row association proof and a real positive/negative installed-app test.

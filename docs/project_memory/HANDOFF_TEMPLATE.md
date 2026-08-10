@@ -8,9 +8,10 @@ Use this as a short starter for a new continuation thread:
 2. docs/project_memory/ACTIVE_CONTEXT.md
 3. docs/project_memory/DECISIONS.md
 4. docs/project_memory/HANDOFF_TEMPLATE.md
+5. docs/project_memory/LEARNINGS.md
 
 工作路径：
-/Users/workstudio/Downloads/数据收集/xhs-pgy-data-collector
+C:\Users\feibo\Documents\Codex\2026-06-25\s\projects\xhs-pgy-data-collector
 
 第一批需要读取的文件：
 - README.md
@@ -22,6 +23,8 @@ Use this as a short starter for a new continuation thread:
 - desktop-app/lib/signing_task_store.js
 - desktop-app/lib/quality_report.js
 - desktop-app/lib/path_guard.js
+- desktop-app/lib/backend_runtime.js
+- desktop-app/scripts/build-backend.js
 - docs/project_memory/PRODUCT_ARCHITECTURE_ROADMAP.md
 - docs/project_memory/PGY_ANTI_BOT_SAFETY_AUDIT.md
 - docs/project_memory/PGY_LIVE_VALIDATION_PROTOCOL.md
@@ -38,6 +41,7 @@ Use this as a short starter for a new continuation thread:
 当前状态摘要：
 - 主线是 Electron 桌面应用 desktop-app。
 - Python/FastAPI content-analyzer 是兼容后端。
+- Windows `0.1.9` 已加入采集与联系方式补采的请求中/已生效状态、整批安全停止、返回 PGY 筛选结果、联系方式失败分类和校准下一步引导；联系方式补采已用安装版完成一次真实登录正负样本验证。安装版还分别完成了 `前50位`（`20+20+10`）和直接 `35-50位`（`6+10`）跨页验收，两者都执行第 40 位人工检查点、90 秒冷却、去重并回到第 1 页，且未启动 50 人详情采集。正式脱敏风控验收记录仍是独立未关闭门槛。版本、安装、运行与登录状态都属于易变信息，新线程必须重新检查。
 - 已有质量报告、任务状态落盘、路径白名单和相关测试。
 - 已有第一版建联表复核导出：`desktop-app/lib/contact_sheet.js` + `desktop-app/renderer/views/exports.js` 支持预览、选择/排除、优先级、联系方式、备注、排除原因，并生成 `建联概览`、`建联表`、可执行的 `小蜜蜂导入表` 和 `待补联系方式`。
 - `建联概览` 是第一张 sheet，汇总总达人、已选/排除、可进小蜜蜂、待补联系方式和跟进状态分布；导入逻辑仍以明细 sheet 为准，不读取概览。
@@ -71,8 +75,8 @@ Use this as a short starter for a new continuation thread:
 
 建议第一步验证：
 - git status --branch --short
-- lsof -nP -iTCP:8010 -sTCP:LISTEN || true
-- lsof -nP -iTCP:8000 -sTCP:LISTEN || true
+- Get-NetTCPConnection -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue
+- Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
 - cd desktop-app && npm test
 - python scripts/verify_project_memory.py
 - python scripts/audit_pgy_safety.py

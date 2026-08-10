@@ -10,12 +10,17 @@
     { "name": "notes", "tabText": "笔记数据" },
     { "name": "fans", "tabText": "粉丝分析" }
   ],
+  "candidate_search": {
+    "rowSelector": null,
+    "nameSelector": null,
+    "paginationSelector": null
+  },
   "noteCardSelector": null,
   "creator_summary": [
     { "name": "platform", "selector": null, "value": "pgy" },
-    { "name": "creator_name", "selector": "h1, [class*='name']", "transform": "text" },
+    { "name": "creator_name", "selector": ".blogger-base-info .blogger-name", "transform": "text" },
     { "name": "creator_url", "selector": null, "transform": "url" },
-    { "name": "followers", "selector": "[class*='follower'],[class*='fans']", "transform": "number" }
+    { "name": "followers", "selector": null, "transform": "number" }
   ],
   "note_detail": [
     { "name": "note_title", "selector": "[class*='title'],h3,h4", "transform": "text" },

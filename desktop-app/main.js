@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const http = require('http');
+const crypto = require('crypto');
 const { applyTransform } = require('./lib/transform');
 const XLSX = require('xlsx');
 let ExcelJS = null;
@@ -34,11 +35,15 @@ const { approveRequest, buildXiaomifengApprovalPayload, checkApproval, createApp
 const { buildFeishuSyncEnvelope } = require('./lib/feishu_contracts');
 const {
   buildXhsRiskDetectionSnippet,
+  classifyXhsProfilePageRead,
   contactFieldCount,
+  extractPgyCreatorEntityId,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
   normalizeXhsProfileUrl,
-  parsePublicContactText
+  parsePublicContactSnapshot,
+  xhsProfileMatchesPgyCreator,
+  xhsProfileUrlFromPgyCreator
 } = require('./lib/xhs_contact_enrichment');
 const {
   TENCENT_MAIL_HOME_URL,
@@ -49,17 +54,50 @@ const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
 const { loadIndexFromDisk, rebuildKbFromDb, searchIndex } = require('./lib/kb/index');
 const { buildBrowserRiskDetectionSnippet } = require('./lib/pgy_risk');
+const { assessBackendHealth, packagedBackendExecutable } = require('./lib/backend_runtime');
+const { installProcessStdioGuards } = require('./lib/process_stdio');
 const {
   MAX_CANDIDATE_COUNT,
   MAX_CANDIDATE_RANK,
+  buildCandidatePageIdentityScript,
+  buildCandidateSearchLayoutScript,
   buildSearchCandidateExtractionScript,
   buildSearchPaginationScript,
+  hasCompleteCandidateSearchCalibration,
   parseCandidateInstruction
 } = require('./lib/pgy_candidate_command');
-const { PgyCandidateResponseCache } = require('./lib/pgy_candidate_response_cache');
+const {
+  assessPgyPageAdvance,
+  candidatePageFingerprint,
+  PgyCandidateResponseCache,
+  resolvePgyStartPage
+} = require('./lib/pgy_candidate_response_cache');
+const {
+  PGY_CANDIDATE_CHECKPOINT_WAIT_MS,
+  assessCheckpointWindow,
+  buildCheckpointWindow,
+  findCheckpointBeforeNextPage,
+  findPendingCheckpoint
+} = require('./lib/pgy_candidate_checkpoint');
+const {
+  BrowserTabRegistry,
+  COLLECTION_TAB_ID,
+  MAIL_TAB_ID,
+  XHS_TAB_ID
+} = require('./lib/browser_tab_registry');
+
+installProcessStdioGuards(process);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 let mainWindow = null;
 let browserView = null;
+let mailBrowserView = null;
+let xhsBrowserView = null;
+let applyBrowserBounds = () => {};
+let collectionInteractionLockState = '';
+const browserTabRegistry = new BrowserTabRegistry();
+const browserTabViews = new Map();
 let backendProc = null;
 let taskRunner = null;
 let dbInstance = null;
@@ -68,23 +106,36 @@ let aiLastSqlResult = null; // { sql, rows } for optional export
 let kbCache = { loaded: false, index: null, meta: null };
 let pgyCandidateDebuggerAttached = false;
 const pgyCandidateResponseCache = new PgyCandidateResponseCache();
+let pgyCandidateCheckpointSession = null;
+let pgyCandidateCheckpointSequence = 0;
+let pgyCandidateReadRunning = false;
+let pgyCandidateCommandWindow = null;
+let pgyCandidateCaptureEpoch = 0;
+let directPgyExtractionRunning = false;
+let lastCollectionResultsUrl = '';
 
 let recordingEnabled = false;
+let recordingReplayRunning = false;
 let currentRecording = [];
 let xhsContactJob = {
   running: false,
   paused: false,
+  pauseRequested: false,
   cancelRequested: false,
   pauseReason: '',
+  phase: 'idle',
+  currentRowId: '',
+  currentCreatorName: '',
   resumeGate: null,
-  resumeGateResolve: null
+  resumeGateResolve: null,
+  controlWaiters: new Set()
 };
 const UI_WIDTH_RATIO = 0.72;   // 默认优先保证左侧建联工作台的可读宽度
 const UI_MIN_WIDTH = 620;
 const UI_MAX_WIDTH = 1040;
 const BROWSER_MIN_WIDTH = 320; // 右侧仍保留登录、跳转和人工操作所需的最小宽度
 const SPLITTER_WIDTH = 10;     // renderer 分割条宽度（px）
-const TOPBAR_HEIGHT = 56;      // 顶部工具栏高度（与 renderer 里保持一致）
+const TOPBAR_HEIGHT = 88;      // 顶部浏览器标签栏 + 工具栏高度（与 renderer 里保持一致）
 const DEFAULT_API_HOST = '127.0.0.1';
 const DEFAULT_API_PORT = '8010';
 const PGY_MIN_TAB_WAIT_MS = 2500;
@@ -92,12 +143,276 @@ const PGY_CANDIDATE_MAX_PAGES = 10;
 const PGY_ALLOW_NOTE_CLICK_RESOLVE = process.env.PGY_ALLOW_NOTE_CLICK_RESOLVE === 'true';
 const PGY_NOTE_CLICK_RESOLVE_LIMIT = 5;
 const XHS_CONTACT_BATCH_LIMIT = 50;
-const XHS_CONTACT_PAGE_WAIT_MS = 5500;
-const XHS_CONTACT_PAGE_JITTER_MS = 3500;
+const PGY_XHS_PROFILE_READY_TIMEOUT_MS = 15000;
+const PGY_XHS_PROFILE_READY_POLL_MS = 650;
+const XHS_CONTACT_READY_TIMEOUT_MS = 18000;
+const XHS_CONTACT_READY_POLL_MS = 800;
+const XHS_CONTACT_READY_CONFIRMATIONS = 2;
 const XHS_CONTACT_COOLDOWN_EVERY = 5;
 const XHS_CONTACT_COOLDOWN_MIN_MS = 35000;
 const XHS_CONTACT_COOLDOWN_JITTER_MS = 25000;
 const XHS_LOGIN_URL = 'https://www.xiaohongshu.com/explore';
+const PGY_CANDIDATE_RESULTS_URL = 'https://pgy.xiaohongshu.com/solar/pre-trade/note/kol';
+const DESKTOP_BACKEND_PROTOCOL_VERSION = '1';
+let backendInstanceToken = '';
+
+function getActiveBrowserView() {
+  return browserTabViews.get(browserTabRegistry.activeId) || browserView;
+}
+
+function isPgyCandidateResultsUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.hostname.toLowerCase() === 'pgy.xiaohongshu.com'
+      && /^\/solar\/pre-trade\/note\/kol(?:\/|$)/i.test(url.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function currentBrowserAutomationLock() {
+  if (pgyCandidateReadRunning) return '正在读取蒲公英候选，请等待本次读取结束';
+  if (pgyCandidateCheckpointSession) return '候选读取正处于安全暂停，请继续或结束本次读取';
+  if (taskRunner?.state?.running) return '蒲公英采集任务运行中';
+  if (xhsContactJob.running) return '小红书联系方式补采运行中';
+  if (directPgyExtractionRunning) return '当前达人页面采集运行中';
+  if (recordingReplayRunning) return '蒲公英录制回放运行中';
+  if (recordingEnabled) return '蒲公英录制排查进行中';
+  return '';
+}
+
+function rejectBrowserAutomationStart(actionLabel, { allowTaskRunner = false } = {}) {
+  const reason = currentBrowserAutomationLock();
+  if (!reason) return null;
+  if (allowTaskRunner && taskRunner?.state?.running && reason === '蒲公英采集任务运行中') return null;
+  return {
+    ok: false,
+    code: 'BROWSER_AUTOMATION_BUSY',
+    error: `${reason}，暂时不能${actionLabel}。请先完成或结束当前操作。`
+  };
+}
+
+async function syncCollectionInteractionLock({ force = false } = {}) {
+  if (!browserView || browserView.webContents.isDestroyed()) return;
+  const shouldBlock = Boolean(
+    pgyCandidateReadRunning
+    || pgyCandidateCheckpointSession
+    || (taskRunner?.state?.running && !taskRunner?.state?.paused)
+    || (xhsContactJob.running && !xhsContactJob.paused)
+    || directPgyExtractionRunning
+    || recordingReplayRunning
+  );
+  const reason = currentBrowserAutomationLock();
+  const nextState = shouldBlock ? reason : '';
+  if (!force && collectionInteractionLockState === nextState) return;
+  collectionInteractionLockState = nextState;
+  try {
+    await browserView.webContents.executeJavaScript(`
+      (() => {
+        const id = '__codex_collection_interaction_lock__';
+        const existing = document.getElementById(id);
+        if (${JSON.stringify(shouldBlock)}) {
+          const lock = existing || document.createElement('div');
+          lock.id = id;
+          lock.setAttribute('role', 'status');
+          lock.style.cssText = [
+            'position:fixed',
+            'inset:0',
+            'z-index:2147483647',
+            'background:rgba(255,255,255,0.02)',
+            'cursor:wait',
+            'pointer-events:auto'
+          ].join(';');
+          lock.innerHTML = '<div style="position:absolute;top:8px;left:50%;transform:translateX(-50%);max-width:80%;padding:7px 10px;border:1px solid rgba(17,24,39,.16);border-radius:6px;background:#fff;color:#111827;font:12px Microsoft YaHei,sans-serif;box-shadow:0 4px 16px rgba(17,24,39,.15)">'
+            + ${JSON.stringify(reason || '自动化运行中，页面操作已临时锁定')}
+            + '</div>';
+          if (!existing) (document.body || document.documentElement).appendChild(lock);
+        } else if (existing) {
+          existing.remove();
+        }
+        return true;
+      })()
+    `, true);
+  } catch (_) {}
+}
+
+function sendBrowserTabsSnapshot() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const tabs = browserTabRegistry.list().map((tab) => {
+    const view = browserTabViews.get(tab.id);
+    const webContents = view?.webContents;
+    let url = '';
+    let title = tab.title;
+    let loading = false;
+    let canGoBack = false;
+    let canGoForward = false;
+    try {
+      url = webContents?.getURL?.() || '';
+      title = webContents?.getTitle?.() || title;
+      loading = Boolean(webContents?.isLoading?.());
+      canGoBack = Boolean(webContents?.canGoBack?.());
+      canGoForward = Boolean(webContents?.canGoForward?.());
+    } catch (_) {}
+    return { ...tab, url, title, loading, canGoBack, canGoForward };
+  });
+  mainWindow.webContents.send('browser:tabs', {
+    activeTabId: browserTabRegistry.activeId,
+    tabs,
+    locked: Boolean(currentBrowserAutomationLock()),
+    lockReason: currentBrowserAutomationLock()
+  });
+  syncCollectionInteractionLock().catch(() => {});
+}
+
+function sendActiveBrowserUrl() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const activeId = browserTabRegistry.activeId;
+  const view = getActiveBrowserView();
+  let url = '';
+  try {
+    url = view?.webContents?.getURL?.() || '';
+  } catch (_) {}
+  mainWindow.webContents.send('browser:url', { tabId: activeId, url });
+  sendBrowserTabsSnapshot();
+}
+
+function configureBrowserTabView(view, tabId) {
+  const webContents = view.webContents;
+  webContents.setWindowOpenHandler((details) => {
+    try {
+      const url = String(details?.url || '');
+      if (tabId === COLLECTION_TAB_ID && normalizeXhsProfileUrl(url)) {
+        const detailView = ensureXhsBrowserTab();
+        activateBrowserTab(XHS_TAB_ID, { force: true });
+        detailView.webContents.loadURL(url);
+        return { action: 'deny' };
+      }
+      if (/^https?:\/\//i.test(url)) {
+        webContents.loadURL(url);
+        if (browserTabRegistry.activeId === tabId) sendActiveBrowserUrl();
+      }
+    } catch (_) {}
+    return { action: 'deny' };
+  });
+
+  webContents.on('will-navigate', (event, url) => {
+    if (tabId !== COLLECTION_TAB_ID || !normalizeXhsProfileUrl(url)) return;
+    event.preventDefault();
+    const detailView = ensureXhsBrowserTab();
+    activateBrowserTab(XHS_TAB_ID, { force: true });
+    detailView.webContents.loadURL(url);
+  });
+
+  const onNavigation = (_event, url) => {
+    if (tabId === COLLECTION_TAB_ID && isPgyCandidateResultsUrl(url)) {
+      lastCollectionResultsUrl = String(url || '').split('#')[0];
+    }
+    if (browserTabRegistry.activeId === tabId) sendActiveBrowserUrl();
+    else sendBrowserTabsSnapshot();
+  };
+  webContents.on('did-navigate', onNavigation);
+  webContents.on('did-navigate-in-page', onNavigation);
+  webContents.on('did-start-loading', sendBrowserTabsSnapshot);
+  webContents.on('did-stop-loading', sendBrowserTabsSnapshot);
+  webContents.on('did-finish-load', () => {
+    if (tabId === COLLECTION_TAB_ID) syncCollectionInteractionLock({ force: true }).catch(() => {});
+  });
+  webContents.on('page-title-updated', sendBrowserTabsSnapshot);
+}
+
+function activateBrowserTab(tabId, { force = false } = {}) {
+  const safeId = String(tabId || '');
+  if (!browserTabRegistry.has(safeId)) {
+    return { ok: false, code: 'BROWSER_TAB_NOT_FOUND', error: '浏览器标签不存在' };
+  }
+  const lockReason = currentBrowserAutomationLock();
+  if (!force && lockReason && safeId !== browserTabRegistry.activeId) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换标签` };
+  }
+  const view = browserTabViews.get(safeId);
+  if (!view) return { ok: false, code: 'BROWSER_TAB_NOT_READY', error: '浏览器标签尚未就绪' };
+  browserTabRegistry.activate(safeId);
+  mainWindow?.setBrowserView(view);
+  applyBrowserBounds();
+  sendActiveBrowserUrl();
+  return { ok: true, activeTabId: safeId };
+}
+
+function ensureCollectionTabActive(options = {}) {
+  return activateBrowserTab(COLLECTION_TAB_ID, { force: true, ...options });
+}
+
+function ensureMailBrowserTab() {
+  if (mailBrowserView && !mailBrowserView.webContents.isDestroyed()) return mailBrowserView;
+  mailBrowserView = new BrowserView({
+    webPreferences: {
+      partition: 'persist:mail_default',
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  browserTabRegistry.add({
+    id: MAIL_TAB_ID,
+    role: 'mail',
+    title: '企业邮箱',
+    closable: true
+  });
+  browserTabViews.set(MAIL_TAB_ID, mailBrowserView);
+  configureBrowserTabView(mailBrowserView, MAIL_TAB_ID);
+  mailBrowserView.webContents.loadURL('about:blank');
+  sendBrowserTabsSnapshot();
+  return mailBrowserView;
+}
+
+function ensureXhsBrowserTab() {
+  if (xhsBrowserView && !xhsBrowserView.webContents.isDestroyed()) return xhsBrowserView;
+  xhsBrowserView = new BrowserView({
+    webPreferences: {
+      // Share the existing PGY/XHS session while keeping page history and scroll
+      // isolated from the protected collection tab.
+      partition: 'persist:pgy_default',
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  browserTabRegistry.add({
+    id: XHS_TAB_ID,
+    role: 'xhs-profile',
+    title: '小红书主页',
+    closable: true
+  });
+  browserTabViews.set(XHS_TAB_ID, xhsBrowserView);
+  configureBrowserTabView(xhsBrowserView, XHS_TAB_ID);
+  xhsBrowserView.webContents.loadURL('about:blank');
+  sendBrowserTabsSnapshot();
+  return xhsBrowserView;
+}
+
+function closeBrowserTab(tabId) {
+  const safeId = String(tabId || '');
+  if (safeId === COLLECTION_TAB_ID) {
+    return { ok: false, code: 'BROWSER_TAB_PROTECTED', error: '采集标签固定绑定自动化，不能关闭' };
+  }
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能关闭标签` };
+  }
+  const view = browserTabViews.get(safeId);
+  if (!view || !browserTabRegistry.has(safeId)) {
+    return { ok: false, code: 'BROWSER_TAB_NOT_FOUND', error: '浏览器标签不存在' };
+  }
+  try {
+    browserTabRegistry.close(safeId);
+    browserTabViews.delete(safeId);
+    if (!view.webContents.isDestroyed()) view.webContents.destroy();
+    if (safeId === MAIL_TAB_ID) mailBrowserView = null;
+    if (safeId === XHS_TAB_ID) xhsBrowserView = null;
+    activateBrowserTab(browserTabRegistry.activeId, { force: true });
+    return { ok: true, activeTabId: browserTabRegistry.activeId };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
 
 function getRecordingsDir() {
   const dir = path.join(app.getPath('userData'), 'recordings');
@@ -230,6 +545,31 @@ function resolveInsideRecordings(maybePath) {
 
 function resolveInsideTemplates(maybePath) {
   return resolveInsideRoot(maybePath, getTemplatesDir());
+}
+
+function loadCandidateSearchCalibration(templatePath) {
+  if (!templatePath) return { ok: true, calibration: {} };
+  const safePath = resolveInsideTemplates(templatePath);
+  if (!safePath) return { ok: false, error: '非法路径：候选校准规则必须位于 templates 目录内' };
+  if (!fs.existsSync(safePath)) return { ok: false, error: '候选校准规则文件不存在' };
+  try {
+    const template = JSON.parse(fs.readFileSync(safePath, 'utf-8'));
+    const source = template?.candidate_search && typeof template.candidate_search === 'object'
+      ? template.candidate_search
+      : {};
+    const cleanSelector = (value) => String(value || '').trim().slice(0, 500);
+    return {
+      ok: true,
+      calibration: {
+        rowSelector: cleanSelector(source.rowSelector),
+        nameSelector: cleanSelector(source.nameSelector),
+        paginationSelector: cleanSelector(source.paginationSelector)
+      },
+      templatePath: safePath
+    };
+  } catch (err) {
+    return { ok: false, error: `候选校准规则解析失败：${String(err?.message || err)}` };
+  }
 }
 
 function ensureDefaultTemplateInUserData() {
@@ -697,7 +1037,8 @@ async function resolveNoteUrlsByClick(webContents, notes, noteCardSelector, { ti
 
 function attachPgyCandidateResponseCapture(webContents) {
   if (!webContents || pgyCandidateDebuggerAttached) return;
-  const pendingResponses = new Set();
+  const pendingResponses = new Map();
+  const sourceContext = () => `web-contents:${webContents.id}:navigation:${pgyCandidateCaptureEpoch}`;
   try {
     if (!webContents.debugger.isAttached()) webContents.debugger.attach('1.3');
     webContents.debugger.sendCommand('Network.enable').then(() => {
@@ -713,12 +1054,21 @@ function attachPgyCandidateResponseCapture(webContents) {
             || responseUrl.hostname.endsWith('.xiaohongshu.com');
           const isDataRequest = params.type === 'XHR' || params.type === 'Fetch';
           if (isPgyPage && isXhsRequest && isDataRequest && params.requestId) {
-            pendingResponses.add(params.requestId);
+            pendingResponses.set(params.requestId, {
+              requestUrl: params.response?.url || '',
+              commandWindow: pgyCandidateCommandWindow,
+              sourceContext: sourceContext()
+            });
           }
         } catch (_) {}
         return;
       }
+      if (method === 'Network.loadingFailed') {
+        pendingResponses.delete(params.requestId);
+        return;
+      }
       if (method !== 'Network.loadingFinished' || !pendingResponses.has(params.requestId)) return;
+      const pending = pendingResponses.get(params.requestId);
       pendingResponses.delete(params.requestId);
       webContents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId })
         .then((response) => {
@@ -727,7 +1077,11 @@ function attachPgyCandidateResponseCapture(webContents) {
           if (!body || body.length > 8 * 1024 * 1024) return;
           let payload = null;
           try { payload = JSON.parse(body); } catch (_) { return; }
-          pgyCandidateResponseCache.capture(payload);
+          pgyCandidateResponseCache.capture(payload, {
+            requestUrl: pending.requestUrl,
+            commandWindow: pending.commandWindow,
+            sourceContext: pending.sourceContext
+          });
         })
         .catch(() => {});
     });
@@ -740,10 +1094,223 @@ function candidateRangeLabel(startRank, endRank) {
   return startRank === 1 ? `前 ${endRank} 位` : `第 ${startRank}-${endRank} 位`;
 }
 
-async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 } = {}) {
+function currentCandidateSourceContext() {
+  if (!browserView?.webContents) return '';
+  return `web-contents:${browserView.webContents.id}:navigation:${pgyCandidateCaptureEpoch}`;
+}
+
+async function seedCandidateCommandFromVisiblePage(commandWindow, calibration = {}) {
+  if (!commandWindow || !browserView?.webContents) return { seeded: 0 };
+  let expectedPage = null;
+  try {
+    const pagination = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('inspect', 1, calibration),
+      true
+    );
+    if (pagination?.currentPageKnown) expectedPage = Number(pagination.currentPage);
+    else if (pagination?.firstPageKnown && pagination?.atFirstPage) expectedPage = 1;
+  } catch (_) {}
+
+  const deadline = Date.now() + 1500;
+  let result = null;
+  do {
+    result = pgyCandidateResponseCache.seedCommandWindow(commandWindow, {
+      sourceContext: currentCandidateSourceContext(),
+      expectedPage
+    });
+    if (result?.seeded) return result;
+    await sleep(150);
+  } while (Date.now() < deadline);
+  return result || { seeded: 0 };
+}
+
+async function confirmCandidateSnapshotOnVisiblePage(snapshot, expectedPage, calibration = {}) {
+  if (!browserView?.webContents || !Array.isArray(snapshot?.items) || snapshot.items.length < 2) {
+    return { ok: false, code: 'PGY_VISIBLE_CANDIDATE_IDENTITY_MISSING' };
+  }
+  let pagination = null;
+  try {
+    pagination = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('inspect', 1, calibration),
+      true
+    );
+  } catch (_) {}
+  const page = resolvePgyStartPage({ pagination }).visiblePageNumber;
+  if (Number(page || 0) !== Number(expectedPage || 0)) {
+    return { ok: false, code: 'PGY_VISIBLE_PAGE_MISMATCH', page };
+  }
+  let identity = null;
+  try {
+    identity = await browserView.webContents.executeJavaScript(
+      buildCandidatePageIdentityScript(snapshot.items, calibration),
+      true
+    );
+  } catch (_) {}
+  if (!identity?.orderedMatch) {
+    return {
+      ok: false,
+      code: 'PGY_VISIBLE_CANDIDATE_ORDER_MISMATCH',
+      matchedCount: Number(identity?.matchedCount || 0),
+      required: Number(identity?.required || 0)
+    };
+  }
+  return {
+    ok: true,
+    pageNumber: Number(expectedPage),
+    evidence: 'visible-candidate-order',
+    matchedCount: Number(identity.matchedCount || 0)
+  };
+}
+
+async function readCandidatePageFromVisibleComponents(expectedPage, calibration = {}) {
+  if (!browserView?.webContents) return null;
+  let pagination = null;
+  try {
+    pagination = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('inspect', 1, calibration),
+      true
+    );
+  } catch (_) {}
+  const page = resolvePgyStartPage({ pagination }).visiblePageNumber;
+  if (Number(page || 0) !== Number(expectedPage || 0)) return null;
+  try {
+    if (hasCompleteCandidateSearchCalibration(calibration)) {
+      const layout = await browserView.webContents.executeJavaScript(
+        buildCandidateSearchLayoutScript(calibration),
+        true
+      );
+      const domItems = (Array.isArray(layout?.candidates) ? layout.candidates : [])
+        .filter((candidate) => candidate?.name && /\/blogger-detail\//i.test(String(candidate?.href || '')))
+        .map((candidate) => ({
+          pgy_url: String(candidate.href),
+          creator_name: String(candidate.name),
+          note: '',
+          status: 'candidate',
+          priority: '',
+          excludeReason: ''
+        }));
+      if (
+        domItems.length >= 2
+        && Number(layout?.rowCount || 0) === domItems.length
+        && Number(layout?.nameCount || 0) === domItems.length
+      ) {
+        return {
+          ok: true,
+          items: domItems,
+          fingerprint: candidatePageFingerprint(domItems),
+          pageNumber: Number(expectedPage),
+          sequence: 0,
+          pageIdentityEvidence: 'calibrated-dom-rows',
+          stats: { source: 'calibrated-dom-rows' }
+        };
+      }
+    }
+    const runtimePage = await browserView.webContents.executeJavaScript(
+      buildSearchCandidateExtractionScript(MAX_CANDIDATE_COUNT),
+      true
+    );
+    if (!Array.isArray(runtimePage?.items) || !runtimePage.items.length) return null;
+    const snapshot = {
+      ok: true,
+      items: runtimePage.items,
+      fingerprint: candidatePageFingerprint(runtimePage.items),
+      pageNumber: Number(expectedPage),
+      sequence: 0,
+      pageIdentityEvidence: 'visible-component-data',
+      stats: runtimePage.stats || {}
+    };
+    const confirmation = await confirmCandidateSnapshotOnVisiblePage(
+      snapshot,
+      expectedPage,
+      calibration
+    );
+    return confirmation.ok ? snapshot : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolveCandidateSnapshotForVisiblePage({
+  commandWindow,
+  expectedPage,
+  afterSequence = 0,
+  previousFingerprint = '',
+  calibration = {}
+} = {}) {
+  if (!commandWindow || !expectedPage) return null;
+  const exact = pgyCandidateResponseCache.latestCandidates(MAX_CANDIDATE_COUNT, {
+    commandWindow,
+    afterSequence,
+    expectedPage
+  });
+  const broad = pgyCandidateResponseCache.latestCandidates(MAX_CANDIDATE_COUNT, {
+    commandWindow,
+    afterSequence
+  });
+  const snapshots = [];
+  const seen = new Set();
+  for (const snapshot of [...exact, ...broad]) {
+    const key = `${Number(snapshot?.sequence || 0)}:${String(snapshot?.fingerprint || '')}`;
+    if (!snapshot?.items?.length || seen.has(key)) continue;
+    seen.add(key);
+    snapshots.push(snapshot);
+  }
+  for (const snapshot of snapshots) {
+    if (previousFingerprint && snapshot.fingerprint === previousFingerprint) continue;
+    if (snapshot.pageNumber && Number(snapshot.pageNumber) !== Number(expectedPage)) continue;
+    const confirmation = await confirmCandidateSnapshotOnVisiblePage(
+      snapshot,
+      expectedPage,
+      calibration
+    );
+    if (!confirmation.ok) continue;
+    return {
+      ...snapshot,
+      responsePageNumber: snapshot.pageNumber,
+      pageNumber: Number(expectedPage),
+      pageIdentityEvidence: confirmation.evidence
+    };
+  }
+  const runtimePage = await readCandidatePageFromVisibleComponents(expectedPage, calibration);
+  if (
+    runtimePage?.items?.length
+    && runtimePage.fingerprint
+    && runtimePage.fingerprint !== String(previousFingerprint || '')
+  ) return runtimePage;
+  return null;
+}
+
+function closeCandidateCommandWindow(commandWindow = pgyCandidateCommandWindow) {
+  if (commandWindow) pgyCandidateResponseCache.endCommandWindow(commandWindow);
+  if (pgyCandidateCommandWindow === commandWindow) pgyCandidateCommandWindow = null;
+}
+
+function candidatePageAnchorUrls(page) {
+  return (Array.isArray(page?.items) ? page.items : [])
+    .map((item) => String(item?.pgy_url || ''))
+    .filter(Boolean);
+}
+
+function sameCandidatePageAnchors(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+  return left.every((url, index) => url === right[index]);
+}
+
+async function readPgyCandidatesFromResponsePages({
+  startRank = 1,
+  endRank = 1,
+  resumeSession = null,
+  initialItems = [],
+  commandWindow = null,
+  calibration = {}
+} = {}) {
   const requestedCount = endRank - startRank + 1;
-  const firstPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
-  if (!Array.isArray(firstPage?.items) || !firstPage.items.length) return null;
+  const activeCommandWindow = resumeSession?.commandWindow || commandWindow;
+  let firstPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT, {
+    commandWindow: activeCommandWindow
+  });
+  const seedItems = Array.isArray(initialItems) ? initialItems : [];
+  if (!browserView && !resumeSession && !seedItems.length && (!Array.isArray(firstPage?.items) || !firstPage.items.length)) return null;
   const items = [];
   const seen = new Set();
   const append = (rows) => {
@@ -753,16 +1320,31 @@ async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 }
       items.push(row);
     }
   };
-  const waitForNewResponse = async (previous = {}) => {
-    const waitUntil = Date.now() + 6000;
+  const waitForNewResponse = async (previous = {}, expectedPage = null) => {
+    const waitUntil = Date.now() + 15000;
     while (Date.now() < waitUntil) {
-      const latest = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
-      const latestFirstUrl = latest?.items?.[0]?.pgy_url || '';
+      const latest = await resolveCandidateSnapshotForVisiblePage({
+        commandWindow: activeCommandWindow,
+        expectedPage,
+        afterSequence: Number(previous.sequence || 0),
+        previousFingerprint: String(previous.fingerprint || ''),
+        calibration
+      });
+      const componentEvidence = /visible-component-data|calibrated-dom-rows/.test(
+        String(latest?.pageIdentityEvidence || '')
+      );
       if (
         latest?.items?.length
         && (
-          Number(latest.capturedAt || 0) > Number(previous.capturedAt || 0)
-          || (latestFirstUrl && latestFirstUrl !== String(previous.firstUrl || ''))
+          String(latest.fingerprint || '') !== String(previous.fingerprint || '')
+          || (
+            Number(latest.pageNumber || 0) > 0
+            && Number(latest.pageNumber || 0) !== Number(previous.pageNumber || 0)
+          )
+        )
+        && (
+          componentEvidence
+          || Number(latest.sequence || 0) > Number(previous.sequence || 0)
         )
       ) {
         return latest;
@@ -773,10 +1355,10 @@ async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 }
   };
 
   if (!browserView) {
-    append(firstPage.items);
+    append(seedItems.length ? seedItems : firstPage?.items);
     const resultItems = items.slice(startRank - 1, endRank);
     return {
-      ok: true,
+      ok: resultItems.length >= requestedCount,
       items: resultItems,
       stats: {
         requested: requestedCount,
@@ -792,103 +1374,341 @@ async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 }
     };
   }
 
-  let pagination = null;
-  try {
-    pagination = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect'), true);
-  } catch (_) {}
-  const startPage = Math.max(1, Number(pagination?.currentPage || 1));
-  let currentPage = startPage;
+  let startPage = 1;
+  let currentPage = 1;
   let pagesRead = 0;
   let stoppedForRisk = false;
+  let waitedCheckpoints = [];
+  let currentPageEvidence = null;
 
-  if (startPage === 1) {
-    append(firstPage.items);
-    pagesRead = 1;
-  } else {
-    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
-    if (!risk?.ok || risk.riskDetected) {
-      stoppedForRisk = true;
-    } else {
-      const previous = {
-        capturedAt: firstPage.capturedAt,
-        firstUrl: firstPage.items?.[0]?.pgy_url || ''
-      };
-      let first = null;
-      try {
-        first = await browserView.webContents.executeJavaScript(
-          buildSearchPaginationScript('goto', 1),
-          true
-        );
-      } catch (_) {}
-      if (!first?.clicked) {
-        return {
-          ok: false,
-          error: '当前不在搜索结果第 1 页，且未能自动回到第 1 页。请手动切到第 1 页后重试。'
-        };
-      }
-      currentPage = 1;
-      await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
-      const page = await waitForNewResponse(previous);
-      if (page?.items?.length) {
-        append(page.items);
-        pagesRead = 1;
-      }
-    }
-  }
-
-  if (!stoppedForRisk && pagesRead === 0) {
-    if (currentPage !== startPage) {
-      try {
-        const restore = await browserView.webContents.executeJavaScript(
-          buildSearchPaginationScript('goto', startPage),
-          true
-        );
-        if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
-      } catch (_) {}
-    }
-    return {
-      ok: false,
-      error: '已经定位到搜索结果第 1 页，但没有读取到列表数据。请稍候重试，或刷新右侧蒲公英页面。'
-    };
-  }
-
-  while (items.length < endRank && pagesRead < PGY_CANDIDATE_MAX_PAGES && !stoppedForRisk) {
-    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
-    if (!risk?.ok || risk.riskDetected) {
-      stoppedForRisk = true;
-      break;
-    }
-    const previousPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT);
-    const previous = {
-      capturedAt: previousPage?.capturedAt,
-      firstUrl: previousPage?.items?.[0]?.pgy_url || ''
-    };
-    let next = null;
-    try {
-      next = await browserView.webContents.executeJavaScript(buildSearchPaginationScript('next'), true);
-    } catch (_) {}
-    if (!next?.clicked) break;
-    currentPage += 1;
-    await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
-
-    const nextPage = await waitForNewResponse(previous);
-    if (!nextPage?.items?.length) break;
-    append(nextPage.items);
-    pagesRead += 1;
-  }
-
-  if (currentPage !== startPage && !stoppedForRisk) {
+  const restoreStartPage = async () => {
+    if (currentPage === startPage || stoppedForRisk) return;
     try {
       const restore = await browserView.webContents.executeJavaScript(
-        buildSearchPaginationScript('goto', startPage),
+        buildSearchPaginationScript('goto', startPage, calibration),
         true
       );
       if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
     } catch (_) {}
+  };
+  const failIncomplete = async (code, error) => {
+    await restoreStartPage();
+    return {
+      ok: false,
+      code,
+      error,
+      partialCount: Math.max(0, items.length - startRank + 1),
+      stats: {
+        requested: requestedCount,
+        startRank,
+        endRank,
+        available: items.length,
+        extracted: 0,
+        source: 'pgy-list-response',
+        pagesRead,
+        stoppedForRisk
+      }
+    };
+  };
+
+  if (resumeSession) {
+    append(resumeSession.items);
+    startPage = Math.max(1, Number(resumeSession.startPage || 1));
+    currentPage = Math.max(1, Number(resumeSession.currentPage || startPage));
+    pagesRead = Math.max(1, Number(resumeSession.pagesRead || 1));
+    waitedCheckpoints = Array.isArray(resumeSession.waitedCheckpoints)
+      ? resumeSession.waitedCheckpoints.slice()
+      : [];
+    currentPageEvidence = {
+      items: (resumeSession.pageAnchorUrls || []).map((pgy_url) => ({ pgy_url })),
+      fingerprint: resumeSession.pageFingerprint || (resumeSession.pageAnchorUrls || []).join('|'),
+      sequence: Number(resumeSession.pageSequence || 0),
+      pageNumber: currentPage
+    };
+  } else {
+    let pagination = null;
+    try {
+      pagination = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('inspect', 1, calibration),
+        true
+      );
+    } catch (_) {}
+    const startPageResolution = resolvePgyStartPage({
+      pagination,
+      responsePageNumber: firstPage?.pageNumber
+    });
+    const domPageNumber = startPageResolution.visiblePageNumber || 0;
+    startPage = startPageResolution.startPage;
+    if (!seedItems.length && domPageNumber) {
+      firstPage = await resolveCandidateSnapshotForVisiblePage({
+        commandWindow: activeCommandWindow,
+        expectedPage: domPageNumber,
+        calibration
+      });
+    }
+    currentPage = startPage;
+    const initialEvidence = seedItems.length
+      ? {
+          items: seedItems,
+          fingerprint: candidatePageFingerprint(seedItems),
+          sequence: 0,
+          pageNumber: startPage
+        }
+      : firstPage;
+
+    if (startPage === 1) {
+      const firstItems = seedItems.length ? seedItems : firstPage?.items;
+      append(firstItems);
+      currentPageEvidence = initialEvidence;
+      pagesRead = Array.isArray(firstItems) && firstItems.length ? 1 : 0;
+    } else {
+      const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+      if (!risk?.ok || risk.riskDetected) {
+        stoppedForRisk = true;
+      } else {
+        const previous = {
+          capturedAt: initialEvidence?.capturedAt,
+          fingerprint: initialEvidence?.fingerprint,
+          pageNumber: initialEvidence?.pageNumber,
+          sequence: initialEvidence?.sequence
+        };
+        let first = null;
+        try {
+          first = await browserView.webContents.executeJavaScript(
+            buildSearchPaginationScript('goto', 1, calibration),
+            true
+          );
+        } catch (_) {}
+        if (!first?.clicked && !first?.alreadyAtTarget) {
+          return {
+            ok: false,
+            code: 'PGY_PAGINATION_FIRST_PAGE_FAILED',
+            error: '当前不在搜索结果第 1 页，且未能自动回到第 1 页。请手动切到第 1 页后重试。'
+          };
+        }
+        currentPage = 1;
+        let page = null;
+        if (first?.alreadyAtTarget) {
+          page = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT, {
+            commandWindow: activeCommandWindow,
+            expectedPage: 1
+          });
+        } else {
+          await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
+          page = await waitForNewResponse(previous, 1);
+        }
+        if (page?.items?.length) {
+          append(page.items);
+          currentPageEvidence = page;
+          pagesRead = 1;
+        }
+      }
+    }
+  }
+
+  if (stoppedForRisk) {
+    return failIncomplete(
+      'PGY_RISK_STOP',
+      '检测到登录或安全提示，已停止翻页。本次部分结果不会自动加入候选。'
+    );
+  }
+  if (pagesRead === 0) {
+    return failIncomplete(
+      'PGY_PAGINATION_RESPONSE_MISSING',
+      '已确认当前是搜索结果第 1 页，但还没有拿到可验证的首页达人顺序，因此未冒然翻到第 2 页拼接排名。请等待列表显示稳定后重试；若仍失败，再手动刷新一次蒲公英页面。'
+    );
+  }
+
+  if (items.length < endRank) {
+    if (!hasCompleteCandidateSearchCalibration(calibration)) {
+      return failIncomplete(
+        'PGY_CANDIDATE_CALIBRATION_REQUIRED',
+        '当前指令需要跨页，但搜索结果校准尚未完成。请到“采集校准”依次标定达人整行、达人昵称和分页区域，并验证通过后重试。'
+      );
+    }
+    let layout = null;
+    let pagination = null;
+    try {
+      [layout, pagination] = await Promise.all([
+        browserView.webContents.executeJavaScript(buildCandidateSearchLayoutScript(calibration), true),
+        browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect', 1, calibration), true)
+      ]);
+    } catch (_) {}
+    if (
+      Number(layout?.rowCount || 0) < 2
+      || Number(layout?.rowCount || 0) !== Number(layout?.nameCount || 0)
+      || !pagination?.currentPageKnown
+    ) {
+      return failIncomplete(
+        'PGY_CANDIDATE_CALIBRATION_INVALID',
+        '搜索结果校准已失效：达人行、行内昵称或当前页码无法对应。请重新校准并验证，当前部分结果不会加入候选。'
+      );
+    }
+  }
+
+  while (pagesRead <= PGY_CANDIDATE_MAX_PAGES) {
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (!risk?.ok || risk.riskDetected) {
+      stoppedForRisk = true;
+      return failIncomplete(
+        'PGY_RISK_STOP',
+        `检测到登录或安全提示，已停止翻页：${risk?.riskText || '请查看右侧页面'}。本次部分结果不会自动加入候选。`
+      );
+    }
+
+    const checkpoint = findPendingCheckpoint({
+      available: items.length,
+      endRank,
+      waitedCheckpoints
+    }) || (items.length < endRank ? findCheckpointBeforeNextPage({
+      available: items.length,
+      nextPageSize: Number(currentPageEvidence?.items?.length || 0),
+      endRank,
+      waitedCheckpoints
+    }) : null);
+    if (checkpoint) {
+      const checkpointWindow = buildCheckpointWindow();
+      const sessionId = `candidate-checkpoint-${Date.now()}-${++pgyCandidateCheckpointSequence}`;
+      pgyCandidateCheckpointSession = {
+        id: sessionId,
+        ...checkpointWindow,
+        checkpoint,
+        startRank,
+        endRank,
+        requestedCount,
+        items: items.slice(),
+        startPage,
+        currentPage,
+        pagesRead,
+        waitedCheckpoints: [...waitedCheckpoints, checkpoint],
+        commandWindow: activeCommandWindow,
+        calibration: { ...calibration },
+        url: browserView.webContents.getURL() || '',
+        webContentsId: browserView.webContents.id,
+        pageAnchorUrls: candidatePageAnchorUrls(currentPageEvidence),
+        pageFingerprint: currentPageEvidence?.fingerprint || '',
+        pageSequence: Number(currentPageEvidence?.sequence || 0)
+      };
+      sendBrowserTabsSnapshot();
+      return {
+        ok: true,
+        paused: true,
+        items: [],
+        checkpoint: {
+          sessionId,
+          rank: checkpoint,
+          nextRank: items.length + 1,
+          endRank,
+          readyAt: checkpointWindow.readyAt,
+          expiresAt: checkpointWindow.expiresAt,
+          waitMs: PGY_CANDIDATE_CHECKPOINT_WAIT_MS,
+          partialInRange: Math.max(0, items.length - startRank + 1)
+        },
+        stats: {
+          requested: requestedCount,
+          startRank,
+          endRank,
+          available: items.length,
+          extracted: 0,
+          source: 'pgy-list-response',
+          pagesRead,
+          stoppedForRisk: false
+        },
+        message: items.length >= checkpoint
+          ? `已定位到第 ${checkpoint} 位并暂存结果。为降低连续翻页风险，安全暂停 90 秒后需手动继续读取第 ${checkpoint + 1}-${endRank} 位。`
+          : `已暂存前 ${items.length} 位；下一页将跨过第 ${checkpoint} 位安全边界，因此先暂停 90 秒。人工继续后读取第 ${items.length + 1}-${endRank} 位。`
+      };
+    }
+
+    if (items.length >= endRank) break;
+    if (pagesRead >= PGY_CANDIDATE_MAX_PAGES) break;
+
+    const previousPage = currentPageEvidence;
+    const previous = {
+      capturedAt: previousPage?.capturedAt,
+      fingerprint: previousPage?.fingerprint,
+      pageNumber: previousPage?.pageNumber,
+      sequence: previousPage?.sequence
+    };
+    let next = null;
+    try {
+      next = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('next', 1, calibration),
+        true
+      );
+    } catch (_) {}
+    if (!next?.clicked) {
+      return failIncomplete(
+        'PGY_PAGINATION_NEXT_NOT_FOUND',
+        `读取到第 ${items.length} 位后未找到可用的下一页按钮，无法确认第 ${items.length + 1}-${endRank} 位。本次部分结果不会自动加入候选。`
+      );
+    }
+    const expectedPage = Math.max(currentPage + 1, Number(next.targetPage || 0));
+    await sleep(PGY_MIN_TAB_WAIT_MS + Math.floor(Math.random() * 1200));
+
+    const nextPage = await waitForNewResponse(previous, expectedPage);
+    if (!nextPage?.items?.length) {
+      return failIncomplete(
+        'PGY_PAGINATION_RESPONSE_TIMEOUT',
+        `已点击第 ${expectedPage} 页，但 15 秒内没有收到新的达人列表响应。本次部分结果不会自动加入候选。`
+      );
+    }
+    let inspected = null;
+    try {
+      inspected = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('inspect', 1, calibration),
+        true
+      );
+    } catch (_) {}
+    const advance = assessPgyPageAdvance({
+      expectedPage,
+      responsePageNumber: nextPage.pageNumber,
+      domPageNumber: inspected?.currentPage,
+      domPageKnown: inspected?.currentPageKnown,
+      previousFingerprint: previousPage?.fingerprint,
+      nextFingerprint: nextPage.fingerprint,
+      previousUrls: Array.from(seen),
+      nextUrls: candidatePageAnchorUrls(nextPage)
+    });
+    if (!advance.ok && advance.code === 'PGY_PAGINATION_PAGE_MISMATCH') {
+      return failIncomplete(
+        'PGY_PAGINATION_PAGE_MISMATCH',
+        `下一页响应已出现，但响应或可见页码与第 ${expectedPage} 页不一致。本次部分结果不会自动加入候选。`
+      );
+    }
+    if (!advance.ok && advance.code === 'PGY_PAGINATION_PAGE_OVERLAP') {
+      return failIncomplete(
+        'PGY_PAGINATION_PAGE_OVERLAP',
+        `第 ${expectedPage} 页与前一页出现重复达人，无法保证第 ${startRank}-${endRank} 位的排名连续。本次部分结果不会自动加入候选。`
+      );
+    }
+    if (!advance.ok) {
+      return failIncomplete(
+        'PGY_PAGINATION_DUPLICATE_PAGE',
+        `第 ${expectedPage} 页没有出现新的唯一达人，可能仍是重复页面。本次部分结果不会自动加入候选。`
+      );
+    }
+    const beforeAppend = items.length;
+    append(nextPage.items);
+    if (items.length === beforeAppend) {
+      return failIncomplete(
+        'PGY_PAGINATION_DUPLICATE_PAGE',
+        `第 ${expectedPage} 页没有新增唯一达人，可能仍是重复页面。本次部分结果不会自动加入候选。`
+      );
+    }
+    currentPage = expectedPage;
+    currentPageEvidence = nextPage;
+    pagesRead += 1;
   }
 
   const resultItems = items.slice(startRank - 1, endRank);
-  const complete = resultItems.length >= requestedCount;
+  if (resultItems.length < requestedCount) {
+    return failIncomplete(
+      'PGY_PAGINATION_INCOMPLETE',
+      `最多读取到第 ${items.length} 位，未能完整取得${candidateRangeLabel(startRank, endRank)}。本次部分结果不会自动加入候选。`
+    );
+  }
+  await restoreStartPage();
   return {
     ok: true,
     items: resultItems,
@@ -900,14 +1720,133 @@ async function readPgyCandidatesFromResponsePages({ startRank = 1, endRank = 1 }
       extracted: resultItems.length,
       source: 'pgy-list-response',
       pagesRead,
-      stoppedForRisk
+      checkpointsWaited: waitedCheckpoints,
+      stoppedForRisk: false
     },
-    message: complete
-      ? `已按当前排序读取${candidateRangeLabel(startRank, endRank)}达人。`
-      : (stoppedForRisk
-        ? `检测到登录或安全提示，已停止翻页；本次只读取 ${resultItems.length} 位达人。`
-        : `当前结果只能读取到第 ${items.length} 位，本次范围内取得 ${resultItems.length} 位达人。`)
+    message: `已按当前排序完整读取${candidateRangeLabel(startRank, endRank)}达人。`
   };
+}
+
+async function validateCandidateCheckpointSession(sessionId) {
+  const session = pgyCandidateCheckpointSession;
+  if (!session || session.id !== String(sessionId || '')) {
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_CHECKPOINT_MISSING',
+      error: '本次安全暂停已经失效，请从原指令重新开始读取。'
+    };
+  }
+  const windowState = assessCheckpointWindow(session);
+  if (!windowState.ok) {
+    if (windowState.code === 'PGY_CANDIDATE_CHECKPOINT_COOLDOWN') {
+      return {
+        ok: false,
+        code: windowState.code,
+        remainingMs: windowState.remainingMs,
+        error: `安全暂停尚未结束，还需等待 ${Math.ceil(windowState.remainingMs / 1000)} 秒。`
+      };
+    }
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: windowState.code,
+      error: '本次安全暂停已超过 5 分钟并失效，请重新执行原指令。'
+    };
+  }
+  if (!browserView || browserView.webContents.id !== session.webContentsId) {
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_TAB_CHANGED',
+      error: '采集标签已经变化，本次暂停结果已作废。'
+    };
+  }
+  const currentUrl = browserView.webContents.getURL() || '';
+  if (currentUrl !== session.url || !isAllowedTaskUrl(currentUrl)) {
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_PAGE_CHANGED',
+      error: '暂停期间页面地址发生变化，本次结果已作废，请重新执行原指令。'
+    };
+  }
+  let pagination = null;
+  try {
+    pagination = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('inspect', 1, session.calibration || {}),
+      true
+    );
+  } catch (_) {}
+  if (
+    pagination?.currentPageKnown
+    && Number(pagination.currentPage || 0) !== Number(session.currentPage || 0)
+  ) {
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_PAGE_CHANGED',
+      error: '暂停期间搜索结果页码发生变化，本次结果已作废，请重新执行原指令。'
+    };
+  }
+  let latestPage = await resolveCandidateSnapshotForVisiblePage({
+    commandWindow: session.commandWindow,
+    expectedPage: session.currentPage,
+    calibration: session.calibration || {}
+  });
+  if (!Array.isArray(latestPage?.items) || !latestPage.items.length) {
+    try {
+      const runtimePage = await browserView.webContents.executeJavaScript(
+        buildSearchCandidateExtractionScript(MAX_CANDIDATE_RANK),
+        true
+      );
+      if (Array.isArray(runtimePage?.items) && runtimePage.items.length) {
+        latestPage = { items: runtimePage.items };
+      }
+    } catch (_) {}
+  }
+  if (!sameCandidatePageAnchors(candidatePageAnchorUrls(latestPage), session.pageAnchorUrls)) {
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_RANKING_CHANGED',
+      error: '暂停期间当前页达人顺序发生变化，无法保证排名连续，本次结果已作废。'
+    };
+  }
+  const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+  if (!risk?.ok || risk.riskDetected) {
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
+    return {
+      ok: false,
+      code: 'PGY_RISK_STOP',
+      error: `检测到登录或安全提示，已停止继续读取：${risk?.riskText || '请查看右侧页面'}。请勿连续刷新或重试。`
+    };
+  }
+  return { ok: true, session };
+}
+
+async function cancelCandidateCheckpointSession(sessionId) {
+  const session = pgyCandidateCheckpointSession;
+  if (!session || (sessionId && session.id !== String(sessionId))) {
+    return { ok: true, canceled: false };
+  }
+  pgyCandidateCheckpointSession = null;
+  try {
+    if (browserView && Number(session.currentPage || 1) !== Number(session.startPage || 1)) {
+      const restore = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('goto', session.startPage, session.calibration || {}),
+        true
+      );
+      if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+    }
+  } catch (_) {}
+  sendBrowserTabsSnapshot();
+  return { ok: true, canceled: true };
 }
 
 function createMainWindow() {
@@ -935,20 +1874,21 @@ function createMainWindow() {
       nodeIntegration: false
     }
   });
+  browserTabRegistry.clear();
+  browserTabViews.clear();
+  browserTabRegistry.add({
+    id: COLLECTION_TAB_ID,
+    role: 'collection',
+    title: '采集',
+    closable: false
+  });
+  browserTabViews.set(COLLECTION_TAB_ID, browserView);
+  configureBrowserTabView(browserView, COLLECTION_TAB_ID);
+  browserView.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) pgyCandidateCaptureEpoch += 1;
+  });
   attachPgyCandidateResponseCapture(browserView.webContents);
   mainWindow.setBrowserView(browserView);
-  // 很多站点（含蒲公英）会用 target=_blank / window.open 做站内跳转。
-  // 如果直接 deny，用户点击会“没反应”。这里改为：拦截新窗口并在当前 BrowserView 内打开。
-  browserView.webContents.setWindowOpenHandler((details) => {
-    try {
-      const url = details?.url;
-      if (url && /^https?:\/\//i.test(url)) {
-        browserView.webContents.loadURL(url);
-        mainWindow?.webContents.send('browser:url', { url });
-      }
-    } catch (_) {}
-    return { action: 'deny' };
-  });
 
   // 初始打开空白页
   browserView.webContents.loadURL('about:blank');
@@ -958,21 +1898,22 @@ function createMainWindow() {
     UI_MAX_WIDTH,
     Math.max(UI_MIN_WIDTH, Math.round(initialWindowWidth * UI_WIDTH_RATIO))
   );
-  const applyBounds = () => {
-    if (!mainWindow || !browserView) return;
+  applyBrowserBounds = () => {
+    const activeView = getActiveBrowserView();
+    if (!mainWindow || !activeView) return;
     const [w, h] = mainWindow.getContentSize();
     const x = Math.round(uiWidth + SPLITTER_WIDTH);
     const y = TOPBAR_HEIGHT;
     const width = Math.max(BROWSER_MIN_WIDTH, w - x);
     const height = Math.max(240, h - TOPBAR_HEIGHT);
-    browserView.setBounds({ x, y, width, height });
+    activeView.setBounds({ x, y, width, height });
     // width 由我们根据 uiWidth 控制；height 跟随窗口即可
-    browserView.setAutoResize({ width: false, height: true });
+    activeView.setAutoResize({ width: false, height: true });
   };
 
-  mainWindow.on('resize', applyBounds);
-  mainWindow.on('ready-to-show', applyBounds);
-  applyBounds();
+  mainWindow.on('resize', applyBrowserBounds);
+  mainWindow.on('ready-to-show', applyBrowserBounds);
+  applyBrowserBounds();
 
   // renderer 拖拽分割条后同步右侧 BrowserView 边界
   ipcMain.handle('browser:setLayout', async (_e, payload) => {
@@ -984,7 +1925,7 @@ function createMainWindow() {
         const min = UI_MIN_WIDTH;
         const max = Math.max(min, w - BROWSER_MIN_WIDTH - SPLITTER_WIDTH);
         uiWidth = Math.max(min, Math.min(max, cw));
-        applyBounds();
+        applyBrowserBounds();
       }
       return { ok: true, uiWidth };
     } catch (err) {
@@ -994,9 +1935,6 @@ function createMainWindow() {
 
   // 记录导航（用于回放）
   browserView.webContents.on('did-navigate', (_e, url) => {
-    // 推送当前 URL 给控制台 UI（用于地址栏显示）
-    mainWindow?.webContents.send('browser:url', { url });
-
     if (!recordingEnabled) return;
     if (!isAllowedTaskUrl(url)) return;
     currentRecording.push({
@@ -1007,28 +1945,20 @@ function createMainWindow() {
     mainWindow?.webContents.send('recording:count', currentRecording.length);
   });
 
-  // SPA 场景：hash/history 跳转不会触发 did-navigate
-  browserView.webContents.on('did-navigate-in-page', (_e, url) => {
-    mainWindow?.webContents.send('browser:url', { url });
-  });
-
-  browserView.webContents.on('did-finish-load', () => {
-    try {
-      const url = browserView?.webContents?.getURL?.() || '';
-      mainWindow?.webContents.send('browser:url', { url });
-    } catch (_) {}
-  });
-
   // Task 6：批量任务引擎（串行队列 + 暂停介入 + 证据包）
   taskRunner = new TaskRunner({
     getRunsDir,
     makeRunId,
-    sendState: (payload) => mainWindow?.webContents.send('tasks:state', payload),
+    sendState: (payload) => {
+      mainWindow?.webContents.send('tasks:state', payload);
+      sendBrowserTabsSnapshot();
+    },
     openUrl: async (url) => {
       if (!browserView) throw new Error('browserView 未初始化');
+      ensureCollectionTabActive();
       const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
       await browserView.webContents.loadURL(finalUrl);
-      mainWindow?.webContents.send('browser:url', { url: finalUrl });
+      sendActiveBrowserUrl();
     },
     getCurrentUrl: () => {
       try {
@@ -1046,11 +1976,24 @@ function createMainWindow() {
   } catch (_) {}
 
   mainWindow.on('closed', () => {
+    for (const view of browserTabViews.values()) {
+      try {
+        if (!view?.webContents?.isDestroyed?.()) view.webContents.destroy();
+      } catch (_) {}
+    }
+    browserTabRegistry.clear();
+    browserTabViews.clear();
     mainWindow = null;
     browserView = null;
+    mailBrowserView = null;
+    applyBrowserBounds = () => {};
+    collectionInteractionLockState = '';
     taskRunner = null;
     pgyCandidateDebuggerAttached = false;
     pgyCandidateResponseCache.clear();
+    pgyCandidateCommandWindow = null;
+    pgyCandidateCheckpointSession = null;
+    pgyCandidateReadRunning = false;
   });
 }
 
@@ -1097,17 +2040,40 @@ function httpGetJson({ host, port, path: urlPath, timeoutMs = 1200 }) {
   });
 }
 
-async function waitForBackendReady({ host, port, timeoutMs = 20000, intervalMs = 500 }) {
+async function waitForBackendReady({
+  host,
+  port,
+  timeoutMs = 20000,
+  intervalMs = 500,
+  expectedToken = ''
+}) {
   const startedAt = Date.now();
   let last = null;
 
   while (Date.now() - startedAt < timeoutMs) {
     // 优先健康检查（若不存在则 fallback 到 /api/config）
     const health = await httpGetJson({ host, port, path: '/api/desktop/health' });
-    if (health.ok) return { ok: true, path: '/api/desktop/health' };
+    if (health.ok) {
+      const assessed = assessBackendHealth(health, {
+        expectedToken,
+        protocolVersion: DESKTOP_BACKEND_PROTOCOL_VERSION
+      });
+      if (assessed.ok) {
+        return {
+          ok: true,
+          path: '/api/desktop/health',
+          pid: assessed.pid
+        };
+      }
+      last = { code: assessed.code };
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
 
     // health 404 视为“不存在” -> 继续探测 /api/config
-    const config = await httpGetJson({ host, port, path: '/api/config' });
+    const config = expectedToken
+      ? { ok: false, status: health.status, code: 'BACKEND_IDENTITY_MISSING' }
+      : await httpGetJson({ host, port, path: '/api/config' });
     if (config.ok) return { ok: true, path: '/api/config' };
 
     // 记录最后一次结果，用于超时后输出 code
@@ -1131,8 +2097,17 @@ function startBackendIfNeeded() {
     : path.resolve(__dirname, '..', 'content-analyzer');
   const backendEntry = path.join(backendDir, 'main.py');
   const packagedBackendDir = path.join(process.resourcesPath, 'content-analyzer-backend');
-  const packagedBackendEntry = path.join(packagedBackendDir, 'xhs-pgy-backend');
+  const packagedBackendEntry = packagedBackendExecutable(process.resourcesPath);
   const shouldUsePackagedBackend = app.isPackaged && fs.existsSync(packagedBackendEntry);
+
+  if (app.isPackaged && !shouldUsePackagedBackend) {
+    console.error('[backend] 安装包缺少内置后端：', packagedBackendEntry);
+    mainWindow?.webContents.send('backend:status', {
+      running: false,
+      code: 'PACKAGED_BACKEND_NOT_FOUND'
+    });
+    return;
+  }
 
   if (!shouldUsePackagedBackend && !fs.existsSync(backendEntry)) {
     console.warn('[backend] 未找到后端入口 main.py，跳过启动：', backendEntry);
@@ -1140,12 +2115,16 @@ function startBackendIfNeeded() {
   }
 
   const packagedDataRoot = app.isPackaged ? path.join(app.getPath('userData'), 'content-analyzer') : null;
+  backendInstanceToken = crypto.randomBytes(32).toString('hex');
   // 可按需在这里固定端口
   const env = {
     ...process.env,
     API_HOST: process.env.API_HOST || DEFAULT_API_HOST,
     API_PORT: process.env.API_PORT || DEFAULT_API_PORT,
     DEBUG: process.env.DEBUG || 'false',
+    PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+    PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8',
+    DESKTOP_INSTANCE_TOKEN: backendInstanceToken,
     ...(packagedDataRoot
       ? {
           DATA_DIR: process.env.DATA_DIR || path.join(packagedDataRoot, 'data'),
@@ -1160,7 +2139,8 @@ function startBackendIfNeeded() {
     const proc = spawn(packagedBackendEntry, [], {
       cwd: packagedBackendDir,
       env,
-      stdio: 'pipe'
+      stdio: 'ignore',
+      windowsHide: true
     });
 
     proc.on('error', (err) => {
@@ -1168,11 +2148,11 @@ function startBackendIfNeeded() {
       mainWindow?.webContents.send('backend:status', { running: false, code: err?.code || 'SPAWN_ERROR' });
     });
 
-    proc.stdout.on('data', (buf) => {
+    proc.stdout?.on('data', (buf) => {
       const s = buf.toString();
       console.log('[backend]', s.trimEnd());
     });
-    proc.stderr.on('data', (buf) => {
+    proc.stderr?.on('data', (buf) => {
       const s = buf.toString();
       console.error('[backend]', s.trimEnd());
     });
@@ -1183,7 +2163,7 @@ function startBackendIfNeeded() {
     });
 
     backendProc = proc;
-    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT })
+    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT, expectedToken: backendInstanceToken })
       .then((ready) => {
         mainWindow?.webContents.send('backend:status', ready?.ok
           ? { running: true, host: env.API_HOST, port: env.API_PORT, readyPath: ready.path }
@@ -1219,7 +2199,8 @@ function startBackendIfNeeded() {
     const proc = spawn(pythonCmd, [backendEntry], {
       cwd: backendDir,
       env,
-      stdio: 'pipe'
+      stdio: 'pipe',
+      windowsHide: true
     });
 
     // 关键：命令不存在时会触发 error 事件（ENOENT）
@@ -1249,7 +2230,7 @@ function startBackendIfNeeded() {
 
     backendProc = proc;
     // Task 2：spawn 后先探测后端就绪（成功后才 running=true）
-    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT })
+    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT, expectedToken: backendInstanceToken })
       .then((ready) => {
         if (!ready?.ok) {
           mainWindow?.webContents.send('backend:status', {
@@ -1291,40 +2272,178 @@ function stopBackend() {
 // =========================
 // IPC：浏览器控制
 // =========================
+ipcMain.handle('app:info', async () => ({
+  ok: true,
+  version: app.getVersion()
+}));
+
 ipcMain.handle('backend:info', async () => {
   const host = process.env.API_HOST || DEFAULT_API_HOST;
   const port = process.env.API_PORT || DEFAULT_API_PORT;
-  const ready = await waitForBackendReady({ host, port, timeoutMs: 300 });
-  return { ok: true, host, port, running: !!ready?.ok, readyPath: ready?.path || '' };
+  const ready = await waitForBackendReady({
+    host,
+    port,
+    timeoutMs: 300,
+    expectedToken: backendInstanceToken
+  });
+  return {
+    ok: true,
+    host,
+    port,
+    running: !!ready?.ok,
+    readyPath: ready?.path || '',
+    code: ready?.ok ? '' : (ready?.code || 'BACKEND_NOT_READY')
+  };
 });
 
 ipcMain.handle('browser:getUrl', async () => {
   try {
-    const url = browserView?.webContents?.getURL?.() || '';
-    return { ok: true, url };
+    const url = getActiveBrowserView()?.webContents?.getURL?.() || '';
+    return { ok: true, tabId: browserTabRegistry.activeId, url };
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   }
 });
 
+ipcMain.handle('browser:getCollectionUrl', async () => {
+  try {
+    const url = browserView?.webContents?.getURL?.() || '';
+    return { ok: true, tabId: COLLECTION_TAB_ID, url };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle('browser:returnToCollectionResults', async () => {
+  if (!browserView?.webContents) return { ok: false, error: '采集页尚未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，请先暂停并停止任务或等待任务结束` };
+  }
+  ensureCollectionTabActive();
+  const webContents = browserView.webContents;
+  const currentUrl = webContents.getURL() || '';
+  if (isPgyCandidateResultsUrl(currentUrl)) {
+    return { ok: true, restoredFromHistory: true, url: currentUrl };
+  }
+
+  try {
+    const history = webContents.navigationHistory;
+    const activeIndex = history?.getActiveIndex?.() ?? -1;
+    for (let index = activeIndex - 1; index >= 0; index -= 1) {
+      const entry = history?.getEntryAtIndex?.(index);
+      if (!isPgyCandidateResultsUrl(entry?.url)) continue;
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          webContents.removeListener('did-stop-loading', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, 8000);
+        webContents.once('did-stop-loading', finish);
+        webContents.goToIndex(index);
+      });
+      sendActiveBrowserUrl();
+      return {
+        ok: true,
+        restoredFromHistory: true,
+        url: webContents.getURL() || entry.url
+      };
+    }
+  } catch (_) {
+    // Fall back to the last known result URL below.
+  }
+
+  const fallbackUrl = isPgyCandidateResultsUrl(lastCollectionResultsUrl)
+    ? lastCollectionResultsUrl
+    : PGY_CANDIDATE_RESULTS_URL;
+  try {
+    await webContents.loadURL(fallbackUrl);
+    sendActiveBrowserUrl();
+    return {
+      ok: true,
+      restoredFromHistory: false,
+      url: fallbackUrl,
+      warning: '没有找到原筛选页历史，已打开达人广场；请重新确认筛选条件和页码'
+    };
+  } catch (error) {
+    return { ok: false, error: `返回筛选结果失败：${String(error?.message || error)}` };
+  }
+});
+
+ipcMain.handle('browser:listTabs', async () => {
+  sendBrowserTabsSnapshot();
+  const tabs = browserTabRegistry.list().map((tab) => {
+    const view = browserTabViews.get(tab.id);
+    let url = '';
+    let title = tab.title;
+    try {
+      url = view?.webContents?.getURL?.() || '';
+      title = view?.webContents?.getTitle?.() || title;
+    } catch (_) {}
+    return { ...tab, url, title };
+  });
+  return {
+    ok: true,
+    activeTabId: browserTabRegistry.activeId,
+    tabs,
+    locked: Boolean(currentBrowserAutomationLock()),
+    lockReason: currentBrowserAutomationLock()
+  };
+});
+
+ipcMain.handle('browser:activateTab', async (_e, tabId) => activateBrowserTab(tabId));
+ipcMain.handle('browser:closeTab', async (_e, tabId) => closeBrowserTab(tabId));
+
 ipcMain.handle('browser:open', async (_e, url) => {
-  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const activeView = getActiveBrowserView();
+  if (!activeView) return { ok: false, error: 'browserView 未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason && browserTabRegistry.activeId === COLLECTION_TAB_ID) {
+    return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开其他网页` };
+  }
   const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
   try {
+    await activeView.webContents.loadURL(finalUrl);
+    sendActiveBrowserUrl();
+    return { ok: true, tabId: browserTabRegistry.activeId, url: finalUrl };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('browser:openCollection', async (_e, url) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开其他网页` };
+  }
+  const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    ensureCollectionTabActive();
     await browserView.webContents.loadURL(finalUrl);
-    mainWindow?.webContents.send('browser:url', { url: finalUrl });
-    return { ok: true };
+    sendActiveBrowserUrl();
+    return { ok: true, tabId: COLLECTION_TAB_ID, url: finalUrl };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
 });
 
 ipcMain.handle('browser:nav', async (_e, action) => {
-  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const activeView = getActiveBrowserView();
+  if (!activeView) return { ok: false, error: 'browserView 未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason && browserTabRegistry.activeId === COLLECTION_TAB_ID) {
+    return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能导航或刷新` };
+  }
   try {
-    if (action === 'back' && browserView.webContents.canGoBack()) browserView.webContents.goBack();
-    if (action === 'forward' && browserView.webContents.canGoForward()) browserView.webContents.goForward();
-    if (action === 'reload') browserView.webContents.reload();
+    if (action === 'back' && activeView.webContents.canGoBack()) activeView.webContents.goBack();
+    if (action === 'forward' && activeView.webContents.canGoForward()) activeView.webContents.goForward();
+    if (action === 'reload') activeView.webContents.reload();
+    sendBrowserTabsSnapshot();
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
@@ -1398,9 +2517,18 @@ function emitXhsContactProgress(payload = {}) {
   mainWindow?.webContents.send('contacts:xhsProgress', {
     running: xhsContactJob.running,
     paused: xhsContactJob.paused,
+    pausePending: xhsContactJob.pauseRequested,
+    cancelPending: xhsContactJob.cancelRequested,
     pauseReason: xhsContactJob.pauseReason,
+    phase: xhsContactJob.phase,
+    currentRowId: xhsContactJob.currentRowId,
+    currentCreatorName: xhsContactJob.currentCreatorName,
     ...payload
   });
+}
+
+function wakeXhsContactControlWaiters(action) {
+  for (const resolve of Array.from(xhsContactJob.controlWaiters || [])) resolve(action);
 }
 
 function newXhsResumeGate() {
@@ -1417,7 +2545,42 @@ async function waitForXhsResume() {
   return action || 'resume';
 }
 
+async function waitForXhsControl(ms = 0) {
+  if (xhsContactJob.cancelRequested) return 'cancel';
+  if (xhsContactJob.pauseRequested && !xhsContactJob.paused) {
+    xhsContactJob.pauseRequested = false;
+    xhsContactJob.paused = true;
+    xhsContactJob.pauseReason = xhsContactJob.pauseReason || '用户暂停';
+    newXhsResumeGate();
+    emitXhsContactProgress({
+      type: 'paused',
+      code: 'USER_PAUSED',
+      message: '补采已在安全点暂停，不会继续读取下一位达人'
+    });
+    sendBrowserTabsSnapshot();
+  }
+  if (xhsContactJob.paused) return await waitForXhsResume();
+
+  const delayMs = Math.max(0, Number(ms || 0));
+  if (!delayMs) return 'continue';
+  const action = await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      xhsContactJob.controlWaiters?.delete(finish);
+      resolve(value || 'continue');
+    };
+    const timer = setTimeout(() => finish('continue'), delayMs);
+    xhsContactJob.controlWaiters?.add(finish);
+  });
+  if (action === 'pause') return await waitForXhsControl(0);
+  return action;
+}
+
 async function pauseXhsContactJob(reason, code = 'XHS_MANUAL_INTERVENTION') {
+  xhsContactJob.pauseRequested = false;
   xhsContactJob.paused = true;
   xhsContactJob.pauseReason = String(reason || '请在右侧页面手工处理');
   newXhsResumeGate();
@@ -1427,24 +2590,26 @@ async function pauseXhsContactJob(reason, code = 'XHS_MANUAL_INTERVENTION') {
 
 function resumeXhsContactJob(action = 'resume') {
   const resolve = xhsContactJob.resumeGateResolve;
+  xhsContactJob.pauseRequested = false;
   xhsContactJob.paused = false;
   xhsContactJob.pauseReason = '';
   xhsContactJob.resumeGate = null;
   xhsContactJob.resumeGateResolve = null;
   resolve?.(action);
+  wakeXhsContactControlWaiters(action);
 }
 
-async function waitForProfileNavigation(timeoutMs = 10000) {
+async function waitForProfileNavigation(view, timeoutMs = 10000) {
   const end = Date.now() + Math.max(1000, Number(timeoutMs || 0));
   while (Date.now() < end) {
-    const current = normalizeXhsProfileUrl(browserView?.webContents?.getURL?.() || '');
+    const current = normalizeXhsProfileUrl(view?.webContents?.getURL?.() || '');
     if (current) return current;
-    await sleep(250);
+    if (await waitForXhsControl(250) === 'cancel') return '';
   }
   return '';
 }
 
-async function resolveXhsProfileUrlFromPgy(row = {}) {
+async function resolveXhsProfileUrlFromPgyOnce(row = {}, view = browserView) {
   const saved = normalizeXhsProfileUrl(row.xhsProfileUrl);
   if (saved) return { ok: true, profileUrl: saved, source: 'saved' };
 
@@ -1453,11 +2618,14 @@ async function resolveXhsProfileUrlFromPgy(row = {}) {
     return { ok: false, code: 'PGY_PROFILE_URL_REQUIRED', error: '缺少有效的蒲公英达人详情链接' };
   }
 
-  await browserView.webContents.loadURL(creatorUrl);
+  if (!view?.webContents) {
+    return { ok: false, code: 'XHS_BROWSER_TAB_NOT_READY', error: '小红书主页标签未初始化' };
+  }
+  await view.webContents.loadURL(creatorUrl);
   mainWindow?.webContents.send('browser:url', { url: creatorUrl });
   await sleep(3500);
 
-  const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+  const risk = await pgyDetectRiskOnCurrentPage(view.webContents);
   if (risk?.riskDetected) {
     return {
       ok: false,
@@ -1468,7 +2636,7 @@ async function resolveXhsProfileUrlFromPgy(row = {}) {
   }
 
   const xhsId = String(row.xhsId || '').trim();
-  const resolved = await browserView.webContents.executeJavaScript(
+  const resolved = await view.webContents.executeJavaScript(
     `
       (function(){
         const wanted = ${JSON.stringify(xhsId)};
@@ -1528,16 +2696,222 @@ async function resolveXhsProfileUrlFromPgy(row = {}) {
   const direct = firstProfileUrl(resolved?.hrefs);
   if (direct) return { ok: true, profileUrl: direct, source: 'pgy_link' };
   if (resolved?.clicked) {
-    const navigated = await waitForProfileNavigation(10000);
+    const navigated = await waitForProfileNavigation(view, 10000);
     if (navigated) return { ok: true, profileUrl: navigated, source: 'pgy_click' };
   }
   return { ok: false, code: 'XHS_PROFILE_NOT_FOUND', error: '未能从蒲公英页面解析小红书主页链接' };
 }
 
-async function inspectXhsProfilePage() {
-  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+async function inspectPgyXhsProfileLink(view, xhsId = '', allowClick = false) {
+  return await view.webContents.executeJavaScript(
+    `
+      (function(){
+        const wanted = ${JSON.stringify(String(xhsId || '').trim())};
+        const allowClick = ${JSON.stringify(Boolean(allowClick))};
+        const compact = (value) => String(value || '').replace(/\\s+/g, '').trim();
+        const isVisible = (el) => {
+          try {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          } catch (_) { return false; }
+        };
+        const hrefs = [];
+        const targetHrefs = [];
+        const addHref = (value) => {
+          const text = String(value || '').trim();
+          if (text && !hrefs.includes(text)) hrefs.push(text);
+        };
+        const addTargetHref = (value) => {
+          const text = String(value || '').trim();
+          if (text && !targetHrefs.includes(text)) targetHrefs.push(text);
+          addHref(text);
+        };
+        document.querySelectorAll('a[href], [data-href], [data-url]').forEach((el) => {
+          addHref(el.href);
+          addHref(el.getAttribute('href'));
+          addHref(el.getAttribute('data-href'));
+          addHref(el.getAttribute('data-url'));
+        });
+        const knownIdAnchor = document.querySelector('.base-info-item.blogger-redid a');
+        let target = knownIdAnchor && isVisible(knownIdAnchor) ? knownIdAnchor : null;
+        if (!target && wanted) {
+          const wantedCompact = compact(wanted);
+          target = Array.from(document.querySelectorAll('a,button,span,div,p'))
+            .filter(isVisible)
+            .filter((el) => {
+              const text = compact(el.textContent);
+              return text === wantedCompact || text === compact('小红书号：' + wanted) || text === compact('小红书号:' + wanted);
+            })
+            .sort((a, b) => String(a.textContent || '').length - String(b.textContent || '').length)[0] || null;
+        }
+        const anchor = target?.closest?.('a') || target?.querySelector?.('a') || null;
+        if (anchor) {
+          addTargetHref(anchor.href);
+          addTargetHref(anchor.getAttribute('href'));
+        }
+        let cursor = target;
+        for (let i = 0; cursor && i < 5; i += 1, cursor = cursor.parentElement) {
+          Array.from(cursor.attributes || []).forEach((attr) => addTargetHref(attr.value));
+        }
+        let clicked = false;
+        if (allowClick && target) {
+          try {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            (anchor || target).click();
+            clicked = true;
+          } catch (_) {}
+        }
+        const bodyText = String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+        const pageEvidence = Boolean(
+          document.querySelector('.blogger-base-info, .base-info-item.blogger-redid, [class*="blogger-detail" i]') ||
+          /小红书(?:号|ID)|粉丝数|报价/.test(bodyText)
+        );
+        return {
+          ok: true,
+          documentReadyState: document.readyState,
+          pageEvidence,
+          targetFound: Boolean(target),
+          xhsIdSeen: wanted ? compact(bodyText).includes(compact(wanted)) : false,
+          hrefs,
+          targetHrefs,
+          clicked
+        };
+      })()
+    `,
+    true
+  );
+}
+
+async function resolveXhsProfileUrlFromPgy(row = {}, view = browserView) {
+  const creatorUrl = String(row.creatorUrl || '').trim();
+  const saved = normalizeXhsProfileUrl(row.xhsProfileUrl);
+  if (saved && xhsProfileMatchesPgyCreator(saved, creatorUrl)) {
+    return { ok: true, profileUrl: saved, source: 'saved' };
+  }
+
+  if (!isAllowedTaskUrl(creatorUrl)) {
+    return { ok: false, code: 'PGY_PROFILE_URL_REQUIRED', error: '缺少有效的蒲公英达人详情链接' };
+  }
+  if (!view?.webContents) {
+    return { ok: false, code: 'XHS_BROWSER_TAB_NOT_READY', error: '小红书主页标签未初始化' };
+  }
+
   try {
-    return await browserView.webContents.executeJavaScript(
+    await view.webContents.loadURL(creatorUrl);
+  } catch (error) {
+    if (xhsContactJob.cancelRequested) return { ok: false, canceled: true, code: 'XHS_CONTACT_CANCELED', error: '补采已停止' };
+    return { ok: false, retryable: true, code: 'PGY_PROFILE_LOAD_FAILED', error: `蒲公英达人页打开失败：${String(error?.message || error)}` };
+  }
+  mainWindow?.webContents.send('browser:url', { url: creatorUrl });
+
+  const expectedCreatorId = extractPgyCreatorEntityId(creatorUrl);
+  const xhsId = String(row.xhsId || '').trim();
+  const deadline = Date.now() + PGY_XHS_PROFILE_READY_TIMEOUT_MS;
+  let stableEvidenceReads = 0;
+  let lastInspection = null;
+  let clickAttempted = false;
+  while (Date.now() < deadline) {
+    if (await waitForXhsControl(0) === 'cancel') {
+      return { ok: false, canceled: true, code: 'XHS_CONTACT_CANCELED', error: '补采已停止' };
+    }
+    const navigatedProfile = normalizeXhsProfileUrl(view.webContents.getURL());
+    if (navigatedProfile) {
+      if (xhsProfileMatchesPgyCreator(navigatedProfile, creatorUrl)) {
+        return { ok: true, profileUrl: navigatedProfile, source: 'pgy_navigation' };
+      }
+      return {
+        ok: false,
+        retryable: false,
+        code: 'XHS_PROFILE_ID_MISMATCH',
+        error: `蒲公英达人 ${expectedCreatorId || '当前记录'} 打开了不匹配的小红书主页，已拒绝写入`
+      };
+    }
+
+    const risk = await pgyDetectRiskOnCurrentPage(view.webContents);
+    if (risk?.riskDetected) {
+      return {
+        ok: false,
+        code: 'PGY_RISK_DETECTED',
+        error: `蒲公英页面触发验证：${risk.riskText || '请手工确认'}`,
+        manualIntervention: true
+      };
+    }
+
+    try {
+      lastInspection = await inspectPgyXhsProfileLink(view, xhsId, false);
+    } catch (_) {
+      const currentProfile = normalizeXhsProfileUrl(view.webContents.getURL());
+      if (currentProfile && xhsProfileMatchesPgyCreator(currentProfile, creatorUrl)) {
+        return { ok: true, profileUrl: currentProfile, source: 'pgy_navigation' };
+      }
+      if (await waitForXhsControl(PGY_XHS_PROFILE_READY_POLL_MS) === 'cancel') break;
+      continue;
+    }
+    const direct = firstProfileUrl(lastInspection?.targetHrefs);
+    if (direct && xhsProfileMatchesPgyCreator(direct, creatorUrl)) {
+      return { ok: true, profileUrl: direct, source: 'pgy_link' };
+    }
+
+    const documentReady = ['interactive', 'complete'].includes(String(lastInspection?.documentReadyState || ''));
+    stableEvidenceReads = documentReady && lastInspection?.pageEvidence ? stableEvidenceReads + 1 : 0;
+    if (stableEvidenceReads >= 2 && lastInspection?.targetFound) {
+      const derivedProfile = xhsProfileUrlFromPgyCreator(creatorUrl);
+      if (derivedProfile) {
+        return { ok: true, profileUrl: derivedProfile, source: 'pgy_creator_id' };
+      }
+    }
+    if (!clickAttempted && stableEvidenceReads >= 2 && lastInspection?.targetFound) {
+      clickAttempted = true;
+      const clicked = await inspectPgyXhsProfileLink(view, xhsId, true).catch(() => null);
+      const clickedDirect = firstProfileUrl(clicked?.targetHrefs);
+      if (clickedDirect && xhsProfileMatchesPgyCreator(clickedDirect, creatorUrl)) {
+        return { ok: true, profileUrl: clickedDirect, source: 'pgy_link' };
+      }
+      if (clicked?.clicked) {
+        const navigated = await waitForProfileNavigation(view, 10000);
+        if (navigated && xhsProfileMatchesPgyCreator(navigated, creatorUrl)) {
+          return { ok: true, profileUrl: navigated, source: 'pgy_click' };
+        }
+        if (navigated) {
+          return {
+            ok: false,
+            retryable: false,
+            code: 'XHS_PROFILE_ID_MISMATCH',
+            error: `蒲公英达人 ${expectedCreatorId || '当前记录'} 打开了不匹配的小红书主页，已拒绝写入`
+          };
+        }
+      }
+    }
+    if (await waitForXhsControl(PGY_XHS_PROFILE_READY_POLL_MS) === 'cancel') break;
+  }
+  if (xhsContactJob.cancelRequested) {
+    return { ok: false, canceled: true, code: 'XHS_CONTACT_CANCELED', error: '补采已停止' };
+  }
+  if (!lastInspection?.pageEvidence) {
+    return {
+      ok: false,
+      retryable: true,
+      code: 'PGY_PROFILE_NOT_READY',
+      error: '蒲公英达人页在等待时间内未稳定加载，尚不能判断是否有小红书主页'
+    };
+  }
+  return {
+    ok: false,
+    retryable: false,
+    code: 'XHS_PROFILE_NOT_FOUND',
+    error: xhsId
+      ? `蒲公英达人页已加载，但未找到与小红书号 ${xhsId} 对应的主页入口`
+      : '蒲公英达人页已加载，但没有找到可打开的小红书主页入口'
+  };
+}
+
+async function inspectXhsProfilePage() {
+  if (!xhsBrowserView?.webContents) {
+    return { ok: false, code: 'XHS_BROWSER_TAB_NOT_READY', error: '小红书主页标签未初始化' };
+  }
+  try {
+    return await xhsBrowserView.webContents.executeJavaScript(
       `
         (function(){
           const url = location.href;
@@ -1566,24 +2940,46 @@ async function inspectXhsProfilePage() {
           ].forEach((selector) => document.querySelectorAll(selector).forEach((el) => {
             if (visible(el)) add(el.innerText);
           }));
+          const visibleMailtoHrefs = [];
+          document.querySelectorAll('a[href^="mailto:" i]').forEach((el) => {
+            if (!visible(el)) return;
+            const href = String(el.getAttribute('href') || '');
+            visibleMailtoHrefs.push(href);
+            const address = href.replace(/^mailto:/i, '').split('?')[0];
+            try { add(decodeURIComponent(address)); } catch (_) { add(address); }
+          });
           Array.from(document.querySelectorAll('div,span,p')).forEach((el) => {
             if (!visible(el)) return;
             const text = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
             if (text.length > 0 && text.length <= 300 && /(小红书号|邮箱|邮件|微信|vx|v信|wechat|商务|合作|联系)/i.test(text)) add(text);
           });
           const profileText = Array.from(snippets).join('\\n').slice(0, 6000);
+          const profileRoot = document.querySelector('[class*="user-page" i], [id*="userPage" i], [class*="profile" i]');
+          const profileRootVisible = Boolean(profileRoot && visible(profileRoot));
+          const profileIdVisible = /小红书号/.test(profileText);
+          const loadingIndicatorVisible = Array.from(document.querySelectorAll(
+            '[class*="profile" i] [class*="loading" i], [class*="user-page" i] [class*="loading" i]'
+          )).some(visible);
           const profileReady = /xiaohongshu\\.com\\/user\\/profile\\//i.test(url) && (
-            /小红书号/.test(profileText) ||
-            !!document.querySelector('[class*="user-page" i], [id*="userPage" i], [class*="profile" i]')
+            profileIdVisible || profileRootVisible
           );
           return {
             ok: true,
             url,
+            documentReadyState: document.readyState,
+            bodyText: bodyText.slice(0, 12000),
             loginRequired: Boolean(loginInput || loginModal),
+            loginInputVisible: loginInput,
+            loginModalVisible: loginModal,
             riskDetected,
             riskText,
             profileReady,
-            profileText
+            profileText,
+            visibleContactText: profileText,
+            visibleMailtoHrefs,
+            profileRootVisible,
+            profileIdVisible,
+            loadingIndicatorVisible
           };
         })()
       `,
@@ -1594,16 +2990,81 @@ async function inspectXhsProfilePage() {
   }
 }
 
+async function waitForXhsProfilePage(expectedUrl) {
+  const deadline = Date.now() + XHS_CONTACT_READY_TIMEOUT_MS;
+  let lastInspected = null;
+  let lastClassification = null;
+  let previousSnapshot = null;
+  let bestReady = null;
+  let readyConfirmations = 0;
+
+  while (Date.now() < deadline && !xhsContactJob.cancelRequested) {
+    const inspected = await inspectXhsProfilePage();
+    lastInspected = inspected;
+    if (inspected?.riskDetected || inspected?.loginRequired) return inspected;
+
+    const classification = classifyXhsProfilePageRead(inspected, previousSnapshot, {
+      targetUrl: expectedUrl
+    });
+    lastClassification = classification;
+    if (classification.riskDetected || classification.loginRequired) {
+      return { ...inspected, ...classification };
+    }
+    if (classification.ok && classification.profileReady) {
+      readyConfirmations += 1;
+      bestReady = { ...inspected, ...classification };
+      if (readyConfirmations >= XHS_CONTACT_READY_CONFIRMATIONS) {
+        return { ...bestReady, contentStable: true };
+      }
+    } else {
+      readyConfirmations = 0;
+    }
+    previousSnapshot = inspected;
+    if (await waitForXhsControl(XHS_CONTACT_READY_POLL_MS) === 'cancel') {
+      return { ok: false, canceled: true, code: 'XHS_CONTACT_CANCELED', error: '补采已停止' };
+    }
+  }
+
+  if (bestReady) return { ...bestReady, contentStable: false, readinessTimedOut: true };
+  if (lastInspected) {
+    const code = lastClassification?.code || lastInspected?.code || 'XHS_PROFILE_NOT_READY';
+    const failureMessages = {
+      XHS_PROFILE_URL_MISMATCH: '小红书页面跳转到了其他主页，未读取本条数据',
+      XHS_PROFILE_URL_NOT_READY: '小红书个人主页地址尚未加载完成',
+      XHS_PROFILE_DOCUMENT_LOADING: '小红书个人主页仍在加载',
+      XHS_PROFILE_CONTENT_NOT_READY: '小红书主页已打开，但公开资料区域尚未出现',
+      XHS_PROFILE_STABILIZING: '小红书公开资料仍在变化，未达到稳定读取条件'
+    };
+    return {
+      ...lastInspected,
+      ...lastClassification,
+      ok: false,
+      profileReady: false,
+      code,
+      error: lastInspected.error || failureMessages[code] || '个人主页在等待时间内未完成加载'
+    };
+  }
+  return {
+    ok: false,
+    code: 'XHS_PROFILE_NOT_READY',
+    error: '个人主页在等待时间内未完成加载'
+  };
+}
+
 async function runXhsContactBatch(rows) {
   const updates = [];
   let found = 0;
   let failed = 0;
+  const contactView = ensureXhsBrowserTab();
+  activateBrowserTab(XHS_TAB_ID, { force: true });
 
   for (let index = 0; index < rows.length; index += 1) {
-    if (xhsContactJob.cancelRequested) break;
-    if (xhsContactJob.paused && await waitForXhsResume() === 'cancel') break;
+    if (await waitForXhsControl(0) === 'cancel') break;
 
     const row = rows[index];
+    xhsContactJob.currentRowId = row.rowId;
+    xhsContactJob.currentCreatorName = row.creatorName;
+    xhsContactJob.phase = 'resolving_pgy';
     emitXhsContactProgress({
       type: 'item_start',
       index,
@@ -1612,20 +3073,38 @@ async function runXhsContactBatch(rows) {
       found,
       failed,
       rowId: row.rowId,
-      creatorName: row.creatorName
+      creatorName: row.creatorName,
+      message: '正在从蒲公英达人页定位小红书主页'
     });
 
-    let profile = await resolveXhsProfileUrlFromPgy(row);
+    let profile = await resolveXhsProfileUrlFromPgy(row, contactView);
+    if (!profile.ok && profile.retryable && !profile.canceled && !xhsContactJob.cancelRequested) {
+      emitXhsContactProgress({
+        type: 'retrying',
+        code: profile.code,
+        index,
+        completed: index,
+        total: rows.length,
+        found,
+        failed,
+        message: `${profile.error || '达人页尚未就绪'}，将低频重试一次`
+      });
+      if (await waitForXhsControl(1800) === 'cancel') break;
+      profile = await resolveXhsProfileUrlFromPgy(row, contactView);
+    }
     if (!profile.ok && profile.manualIntervention) {
       const action = await pauseXhsContactJob(profile.error, profile.code);
       if (action === 'cancel') break;
-      profile = await resolveXhsProfileUrlFromPgy(row);
+      profile = await resolveXhsProfileUrlFromPgy(row, contactView);
     }
+    if (profile.canceled || xhsContactJob.cancelRequested) break;
     if (!profile.ok) {
       failed += 1;
       const update = {
         rowId: row.rowId,
         contactCollectionStatus: 'profile_not_found',
+        contactCollectionCode: profile.code || 'XHS_PROFILE_NOT_FOUND',
+        contactCollectionError: profile.error || '未找到小红书主页',
         error: profile.error || '未找到小红书主页'
       };
       updates.push(update);
@@ -1635,16 +3114,38 @@ async function runXhsContactBatch(rows) {
 
     let ready = false;
     let inspected = null;
+    let shouldNavigate = true;
     while (!ready && !xhsContactJob.cancelRequested) {
-      try {
-        await browserView.webContents.loadURL(profile.profileUrl);
-      } catch (err) {
-        const currentUrl = browserView.webContents.getURL();
-        if (!isIgnorableXhsNavigationError(err, currentUrl, profile.profileUrl)) throw err;
+      if (shouldNavigate) {
+        xhsContactJob.phase = 'loading_xhs';
+        emitXhsContactProgress({
+          type: 'phase',
+          index,
+          completed: index,
+          total: rows.length,
+          found,
+          failed,
+          message: '正在打开小红书个人主页'
+        });
+        try {
+          await contactView.webContents.loadURL(profile.profileUrl);
+        } catch (err) {
+          const currentUrl = contactView.webContents.getURL();
+          if (!isIgnorableXhsNavigationError(err, currentUrl, profile.profileUrl)) throw err;
+        }
+        mainWindow?.webContents.send('browser:url', { url: profile.profileUrl });
       }
-      mainWindow?.webContents.send('browser:url', { url: profile.profileUrl });
-      await sleep(XHS_CONTACT_PAGE_WAIT_MS + Math.round(Math.random() * XHS_CONTACT_PAGE_JITTER_MS));
-      inspected = await inspectXhsProfilePage();
+      xhsContactJob.phase = 'reading_xhs';
+      emitXhsContactProgress({
+        type: 'phase',
+        index,
+        completed: index,
+        total: rows.length,
+        found,
+        failed,
+        message: '正在等待公开资料稳定并读取联系方式'
+      });
+      inspected = await waitForXhsProfilePage(profile.profileUrl);
 
       if (inspected?.riskDetected) {
         const action = await pauseXhsContactJob(
@@ -1652,6 +3153,7 @@ async function runXhsContactBatch(rows) {
           'XHS_RISK_DETECTED'
         );
         if (action === 'cancel') break;
+        shouldNavigate = normalizeXhsProfileUrl(contactView.webContents.getURL()) !== profile.profileUrl;
         continue;
       }
       if (inspected?.loginRequired) {
@@ -1660,12 +3162,13 @@ async function runXhsContactBatch(rows) {
           'XHS_LOGIN_REQUIRED'
         );
         if (action === 'cancel') break;
+        shouldNavigate = normalizeXhsProfileUrl(contactView.webContents.getURL()) !== profile.profileUrl;
         continue;
       }
       ready = Boolean(inspected?.ok && inspected?.profileReady);
       if (!ready) break;
     }
-    if (xhsContactJob.cancelRequested) break;
+    if (inspected?.canceled || xhsContactJob.cancelRequested) break;
 
     if (!ready) {
       failed += 1;
@@ -1673,6 +3176,8 @@ async function runXhsContactBatch(rows) {
         rowId: row.rowId,
         xhsProfileUrl: profile.profileUrl,
         contactCollectionStatus: 'profile_unavailable',
+        contactCollectionCode: inspected?.code || 'XHS_PROFILE_NOT_READY',
+        contactCollectionError: inspected?.error || '个人主页未完整加载',
         error: inspected?.error || '个人主页未完整加载'
       };
       updates.push(update);
@@ -1680,7 +3185,7 @@ async function runXhsContactBatch(rows) {
       continue;
     }
 
-    const contact = parsePublicContactText(inspected.profileText);
+    const contact = inspected.contact || parsePublicContactSnapshot(inspected);
     const count = contactFieldCount(contact);
     if (count > 0) found += 1;
     const update = {
@@ -1691,7 +3196,9 @@ async function runXhsContactBatch(rows) {
       phone: contact.phone,
       contactSource: 'xiaohongshu_public_profile',
       contactCollectedAt: new Date().toISOString(),
-      contactCollectionStatus: count > 0 ? 'found' : 'not_public'
+      contactCollectionStatus: count > 0 ? 'found' : 'not_public',
+      contactCollectionCode: count > 0 ? 'CONTACT_FOUND' : 'CONTACT_NOT_PUBLIC',
+      contactCollectionError: ''
     };
     updates.push(update);
     emitXhsContactProgress({ type: 'item_result', index, completed: index + 1, total: rows.length, found, failed, update });
@@ -1700,6 +3207,7 @@ async function runXhsContactBatch(rows) {
       const processed = index + 1;
       if (processed % XHS_CONTACT_COOLDOWN_EVERY === 0) {
         const cooldownMs = XHS_CONTACT_COOLDOWN_MIN_MS + Math.round(Math.random() * XHS_CONTACT_COOLDOWN_JITTER_MS);
+        xhsContactJob.phase = 'cooldown';
         emitXhsContactProgress({
           type: 'cooldown',
           completed: processed,
@@ -1708,22 +3216,30 @@ async function runXhsContactBatch(rows) {
           failed,
           message: `已处理 ${processed} 位，正在进行风控冷却等待`
         });
-        await sleep(cooldownMs);
+        if (await waitForXhsControl(cooldownMs) === 'cancel') break;
       } else {
-        await sleep(1800 + Math.round(Math.random() * 2200));
+        xhsContactJob.phase = 'between_items';
+        if (await waitForXhsControl(1800 + Math.round(Math.random() * 2200)) === 'cancel') break;
       }
     }
   }
 
+  xhsContactJob.currentRowId = '';
+  xhsContactJob.currentCreatorName = '';
+  xhsContactJob.phase = xhsContactJob.cancelRequested ? 'stopped' : 'finished';
   return { updates, found, failed, canceled: xhsContactJob.cancelRequested };
 }
 
 ipcMain.handle('contacts:openXhsLogin', async () => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开小红书` };
   try {
-    await browserView.webContents.loadURL(XHS_LOGIN_URL);
-    mainWindow?.webContents.send('browser:url', { url: XHS_LOGIN_URL });
-    return { ok: true, url: XHS_LOGIN_URL };
+    const contactView = ensureXhsBrowserTab();
+    activateBrowserTab(XHS_TAB_ID, { force: true });
+    await contactView.webContents.loadURL(XHS_LOGIN_URL);
+    sendActiveBrowserUrl();
+    return { ok: true, tabId: XHS_TAB_ID, url: XHS_LOGIN_URL };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
@@ -1731,14 +3247,19 @@ ipcMain.handle('contacts:openXhsLogin', async () => {
 
 ipcMain.handle('contacts:openPgyCreator', async (_e, creatorUrl) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_ACTIVE', error: '请先完成或结束当前候选读取' };
+  }
   const url = String(creatorUrl || '').trim();
   if (!isAllowedTaskUrl(url)) return { ok: false, code: 'PGY_TASK_URL_NOT_ALLOWED', error: '只允许打开蒲公英达人链接' };
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
   try {
-    await browserView.webContents.loadURL(url);
-    mainWindow?.webContents.send('browser:url', { url });
-    return { ok: true, url };
+    const detailView = ensureXhsBrowserTab();
+    activateBrowserTab(XHS_TAB_ID, { force: true });
+    await detailView.webContents.loadURL(url);
+    sendActiveBrowserUrl();
+    return { ok: true, tabId: XHS_TAB_ID, url };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
@@ -1746,22 +3267,37 @@ ipcMain.handle('contacts:openPgyCreator', async (_e, creatorUrl) => {
 
 ipcMain.handle('contacts:openTencentEmail', async () => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_READ_ACTIVE',
+      error: '请先完成或结束当前候选读取，再打开企业邮箱'
+    };
+  }
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
   if (recordingEnabled) return { ok: false, code: 'RECORDING_RUNNING', error: '请先停止蒲公英录制排查，再打开企业邮箱' };
   try {
-    await browserView.webContents.loadURL(TENCENT_MAIL_HOME_URL);
+    const mailView = ensureMailBrowserTab();
+    activateBrowserTab(MAIL_TAB_ID, { force: true });
+    await mailView.webContents.loadURL(TENCENT_MAIL_HOME_URL);
   } catch (err) {
-    const currentUrl = browserView.webContents.getURL() || '';
+    const currentUrl = mailBrowserView?.webContents?.getURL?.() || '';
     if (!isAllowedTencentMailUrl(currentUrl)) {
       return { ok: false, error: `腾讯企业邮箱打开失败：${String(err?.message || err)}` };
     }
   }
-  mainWindow?.webContents.send('browser:url', { url: browserView.webContents.getURL() || TENCENT_MAIL_HOME_URL });
-  return { ok: true, url: TENCENT_MAIL_HOME_URL };
+  sendActiveBrowserUrl();
+  return {
+    ok: true,
+    tabId: MAIL_TAB_ID,
+    url: mailBrowserView?.webContents?.getURL?.() || TENCENT_MAIL_HOME_URL
+  };
 });
 
 ipcMain.handle('contacts:checkXhsLogin', async () => {
+  ensureXhsBrowserTab();
+  activateBrowserTab(XHS_TAB_ID, { force: true });
   const inspected = await inspectXhsProfilePage();
   if (!inspected?.ok) return inspected;
   const currentUrl = String(inspected.url || '');
@@ -1778,20 +3314,15 @@ ipcMain.handle('contacts:checkXhsLogin', async () => {
 
 ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_ACTIVE', error: '请先完成或结束当前候选读取' };
+  }
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待蒲公英采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '小红书联系方式补采正在运行' };
-  const currentUrl = String(browserView.webContents.getURL() || '');
-  if (/^https:\/\/(?:www\.)?xiaohongshu\.com\//i.test(currentUrl)) {
-    const preflight = await inspectXhsProfilePage();
-    if (preflight?.riskDetected) {
-      return {
-        ok: false,
-        code: 'XHS_RISK_DETECTED',
-        riskText: preflight.riskText || '安全验证',
-        error: `小红书当前处于安全验证或访问频繁状态：${preflight.riskText || '请查看右侧页面'}。请勿继续重试，等待页面恢复后再检测登录。`
-      };
-    }
-  }
+  const busy = rejectBrowserAutomationStart('开始小红书联系方式补采');
+  if (busy) return busy;
+  ensureCollectionTabActive();
+  const contactView = ensureXhsBrowserTab();
   const runDir = resolveInsideRuns(payload.runDir || '');
   if (!runDir) return { ok: false, error: '未选择有效运行结果' };
 
@@ -1815,48 +3346,97 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
   xhsContactJob = {
     running: true,
     paused: false,
+    pauseRequested: false,
     cancelRequested: false,
     pauseReason: '',
+    phase: 'starting',
+    currentRowId: '',
+    currentCreatorName: '',
     resumeGate: null,
-    resumeGateResolve: null
+    resumeGateResolve: null,
+    controlWaiters: new Set()
   };
-  emitXhsContactProgress({ type: 'started', total: rows.length, completed: 0, found: 0, failed: 0 });
+  sendBrowserTabsSnapshot();
+  emitXhsContactProgress({
+    type: 'started',
+    total: rows.length,
+    completed: 0,
+    found: 0,
+    failed: 0,
+    message: '补采任务已启动，正在准备第一位达人'
+  });
   try {
+    const currentUrl = String(contactView.webContents.getURL() || '');
+    if (/^https:\/\/(?:www\.)?xiaohongshu\.com\//i.test(currentUrl)) {
+      const preflight = await inspectXhsProfilePage();
+      if (preflight?.riskDetected) {
+        return {
+          ok: false,
+          code: 'XHS_RISK_DETECTED',
+          riskText: preflight.riskText || '安全验证',
+          error: `小红书当前处于安全验证或访问频繁状态：${preflight.riskText || '请查看右侧页面'}。请勿继续重试，等待页面恢复后再检测登录。`
+        };
+      }
+    }
     const result = await runXhsContactBatch(rows);
-    emitXhsContactProgress({ type: 'finished', total: rows.length, completed: result.updates.length, ...result });
+    emitXhsContactProgress({
+      type: result.canceled ? 'stopped' : 'finished',
+      total: rows.length,
+      completed: result.updates.length,
+      message: result.canceled ? '补采已安全停止，未处理达人不会继续' : '补采任务已完成',
+      ...result
+    });
     return { ok: true, total: rows.length, ...result };
   } catch (err) {
     const error = String(err?.message || err);
+    xhsContactJob.phase = 'failed';
     emitXhsContactProgress({ type: 'failed', total: rows.length, error });
     return { ok: false, error };
   } finally {
     resumeXhsContactJob(xhsContactJob.cancelRequested ? 'cancel' : 'resume');
     xhsContactJob.running = false;
     xhsContactJob.cancelRequested = false;
+    ensureCollectionTabActive();
+    sendBrowserTabsSnapshot();
   }
 });
 
 ipcMain.handle('contacts:pauseXhsEnrichment', async () => {
   if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
-  xhsContactJob.paused = true;
+  if (xhsContactJob.paused) return { ok: true, paused: true };
+  if (xhsContactJob.pauseRequested) return { ok: true, pending: true };
+  xhsContactJob.pauseRequested = true;
   xhsContactJob.pauseReason = '用户暂停';
-  emitXhsContactProgress({ type: 'paused', code: 'USER_PAUSED', message: xhsContactJob.pauseReason });
-  return { ok: true };
+  wakeXhsContactControlWaiters('pause');
+  emitXhsContactProgress({
+    type: 'pause_requested',
+    code: 'USER_PAUSE_REQUESTED',
+    message: '暂停请求已收到，将在当前页面读取的下一个安全点暂停'
+  });
+  sendBrowserTabsSnapshot();
+  return { ok: true, pending: true };
 });
 
 ipcMain.handle('contacts:resumeXhsEnrichment', async () => {
   if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
+  const canceledPendingPause = xhsContactJob.pauseRequested && !xhsContactJob.paused;
   resumeXhsContactJob('resume');
-  emitXhsContactProgress({ type: 'resumed' });
-  return { ok: true };
+  emitXhsContactProgress({
+    type: 'resumed',
+    message: canceledPendingPause ? '已取消待暂停请求，补采继续运行' : '补采已继续运行'
+  });
+  sendBrowserTabsSnapshot();
+  return { ok: true, canceledPendingPause };
 });
 
 ipcMain.handle('contacts:cancelXhsEnrichment', async () => {
   if (!xhsContactJob.running) return { ok: false, error: '当前没有运行中的补采任务' };
   xhsContactJob.cancelRequested = true;
+  xhsContactJob.phase = 'stopping';
+  wakeXhsContactControlWaiters('cancel');
   resumeXhsContactJob('cancel');
-  emitXhsContactProgress({ type: 'cancel_requested', message: '将在当前页处理完成后停止' });
-  return { ok: true };
+  emitXhsContactProgress({ type: 'cancel_requested', message: '停止请求已收到，将在下一个安全点结束且不再处理下一位达人' });
+  return { ok: true, pending: true };
 });
 
 function rejectNonPgyCurrentPageForBrowserAutomation(actionLabel = '当前操作') {
@@ -1876,15 +3456,179 @@ ipcMain.handle('pgy:checkLogin', async () => {
   return await pgyCheckLogin();
 });
 
+ipcMain.handle('pgy:inspectCandidateSearchLayout', async (_e, templatePath) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('检查搜索结果布局');
+  if (rejected) return rejected;
+  const loaded = loadCandidateSearchCalibration(templatePath);
+  if (!loaded.ok) return loaded;
+  const calibration = loaded.calibration || {};
+  try {
+    const [layout, pagination] = await Promise.all([
+      browserView.webContents.executeJavaScript(
+        buildCandidateSearchLayoutScript(calibration),
+        true
+      ),
+      browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('inspect', 1, calibration),
+        true
+      )
+    ]);
+    return {
+      ok: true,
+      ...(layout || {}),
+      pagination: {
+        ok: Boolean(pagination?.ok),
+        currentPage: pagination?.currentPage || (pagination?.atFirstPage ? 1 : null),
+        currentPageKnown: Boolean(pagination?.currentPageKnown || pagination?.firstPageKnown),
+        pageNumbers: Array.isArray(pagination?.pageNumbers) ? pagination.pageNumbers : [],
+        controlCount: Number(pagination?.controlCount || 0),
+        selector: String(pagination?.selector || ''),
+        calibrated: Boolean(pagination?.calibrated),
+        error: pagination?.error || ''
+      }
+    };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const rejected = rejectNonPgyCurrentPageForBrowserAutomation('验证搜索结果跨页');
+  if (rejected) return rejected;
+  const busy = rejectBrowserAutomationStart('验证搜索结果跨页');
+  if (busy) return busy;
+  const loaded = loadCandidateSearchCalibration(templatePath);
+  if (!loaded.ok) return loaded;
+  const calibration = loaded.calibration || {};
+  if (!hasCompleteCandidateSearchCalibration(calibration)) {
+    return { ok: false, code: 'PGY_CANDIDATE_CALIBRATION_REQUIRED', error: '请先完成达人整行、达人昵称和分页区域三项标定。' };
+  }
+
+  const inspectPage = async () => {
+    const [layout, pagination] = await Promise.all([
+      browserView.webContents.executeJavaScript(buildCandidateSearchLayoutScript(calibration), true),
+      browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect', 1, calibration), true)
+    ]);
+    return { layout: layout || {}, pagination: pagination || {} };
+  };
+  const waitForPage = async (targetPage, previousNames = []) => {
+    const previousFingerprint = previousNames.join('\n');
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const snapshot = await inspectPage();
+      const names = Array.isArray(snapshot.layout?.names) ? snapshot.layout.names : [];
+      const fingerprint = names.join('\n');
+      if (
+        Number(snapshot.pagination?.currentPage || 0) === Number(targetPage)
+        && snapshot.pagination?.currentPageKnown
+        && names.length >= 2
+        && (!previousFingerprint || fingerprint !== previousFingerprint)
+      ) return snapshot;
+      await sleep(350);
+    }
+    return null;
+  };
+  const restoreFirstPage = async () => {
+    try {
+      const restore = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('goto', 1, calibration),
+        true
+      );
+      if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+      const restored = await waitForPage(1);
+      return Boolean(restored);
+    } catch (_) {
+      return false;
+    }
+  };
+
+  directPgyExtractionRunning = true;
+  sendBrowserTabsSnapshot();
+  await syncCollectionInteractionLock({ force: true });
+  try {
+    let first = await inspectPage();
+    if (Number(first.pagination?.currentPage || 0) !== 1) {
+      const gotoFirst = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('goto', 1, calibration),
+        true
+      );
+      if (!gotoFirst?.clicked && !gotoFirst?.alreadyAtTarget) {
+        return { ok: false, code: 'PGY_PAGINATION_FIRST_PAGE_FAILED', error: '无法回到第 1 页，跨页验证已停止。' };
+      }
+      if (gotoFirst?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+      first = await waitForPage(1);
+    }
+    const firstNames = Array.isArray(first?.layout?.names) ? first.layout.names : [];
+    if (
+      !first
+      || Number(first.layout?.rowCount || 0) < 2
+      || Number(first.layout?.rowCount || 0) !== Number(first.layout?.rowsWithName || 0)
+      || Number(first.layout?.rowCount || 0) !== firstNames.length
+    ) {
+      return { ok: false, code: 'PGY_CANDIDATE_CALIBRATION_INVALID', error: '第 1 页的达人整行与行内昵称不能一一对应。' };
+    }
+    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    if (!risk?.ok || risk.riskDetected) {
+      return { ok: false, code: 'PGY_RISK_STOP', error: '检测到登录或安全提示，未执行跨页验证。' };
+    }
+    const next = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('next', 1, calibration),
+      true
+    );
+    if (!next?.clicked) {
+      return { ok: false, code: 'PGY_PAGINATION_NEXT_NOT_FOUND', error: '分页区内没有找到可用的下一页按钮。' };
+    }
+    await sleep(PGY_MIN_TAB_WAIT_MS);
+    const second = await waitForPage(2, firstNames);
+    if (!second) {
+      await restoreFirstPage();
+      return { ok: false, code: 'PGY_PAGINATION_PAGE_MISMATCH', error: '点击下一页后，未能同时确认第 2 页页码和新的达人顺序。' };
+    }
+    const secondNames = Array.isArray(second.layout?.names) ? second.layout.names : [];
+    if (
+      Number(second.layout?.rowCount || 0) < 2
+      || Number(second.layout?.rowCount || 0) !== Number(second.layout?.rowsWithName || 0)
+      || Number(second.layout?.rowCount || 0) !== secondNames.length
+    ) {
+      await restoreFirstPage();
+      return { ok: false, code: 'PGY_CANDIDATE_CALIBRATION_INVALID', error: '第 2 页的达人整行与行内昵称不能一一对应。' };
+    }
+    const restored = await restoreFirstPage();
+    if (!restored) {
+      return { ok: false, code: 'PGY_PAGINATION_RESTORE_FAILED', error: '第 2 页验证成功，但未能自动返回第 1 页。请手动回到第 1 页后再采集。' };
+    }
+    return {
+      ok: true,
+      passed: true,
+      firstPageCount: firstNames.length,
+      secondPageCount: secondNames.length,
+      firstNames: firstNames.slice(0, 8),
+      secondNames: secondNames.slice(0, 8),
+      restoredToPage: 1
+    };
+  } catch (error) {
+    await restoreFirstPage();
+    return { ok: false, error: String(error?.message || error) };
+  } finally {
+    directPgyExtractionRunning = false;
+    sendBrowserTabsSnapshot();
+    await syncCollectionInteractionLock({ force: true });
+  }
+});
+
 ipcMain.handle('pgy:pickElement', async (_e, payload = {}) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('鼠标精确点选');
   if (rejected) return rejected;
+  const fieldKey = String(payload?.fieldKey || '');
   const label = String(payload?.label || '要采集的内容');
   const timeoutMs = Math.max(5000, Math.min(60000, Number(payload?.timeoutMs || 25000)));
   try {
     const js = `
       (function(){
+        const fieldKey = ${JSON.stringify(fieldKey)};
         const label = ${JSON.stringify(label)};
         const timeoutMs = ${timeoutMs};
         const old = document.getElementById('__pgy_picker_overlay__');
@@ -1951,6 +3695,89 @@ ipcMain.handle('pgy:pickElement', async (_e, payload = {}) => {
           return path.join(' > ');
         };
 
+        const repeatedSelector = (el) => {
+          const options = [];
+          const seen = new Set();
+          const isVisible = (node) => {
+            if (!node || node.nodeType !== 1) return false;
+            const rect = node.getBoundingClientRect?.();
+            if (!rect || rect.width < 2 || rect.height < 2) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
+          };
+          let node = el;
+          for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth += 1) {
+            const tag = node.tagName.toLowerCase();
+            const classes = (typeof node.className === 'string' ? node.className.split(/\\s+/).filter(Boolean) : [])
+              .filter((name) => name.length < 48 && !/^css-/.test(name) && !/^_[a-z0-9]/i.test(name))
+              .slice(0, 3);
+            const selectors = [];
+            if (classes.length >= 2) selectors.push(tag + '.' + classes.slice(0, 2).map((name) => CSS.escape(name)).join('.'));
+            if (classes.length) {
+              selectors.push(tag + '.' + CSS.escape(classes[0]));
+              selectors.push('.' + CSS.escape(classes[0]));
+            }
+            for (const selector of selectors) {
+              if (!selector || seen.has(selector)) continue;
+              seen.add(selector);
+              let matches = [];
+              try { matches = Array.from(document.querySelectorAll(selector)).filter(isVisible); } catch (_) {}
+              const count = matches.length;
+              if (count < 2 || count > 80) continue;
+              const rect = node.getBoundingClientRect?.();
+              let score = 80 - depth * 8;
+              if (count >= 3 && count <= 40) score += 30;
+              if (fieldKey === 'candidate_row' && rect && rect.width >= 320 && rect.height >= 54 && rect.height <= 360) score += 35;
+              if (fieldKey === 'candidate_name') {
+                const text = String(node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (text.length >= 2 && text.length <= 40) score += 35;
+              }
+              options.push({ selector, count, score });
+            }
+            node = node.parentElement;
+          }
+          options.sort((left, right) => right.score - left.score || Math.abs(left.count - 20) - Math.abs(right.count - 20));
+          return options[0] || null;
+        };
+
+        const repeatedFieldSelector = (el) => {
+          if (!el || el.nodeType !== 1) return null;
+          const tag = el.tagName.toLowerCase();
+          const classes = (typeof el.className === 'string' ? el.className.split(/\\s+/).filter(Boolean) : [])
+            .filter((name) => name.length < 48 && !/^css-/.test(name) && !/^_[a-z0-9]/i.test(name));
+          const selectors = [];
+          const seen = new Set();
+          for (const name of classes) {
+            const escaped = CSS.escape(name);
+            selectors.push(tag + '.' + escaped, '.' + escaped);
+          }
+          const options = [];
+          for (const selector of selectors) {
+            if (!selector || seen.has(selector)) continue;
+            seen.add(selector);
+            let matches = [];
+            try {
+              matches = Array.from(document.querySelectorAll(selector)).filter((node) => {
+                const rect = node.getBoundingClientRect?.();
+                if (!rect || rect.width < 2 || rect.height < 2) return false;
+                const style = getComputedStyle(node);
+                return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
+              });
+            } catch (_) {}
+            const count = matches.length;
+            if (count < 2 || count > 80) continue;
+            let score = 100 - Math.abs(count - 20);
+            if (count >= 3 && count <= 40) score += 35;
+            if (fieldKey === 'candidate_name' && /name|nick|author|kol[-_]?name/i.test(selector)) score += 100;
+            if (fieldKey === 'candidate_row' && /row|item|detail|kol[-_]?info/i.test(selector)) score += 80;
+            if (/^\\.[a-z0-9_-]+$/i.test(selector)) score += 5;
+            if (/\\.(?:d-text|flexible|--)/i.test(selector)) score -= 35;
+            options.push({ selector, count, score });
+          }
+          options.sort((left, right) => right.score - left.score || left.selector.length - right.selector.length);
+          return options[0] || null;
+        };
+
         let onMove = null;
         let onClick = null;
         let onKey = null;
@@ -2004,12 +3831,18 @@ ipcMain.handle('pgy:pickElement', async (_e, payload = {}) => {
             const selector = uniqueSelector(el);
             let count = 0;
             try { count = selector ? document.querySelectorAll(selector).length : 0; } catch (_) {}
+            const fieldMatch = repeatedFieldSelector(el);
+            const repeated = repeatedSelector(el);
             const href = el.closest?.('a[href]')?.getAttribute('href') || el.getAttribute?.('href') || '';
             const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
             done({
               ok: true,
               selector,
               count,
+              fieldSelector: fieldMatch?.selector || '',
+              fieldCount: Number(fieldMatch?.count || 0),
+              repeatSelector: repeated?.selector || '',
+              repeatCount: Number(repeated?.count || 0),
               text: String(el.textContent || '').trim().slice(0, 300),
               tag: el.tagName ? el.tagName.toLowerCase() : '',
               href,
@@ -2100,6 +3933,38 @@ ipcMain.handle('pgy:scanPageBlocks', async (_e, payload = {}) => {
           }
           return path.join(' > ');
         };
+        const repeatedSelectorForScan = (el) => {
+          const options = [];
+          const seen = new Set();
+          let node = el;
+          for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth += 1) {
+            const tag = node.tagName.toLowerCase();
+            const classes = (typeof node.className === 'string' ? node.className.split(/\s+/).filter(Boolean) : [])
+              .filter((name) => name.length < 48 && !/^css-/.test(name) && !/^_[a-z0-9]/i.test(name))
+              .slice(0, 3);
+            const selectors = [];
+            if (classes.length >= 2) selectors.push(tag + '.' + classes.slice(0, 2).map(esc).join('.'));
+            if (classes.length) {
+              selectors.push(tag + '.' + esc(classes[0]));
+              selectors.push('.' + esc(classes[0]));
+            }
+            for (const selector of selectors) {
+              if (!selector || seen.has(selector)) continue;
+              seen.add(selector);
+              let matches = [];
+              try { matches = Array.from(document.querySelectorAll(selector)).filter(isVisible); } catch (_) {}
+              if (matches.length < 2 || matches.length > 80) continue;
+              options.push({
+                selector,
+                count: matches.length,
+                score: 80 - depth * 8 + (matches.length >= 3 && matches.length <= 40 ? 30 : 0)
+              });
+            }
+            node = node.parentElement;
+          }
+          options.sort((left, right) => right.score - left.score || Math.abs(left.count - 20) - Math.abs(right.count - 20));
+          return options[0] || null;
+        };
         const scoreElement = (el, text, rect, href) => {
           const tag = (el.tagName || '').toLowerCase();
           const cls = String(el.className || '').toLowerCase();
@@ -2111,10 +3976,17 @@ ipcMain.handle('pgy:scanPageBlocks', async (_e, payload = {}) => {
           if (/^h[1-4]$/.test(tag)) score += 16;
           if (tag === 'a' && href) score += 9;
           if (tag === 'img') score += 6;
-          if (fieldKey === 'creator_name') {
+          if (fieldKey === 'creator_name' || fieldKey === 'candidate_name') {
             if (/name|nick|author|user|达人|昵称|名称|博主/.test(hay)) score += 26;
             if (/^h[1-3]$/.test(tag)) score += 20;
             if (text.length >= 2 && text.length <= 28) score += 12;
+          } else if (fieldKey === 'candidate_row') {
+            if (/row|item|card|blogger|creator|kol|达人|博主/.test(hay)) score += 28;
+            if (rect.width >= 320 && rect.height >= 54 && rect.height <= 360) score += 28;
+            if (el.querySelectorAll?.('img').length) score += 12;
+          } else if (fieldKey === 'candidate_pagination') {
+            if (/pagination|pager|page|分页|跳至/.test(hay)) score += 36;
+            if (/\b1\s*2\s*3\b/.test(text) || (text.includes('跳至') && text.includes('页'))) score += 28;
           } else if (fieldKey === 'followers') {
             if (/粉丝|fans|follower|关注/.test(hay)) score += 30;
             if (/[0-9][0-9.,]*\\s*[万wW]?/.test(text)) score += 18;
@@ -2152,12 +4024,16 @@ ipcMain.handle('pgy:scanPageBlocks', async (_e, payload = {}) => {
             if (!text && !href && (el.tagName || '').toLowerCase() !== 'img') return null;
             const selector = uniqueSelector(el);
             if (!selector) return null;
+            const repeated = repeatedSelectorForScan(el);
             let count = 0;
             try { count = document.querySelectorAll(selector).length; } catch (_) {}
-            const score = scoreElement(el, text, rect, href);
+            let score = scoreElement(el, text, rect, href);
+            if ((fieldKey === 'candidate_name' || fieldKey === 'candidate_row') && repeated?.count >= 2) score += 70;
             return {
               selector,
               count,
+              repeatSelector: repeated?.selector || '',
+              repeatCount: Number(repeated?.count || 0),
               text,
               tag: (el.tagName || '').toLowerCase(),
               href,
@@ -2487,10 +4363,13 @@ ipcMain.handle('pgy:suggestNoteCardSelector', async () => {
   }
 });
 
-ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
+async function extractPgySearchCandidates(options = {}) {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('读取搜索结果');
   if (rejected) return rejected;
+  const loadedCalibration = loadCandidateSearchCalibration(options?.templatePath);
+  if (!loadedCalibration.ok) return loadedCalibration;
+  const calibration = loadedCalibration.calibration || {};
   try {
     const startRank = Math.max(1, Math.min(
       MAX_CANDIDATE_RANK,
@@ -2507,28 +4386,25 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
     if (requestedCount > MAX_CANDIDATE_COUNT) {
       return { ok: false, error: `为降低平台风控风险，单次最多加入 ${MAX_CANDIDATE_COUNT} 位达人。` };
     }
-    const runtimeResult = await browserView.webContents.executeJavaScript(
-      buildSearchCandidateExtractionScript(endRank),
-      true
-    );
-    if (Array.isArray(runtimeResult?.items) && runtimeResult.items.length >= endRank) {
-      const items = runtimeResult.items.slice(startRank - 1, endRank);
+    if ((startRank > 20 || endRank > 20) && !hasCompleteCandidateSearchCalibration(calibration)) {
       return {
-        ...runtimeResult,
-        items,
-        stats: {
-          ...(runtimeResult.stats || {}),
-          requested: requestedCount,
-          startRank,
-          endRank,
-          available: runtimeResult.items.length,
-          extracted: items.length
-        },
-        message: `已按当前排序读取${candidateRangeLabel(startRank, endRank)}达人。`
+        ok: false,
+        code: 'PGY_CANDIDATE_CALIBRATION_REQUIRED',
+        error: '读取第 21 位以后的排名前，必须先完成搜索结果校准。请到“采集校准”依次标定达人整行、达人昵称和分页区域，并验证通过。'
       };
     }
-    const responseResult = await readPgyCandidatesFromResponsePages({ startRank, endRank });
+    await seedCandidateCommandFromVisiblePage(pgyCandidateCommandWindow, calibration);
+    const responseResult = await readPgyCandidatesFromResponsePages({
+      startRank,
+      endRank,
+      initialItems: [],
+      commandWindow: pgyCandidateCommandWindow,
+      calibration
+    });
     if (responseResult?.ok === false) return responseResult;
+    if (responseResult?.paused) {
+      return { ...responseResult, url: browserView.webContents.getURL() };
+    }
     if (responseResult?.stats?.stoppedForRisk) {
       return { ...responseResult, url: browserView.webContents.getURL() };
     }
@@ -2711,11 +4587,107 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
         extracted: fallbackResult.items.length,
         source: 'visible-links-fallback'
       };
+      if (fallbackResult.items.length < requestedCount) {
+        if (available === 0 && !responseResult) {
+          return {
+            ok: false,
+            code: 'PGY_CANDIDATE_RESPONSE_NOT_READY',
+            error: '右侧页面已有榜单，但本次没有接收到可验证的榜单数据。请刷新右侧蒲公英页面，等待达人列表稳定后重试。',
+            partialCount: 0,
+            stats: fallbackResult.stats
+          };
+        }
+        return {
+          ok: false,
+          code: 'PGY_CANDIDATE_RANGE_INCOMPLETE',
+          error: `当前页面只能确认到第 ${available} 位，未能完整取得${candidateRangeLabel(startRank, endRank)}。本次部分结果不会自动加入候选。`,
+          partialCount: fallbackResult.items.length,
+          stats: fallbackResult.stats
+        };
+      }
     }
     return fallbackResult;
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
+}
+
+ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
+  if (pgyCandidateReadRunning) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_RUNNING', error: '已有候选读取正在进行，请等待完成。' };
+  }
+  if (pgyCandidateCheckpointSession) {
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_CHECKPOINT_ACTIVE',
+      error: '上一条候选指令正处于安全暂停，请先继续或结束本次读取。'
+    };
+  }
+  const busy = rejectBrowserAutomationStart('读取蒲公英候选');
+  if (busy) return busy;
+  ensureCollectionTabActive();
+  closeCandidateCommandWindow();
+  const commandWindow = pgyCandidateResponseCache.beginCommandWindow({
+    sourceContext: currentCandidateSourceContext()
+  });
+  pgyCandidateCommandWindow = commandWindow;
+  pgyCandidateReadRunning = true;
+  sendBrowserTabsSnapshot();
+  let keepCommandWindow = false;
+  try {
+    const result = await extractPgySearchCandidates(options);
+    keepCommandWindow = Boolean(result?.paused);
+    return result;
+  } finally {
+    if (!keepCommandWindow) closeCandidateCommandWindow(commandWindow);
+    pgyCandidateReadRunning = false;
+    sendBrowserTabsSnapshot();
+  }
+});
+
+ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
+  if (pgyCandidateReadRunning) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_RUNNING', error: '已有候选读取正在进行，请等待完成。' };
+  }
+  if (taskRunner?.state?.running || xhsContactJob.running || directPgyExtractionRunning || recordingReplayRunning || recordingEnabled) {
+    return {
+      ok: false,
+      code: 'BROWSER_AUTOMATION_BUSY',
+      error: '已有其他网页自动化或录制操作正在进行，不能继续候选读取。'
+    };
+  }
+  ensureCollectionTabActive();
+  const validated = await validateCandidateCheckpointSession(sessionId);
+  if (!validated.ok) {
+    if (!pgyCandidateCheckpointSession) closeCandidateCommandWindow();
+    return validated;
+  }
+  const session = validated.session;
+  pgyCandidateCommandWindow = session.commandWindow;
+  pgyCandidateCheckpointSession = null;
+  pgyCandidateReadRunning = true;
+  sendBrowserTabsSnapshot();
+  let keepCommandWindow = false;
+  try {
+    const result = await readPgyCandidatesFromResponsePages({
+      startRank: session.startRank,
+      endRank: session.endRank,
+      resumeSession: session,
+      calibration: session.calibration || {}
+    });
+    keepCommandWindow = Boolean(result?.paused);
+    return { ...result, url: browserView.webContents.getURL() };
+  } finally {
+    if (!keepCommandWindow) closeCandidateCommandWindow(session.commandWindow);
+    pgyCandidateReadRunning = false;
+    sendBrowserTabsSnapshot();
+  }
+});
+
+ipcMain.handle('pgy:cancelSearchCandidateCheckpoint', async (_e, sessionId) => {
+  const result = await cancelCandidateCheckpointSession(sessionId);
+  if (!pgyCandidateCheckpointSession) closeCandidateCommandWindow();
+  return result;
 });
 
 ipcMain.handle('pgy:parseCandidateInstruction', async (_e, instruction) => (
@@ -2764,6 +4736,10 @@ async function pgyExtractResourceDelta(webContents, tabKey, noteCardSelector) {
             const idEl = document.querySelector('.base-info-item.blogger-redid a');
             const idTxt = idEl ? (idEl.innerText || idEl.textContent || '').trim() : '';
             if (idTxt) out.creator.xhs_id = idTxt;
+            const profileHref = idEl ? String(idEl.href || idEl.getAttribute('href') || '').trim() : '';
+            if (/xiaohongshu\.com\/user\/profile\//i.test(profileHref)) {
+              out.creator.xhs_profile_url = profileHref;
+            }
           } catch (_) {}
 
           try {
@@ -3175,6 +5151,8 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
 
   const pages = [];
   const mergedSummary = {};
+  const expectedCreatorName = String(opt.expectedCreatorName || '').trim();
+  let verifiedCreatorName = '';
   let mergedNotes = [];
   let noteUrlResolve = { resolved: 0, lastClipboardSample: '' };
   let mergedMetrics = {};
@@ -3231,8 +5209,14 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
       const delta = await pgyExtractResourceDelta(browserView.webContents, key, noteCardSelector);
       if (delta?.creator && typeof delta.creator === 'object') {
         // 关键字段强覆盖：避免被“登录账号名”等历史值锁死
-        if (delta.creator.creator_name) mergedSummary.creator_name = String(delta.creator.creator_name).trim();
+        if (delta.creator.creator_name) {
+          verifiedCreatorName = String(delta.creator.creator_name).trim();
+          mergedSummary.creator_name = verifiedCreatorName;
+        }
         if (delta.creator.xhs_id) mergedSummary.xhs_id = String(delta.creator.xhs_id).trim();
+        if (delta.creator.xhs_profile_url) {
+          mergedSummary.xhs_profile_url = normalizeXhsProfileUrl(delta.creator.xhs_profile_url);
+        }
         Object.assign(mergedSummary, mergePreferNonEmpty(mergedSummary, delta.creator));
       }
       if (delta?.metrics && typeof delta.metrics === 'object') mergeMetrics(delta.metrics);
@@ -3290,6 +5274,10 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
     }
 
     await assertNoRiskPage('before_write_result');
+    // The queue label is captured from the selected creator row. It is safer
+    // than a broad template fallback that may hit the signed-in account name.
+    if (verifiedCreatorName) mergedSummary.creator_name = verifiedCreatorName;
+    else if (expectedCreatorName) mergedSummary.creator_name = expectedCreatorName;
     const rawResult = {
       platform: template?.platform || 'pgy',
       creator_url: initialUrl,
@@ -3365,23 +5353,37 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
 }
 
 ipcMain.handle('pgy:extractCurrentMultiPage', async (_e, templatePath, options) => {
-  return await pgyExtractCurrentMultiPage(templatePath, options);
+  const busy = rejectBrowserAutomationStart('采集当前达人页面');
+  if (busy) return busy;
+  directPgyExtractionRunning = true;
+  sendBrowserTabsSnapshot();
+  try {
+    return await pgyExtractCurrentMultiPage(templatePath, options);
+  } finally {
+    directPgyExtractionRunning = false;
+    sendBrowserTabsSnapshot();
+  }
 });
 
 // =========================
 // IPC：录制/回放
 // =========================
 ipcMain.handle('recording:start', async () => {
+  const busy = rejectBrowserAutomationStart('开始录制排查');
+  if (busy) return busy;
+  ensureCollectionTabActive();
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('录制排查');
   if (rejected) return rejected;
   recordingEnabled = true;
   currentRecording = [];
   mainWindow?.webContents.send('recording:count', 0);
+  sendBrowserTabsSnapshot();
   return { ok: true };
 });
 
 ipcMain.handle('recording:stop', async () => {
   recordingEnabled = false;
+  sendBrowserTabsSnapshot();
   const dir = getRecordingsDir();
   const filename = `recording_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
   const filePath = path.join(dir, filename);
@@ -3401,8 +5403,9 @@ ipcMain.handle('recording:stop', async () => {
   return { ok: true, filePath };
 });
 
-ipcMain.on('recording:action', (_e, action) => {
+ipcMain.on('recording:action', (event, action) => {
   if (!recordingEnabled) return;
+  if (event.sender?.id !== browserView?.webContents?.id) return;
   const currentPageUrl = browserView?.webContents?.getURL?.() || '';
   if (!isAllowedTaskUrl(currentPageUrl)) return;
   currentRecording.push({ ...action, t: Date.now() });
@@ -3482,6 +5485,13 @@ ipcMain.handle('recording:replay', async (_e, filePath) => {
   const raw = fs.readFileSync(safePath, 'utf-8');
   const data = JSON.parse(raw);
   const actions = data.actions || [];
+
+  const busy = rejectBrowserAutomationStart('回放录制');
+  if (busy) return busy;
+  recordingReplayRunning = true;
+  sendBrowserTabsSnapshot();
+
+  try {
 
   // 回放：先关闭录制，避免把回放又录进去
   recordingEnabled = false;
@@ -3641,7 +5651,11 @@ ipcMain.handle('recording:replay', async (_e, filePath) => {
     }
   }
 
-  return { ok: true };
+    return { ok: true };
+  } finally {
+    recordingReplayRunning = false;
+    sendBrowserTabsSnapshot();
+  }
 });
 
 // =========================
@@ -3741,10 +5755,20 @@ ipcMain.handle('template:clone', async (_e, srcPath, newName) => {
 });
 
 // =========================
-// IPC：批量任务（start/pause/resume/skipCurrent）
+// IPC：批量任务（start/pause/resume/stop/skipCurrent）
 // =========================
 ipcMain.handle('tasks:start', async (_e, payload) => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
+  if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
+    return {
+      ok: false,
+      code: 'PGY_CANDIDATE_READ_ACTIVE',
+      error: '请先完成或结束当前候选读取，再开始采集任务。'
+    };
+  }
+  const busy = rejectBrowserAutomationStart('开始蒲公英采集任务', { allowTaskRunner: true });
+  if (busy) return busy;
+  ensureCollectionTabActive();
   const r = await taskRunner.start(payload || {});
   if (r?.ok) {
     try {
@@ -3764,6 +5788,16 @@ ipcMain.handle('tasks:start', async (_e, payload) => {
   return r;
 });
 
+ipcMain.handle('tasks:recover', async (_e, runDir) => {
+  if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
+  const busy = rejectBrowserAutomationStart('恢复未完成任务');
+  if (busy) return busy;
+  ensureCollectionTabActive();
+  const result = taskRunner.recoverFromTaskState(runDir);
+  if (result?.ok) sendBrowserTabsSnapshot();
+  return result;
+});
+
 ipcMain.handle('tasks:pause', async () => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
   return await taskRunner.pause('user');
@@ -3772,6 +5806,11 @@ ipcMain.handle('tasks:pause', async () => {
 ipcMain.handle('tasks:resume', async () => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
   return await taskRunner.resume();
+});
+
+ipcMain.handle('tasks:stop', async () => {
+  if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
+  return await taskRunner.stop('user');
 });
 
 ipcMain.handle('tasks:skipCurrent', async () => {
@@ -4760,15 +6799,27 @@ ipcMain.handle('ai:exportLastSqlResult', async () => {
 // =========================
 // 生命周期
 // =========================
-app.whenReady().then(() => {
-  ensureDefaultTemplateInUserData();
-  createMainWindow();
-  startBackendIfNeeded();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+if (hasSingleInstanceLock) {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
-});
+
+  app.whenReady().then(() => {
+    if (process.platform === 'win32') app.setAppUserModelId('com.solo.contentanalyzer');
+    ensureDefaultTemplateInUserData();
+    createMainWindow();
+    startBackendIfNeeded();
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+    });
+  });
+}
+
+app.on('before-quit', stopBackend);
 
 app.on('window-all-closed', () => {
   stopBackend();

@@ -102,7 +102,7 @@ def build_checks(run_commands: bool) -> list[Check]:
         ),
         file_contains(
             "desktop-app/renderer/views/tasks.js",
-            ["读取当前结果", "候选", "开始采集"],
+            ["从当前结果加入候选", "候选", "开始采集"],
             "product-flow",
             "find-creators workflow labels",
         ),

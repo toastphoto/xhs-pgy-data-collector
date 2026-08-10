@@ -16,13 +16,13 @@ export function renderLogin(_state) {
 
   const btnOpen = createButton('在右侧打开蒲公英入口', async () => {
     try {
-      await window.desktopAPI.browser.open('https://pgy.xiaohongshu.com/');
+      await window.desktopAPI.browser.openCollection('https://pgy.xiaohongshu.com/');
     } catch (_) {}
   }, { primary: true });
 
   const btnHome = createButton('打开工作台（已登录）', async () => {
     try {
-      await window.desktopAPI.browser.open('https://pgy.xiaohongshu.com/solar/pre-trade/home');
+      await window.desktopAPI.browser.openCollection('https://pgy.xiaohongshu.com/solar/pre-trade/home');
     } catch (_) {}
   }, { ghost: true });
   btnHome.disabled = true;

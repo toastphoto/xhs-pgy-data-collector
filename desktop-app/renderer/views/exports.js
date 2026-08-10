@@ -1,4 +1,9 @@
 import { store } from '../state/store.js';
+import {
+  buildReviewViewportKey,
+  createReviewViewportStateRegistry,
+  restoreReviewViewport
+} from '../state/review_view_state.mjs';
 import { createAdvancedSection } from '../ui/components.js';
 
 let _runs = [];
@@ -32,6 +37,9 @@ let _contactReviewMap = new Map();
 let _contactPreviewRunDir = '';
 let _contactLoadedRunDir = '';
 let _contactSaveTimer = null;
+let _contactPendingSave = null;
+let _contactSaveInFlight = null;
+let _contactRunSwitchTarget = '';
 let _contactSearch = '';
 let _contactStatusFilter = 'all';
 let _contactContactFilter = 'all';
@@ -40,7 +48,7 @@ let _contactFollowupFilter = 'all';
 let _contactChannelFilter = 'all';
 let _contactBatchFollowupStatus = '待建联';
 let _contactBatchChannel = '蒲公英邀约';
-let _contactReviewScrollTop = 0;
+const _contactReviewViewportStates = createReviewViewportStateRegistry();
 let _contactBulkActionsOpen = false;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
@@ -51,11 +59,16 @@ const _autoEnrichmentStartedRuns = new Set();
 let _xhsContactState = {
   running: false,
   paused: false,
+  pausePending: false,
+  cancelPending: false,
+  phase: 'idle',
   total: 0,
   completed: 0,
   found: 0,
   failed: 0,
   session: 'unknown',
+  currentCreatorName: '',
+  lastCode: '',
   message: ''
 };
 let _emailHandoffState = {
@@ -140,6 +153,20 @@ function getReviewRows() {
   return Array.from(_contactReviewMap.values()).map((row) => ({ ...row }));
 }
 
+function getContactReviewViewportKey() {
+  return buildReviewViewportKey({
+    runDir: _selectedRunDir,
+    filters: {
+      search: _contactSearch,
+      status: _contactStatusFilter,
+      contact: _contactContactFilter,
+      priority: _contactPriorityFilter,
+      followup: _contactFollowupFilter,
+      channel: _contactChannelFilter
+    }
+  });
+}
+
 function applyXhsContactUpdate(update = {}) {
   const rowId = String(update.rowId || '');
   if (!rowId) return false;
@@ -152,6 +179,10 @@ function applyXhsContactUpdate(update = {}) {
   if (update.contactSource) review.contactSource = update.contactSource;
   if (update.contactCollectedAt) review.contactCollectedAt = update.contactCollectedAt;
   if (update.contactCollectionStatus) review.contactCollectionStatus = update.contactCollectionStatus;
+  if (update.contactCollectionCode !== undefined) review.contactCollectionCode = update.contactCollectionCode || '';
+  if (update.contactCollectionError !== undefined || update.error !== undefined) {
+    review.contactCollectionError = update.contactCollectionError || update.error || '';
+  }
   _xiaomifengApprovalCheck = null;
   scheduleContactReviewSave();
   return true;
@@ -161,26 +192,57 @@ function ensureXhsContactProgressListener() {
   if (_xhsContactListenerBound || !window.desktopAPI?.contacts?.onXhsProgress) return;
   _xhsContactListenerBound = true;
   window.desktopAPI.contacts.onXhsProgress((payload = {}) => {
+    if (payload.type === 'item_start' && payload.rowId) {
+      _contactReviewViewportStates.setActiveRow(
+        getContactReviewViewportKey(),
+        payload.rowId,
+        document.querySelector('.contact-review-list')
+      );
+    }
     if (payload.type === 'item_result' && payload.update) applyXhsContactUpdate(payload.update);
     _xhsContactState = {
       ..._xhsContactState,
       running: typeof payload.running === 'boolean' ? payload.running : _xhsContactState.running,
       paused: typeof payload.paused === 'boolean' ? payload.paused : _xhsContactState.paused,
+      pausePending: typeof payload.pausePending === 'boolean' ? payload.pausePending : _xhsContactState.pausePending,
+      cancelPending: typeof payload.cancelPending === 'boolean' ? payload.cancelPending : _xhsContactState.cancelPending,
+      phase: payload.phase || _xhsContactState.phase,
       total: Number.isFinite(Number(payload.total)) ? Number(payload.total) : _xhsContactState.total,
       completed: Number.isFinite(Number(payload.completed)) ? Number(payload.completed) : _xhsContactState.completed,
       found: Number.isFinite(Number(payload.found)) ? Number(payload.found) : _xhsContactState.found,
       failed: Number.isFinite(Number(payload.failed)) ? Number(payload.failed) : _xhsContactState.failed,
+      currentCreatorName: payload.currentCreatorName || payload.creatorName || _xhsContactState.currentCreatorName,
+      lastCode: payload.code || payload.update?.contactCollectionCode || _xhsContactState.lastCode,
       message: payload.message || payload.pauseReason || payload.error || _xhsContactState.message
     };
     if (payload.type === 'started' || payload.type === 'resumed') {
       _xhsContactState.running = true;
       _xhsContactState.paused = false;
+      _xhsContactState.pausePending = false;
+      _xhsContactState.cancelPending = false;
     }
-    if (payload.type === 'paused') _xhsContactState.paused = true;
+    if (payload.type === 'pause_requested') _xhsContactState.pausePending = true;
+    if (payload.type === 'paused') {
+      _xhsContactState.paused = true;
+      _xhsContactState.pausePending = false;
+    }
+    if (payload.type === 'cancel_requested') {
+      _xhsContactState.cancelPending = true;
+      _xhsContactState.phase = 'stopping';
+    }
+    if (payload.type === 'item_result' && payload.update?.error) {
+      _xhsContactState.message = payload.update.contactCollectionError || payload.update.error;
+    }
     if (payload.code === 'XHS_RISK_DETECTED') _xhsContactState.session = 'risk';
-    if (payload.type === 'finished' || payload.type === 'failed') {
+    if (payload.type === 'finished' || payload.type === 'failed' || payload.type === 'stopped') {
       _xhsContactState.running = false;
       _xhsContactState.paused = false;
+      _xhsContactState.pausePending = false;
+      _xhsContactState.cancelPending = false;
+      _xhsContactState.currentCreatorName = '';
+      if (payload.type === 'failed') _xhsContactState.phase = 'failed';
+      if (payload.type === 'stopped') _xhsContactState.phase = 'stopped';
+      if (payload.type === 'finished') _xhsContactState.phase = 'finished';
     }
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
   });
@@ -197,13 +259,28 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
     );
     if (!confirmed) return { ok: false, canceled: true };
   }
-  _xhsContactState = { running: true, paused: false, total: targets.length, completed: 0, found: 0, failed: 0, session: _xhsContactState.session, message: '' };
+  _xhsContactState = {
+    running: true,
+    paused: false,
+    pausePending: false,
+    cancelPending: false,
+    phase: 'starting',
+    total: targets.length,
+    completed: 0,
+    found: 0,
+    failed: 0,
+    session: _xhsContactState.session,
+    currentCreatorName: '',
+    lastCode: '',
+    message: '补采任务正在启动'
+  };
   const result = await window.desktopAPI.contacts.enrichXhsBatch({
     runDir: _selectedRunDir,
     rows: buildExportRowsFromContactRows(targets)
   });
   if (!result?.ok) {
     _xhsContactState.running = false;
+    _xhsContactState.phase = 'failed';
     if (result.code === 'XHS_RISK_DETECTED') {
       _xhsContactState.session = 'risk';
       _xhsContactState.message = result.riskText || result.error || '安全验证';
@@ -217,11 +294,16 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
     ..._xhsContactState,
     running: false,
     paused: false,
+    pausePending: false,
+    cancelPending: false,
+    phase: result.canceled ? 'stopped' : 'finished',
     completed: result.updates?.length || _xhsContactState.completed,
     found: result.found || 0,
     failed: result.failed || 0
   };
-  setMsg(`小红书补采完成：处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`);
+  setMsg(result.canceled
+    ? `小红书补采已停止：停止前处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`
+    : `小红书补采完成：处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`);
   return result;
 }
 
@@ -312,6 +394,8 @@ function buildExportRowsFromContactRows(rows) {
       contactSource: review.contactSource || '',
       contactCollectedAt: review.contactCollectedAt || '',
       contactCollectionStatus: review.contactCollectionStatus || '',
+      contactCollectionCode: review.contactCollectionCode || '',
+      contactCollectionError: review.contactCollectionError || '',
       contactChannel: normalizeContactChannel(review.contactChannel || row.contactChannel || _contactChannelStrategy),
       groupTag: _contactGroupTag,
       greeting: _contactGreeting,
@@ -493,6 +577,8 @@ function ensureReviewRow(row) {
       contactSource: row?.contactSource || '',
       contactCollectedAt: row?.contactCollectedAt || '',
       contactCollectionStatus: row?.contactCollectionStatus || '',
+      contactCollectionCode: row?.contactCollectionCode || '',
+      contactCollectionError: row?.contactCollectionError || '',
       contactChannel: normalizeContactChannel(row?.contactChannel || _contactChannelStrategy)
     });
   }
@@ -545,18 +631,19 @@ function resetContactPreviewState({ keepMeta = false } = {}) {
   _contactPreviewRunDir = '';
   _contactLoadedRunDir = '';
   _contactReviewMap = new Map();
-  _contactReviewScrollTop = 0;
   _contactSaveStatus = '';
   resetEmailHandoff();
   if (!keepMeta) _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
 }
 
-async function loadContactReviewForRun(force = false) {
-  if (!_selectedRunDir) return;
-  if (!force && _contactLoadedRunDir === _selectedRunDir) return;
+async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) {
+  const targetRunDir = String(runDir || '');
+  if (!targetRunDir) return false;
+  if (!force && _contactLoadedRunDir === targetRunDir) return true;
   try {
-    const r = await window.desktopAPI.exports.loadContactReview({ runDir: _selectedRunDir });
-    if (!r?.ok) return;
+    const r = await window.desktopAPI.exports.loadContactReview({ runDir: targetRunDir });
+    if (_selectedRunDir !== targetRunDir) return false;
+    if (!r?.ok) return false;
     const needsManualSelectionMigration = r.settings?.selectionPolicy !== CONTACT_SELECTION_POLICY;
     _contactReviewMap = new Map();
     (Array.isArray(r.reviewRows) ? r.reviewRows : []).forEach((row) => {
@@ -583,19 +670,117 @@ async function loadContactReviewForRun(force = false) {
     if (r.settings?.pgyIntro !== undefined) _contactPgyIntro = r.settings.pgyIntro;
     if (r.settings?.pgyPublishStart !== undefined) _contactPgyPublishStart = r.settings.pgyPublishStart;
     if (r.settings?.pgyPublishEnd !== undefined) _contactPgyPublishEnd = r.settings.pgyPublishEnd;
-    _contactLoadedRunDir = _selectedRunDir;
+    _contactLoadedRunDir = targetRunDir;
+    return true;
   } catch (_) {
     // keep unsaved in-memory edits if load fails
+    return false;
   }
 }
 
-async function saveContactReviewNow() {
-  if (!_selectedRunDir) return null;
-  return window.desktopAPI.exports.saveContactReview({
-    runDir: _selectedRunDir,
+function captureContactReviewSavePayload(runDir = _selectedRunDir) {
+  const targetRunDir = String(runDir || '');
+  if (!targetRunDir) return null;
+  const ownsLoadedState = _contactLoadedRunDir === targetRunDir || _contactPreviewRunDir === targetRunDir;
+  if (!ownsLoadedState) return null;
+  return {
+    runDir: targetRunDir,
     reviewRows: getReviewRows(),
-    settings: getContactSettings()
-  });
+    settings: { ...getContactSettings() }
+  };
+}
+
+function cancelPendingContactReviewSave(runDir = '') {
+  if (!_contactPendingSave) {
+    if (_contactSaveTimer) clearTimeout(_contactSaveTimer);
+    _contactSaveTimer = null;
+    return null;
+  }
+  const pendingRunDir = String(_contactPendingSave.payload?.runDir || '');
+  if (runDir && pendingRunDir !== runDir) return null;
+  if (_contactSaveTimer) clearTimeout(_contactSaveTimer);
+  _contactSaveTimer = null;
+  const payload = _contactPendingSave.payload;
+  _contactPendingSave = null;
+  return payload;
+}
+
+async function persistContactReviewPayload(payload) {
+  if (!payload?.runDir) return null;
+  const previous = _contactSaveInFlight?.promise;
+  const promise = (previous ? previous.catch(() => null) : Promise.resolve())
+    .then(() => window.desktopAPI.exports.saveContactReview(payload));
+  const marker = { runDir: payload.runDir, promise };
+  _contactSaveInFlight = marker;
+  try {
+    return await promise;
+  } finally {
+    if (_contactSaveInFlight === marker) _contactSaveInFlight = null;
+  }
+}
+
+async function saveContactReviewNow(payload = null) {
+  const savePayload = payload || captureContactReviewSavePayload();
+  if (!savePayload) return null;
+  if (!payload) cancelPendingContactReviewSave(savePayload.runDir);
+  return persistContactReviewPayload(savePayload);
+}
+
+async function flushContactReviewSaveBeforeRunSwitch(runDir) {
+  const targetRunDir = String(runDir || '');
+  try {
+    const pendingPayload = cancelPendingContactReviewSave(targetRunDir);
+    if (pendingPayload) {
+      if (_selectedRunDir === targetRunDir) setContactSaveStatus('切换前保存中...');
+      const result = await saveContactReviewNow(pendingPayload);
+      if (!result?.ok) throw new Error(result?.error || '保存失败');
+    }
+    const inFlight = _contactSaveInFlight;
+    if (inFlight?.runDir === targetRunDir) {
+      const result = await inFlight.promise;
+      if (!result?.ok) throw new Error(result?.error || '保存失败');
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
+async function switchSelectedContactRun(nextRunDir) {
+  const targetRunDir = String(nextRunDir || '');
+  if (targetRunDir === _selectedRunDir) return true;
+  const previousRunDir = _selectedRunDir;
+  if (previousRunDir) {
+    const flushed = await flushContactReviewSaveBeforeRunSwitch(previousRunDir);
+    if (!flushed.ok) {
+      setContactSaveStatus('旧结果保存失败，已取消切换');
+      setMsg(`未切换结果：旧结果的复核改动保存失败。${flushed.error || ''}`);
+      return false;
+    }
+  } else {
+    cancelPendingContactReviewSave();
+  }
+  _selectedRunDir = targetRunDir;
+  resetContactPreviewState();
+  _autoPreviewRequestedRunDir = '';
+  return true;
+}
+
+function requestSelectedContactRunSwitch(nextRunDir) {
+  const targetRunDir = String(nextRunDir || '');
+  if (!targetRunDir || targetRunDir === _selectedRunDir || _contactRunSwitchTarget === targetRunDir) return;
+  _contactRunSwitchTarget = targetRunDir;
+  setTimeout(async () => {
+    const switched = await switchSelectedContactRun(targetRunDir);
+    _contactRunSwitchTarget = '';
+    store.set({
+      exports: {
+        ...(store.state.exports || {}),
+        selectedRunDir: switched ? targetRunDir : _selectedRunDir,
+        _t: Date.now()
+      }
+    });
+  }, 0);
 }
 
 function getXiaomifengApprovalPayload() {
@@ -667,24 +852,34 @@ async function importContactReviewWorkbookNow() {
 }
 
 function scheduleContactReviewSave() {
-  if (!_selectedRunDir) return;
-  if (_contactSaveTimer) clearTimeout(_contactSaveTimer);
+  const payload = captureContactReviewSavePayload();
+  if (!payload) return;
+  cancelPendingContactReviewSave();
   _contactSaveStatus = '等待自动保存';
   _xiaomifengApprovalCheck = null;
+  _contactPendingSave = { payload };
   _contactSaveTimer = setTimeout(async () => {
+    const pending = _contactPendingSave;
+    if (!pending) return;
     _contactSaveTimer = null;
+    _contactPendingSave = null;
+    const scheduledRunDir = pending.payload.runDir;
     try {
-      setContactSaveStatus('保存中...');
-      await saveContactReviewNow();
-      setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
-    } catch (_) {
-      setContactSaveStatus('自动保存失败，请手动保存复核');
+      if (_selectedRunDir === scheduledRunDir) setContactSaveStatus('保存中...');
+      const result = await saveContactReviewNow(pending.payload);
+      if (!result?.ok) throw new Error(result?.error || '保存失败');
+      if (_selectedRunDir === scheduledRunDir) setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
+    } catch (error) {
+      if (_selectedRunDir === scheduledRunDir) {
+        setContactSaveStatus(`自动保存失败：${error?.message || String(error)}`);
+      }
     }
   }, 500);
 }
 
 async function refreshContactPreview() {
-  if (!_selectedRunDir) {
+  const runDir = _selectedRunDir;
+  if (!runDir) {
     _contactPreviewRows = [];
     _contactPreviewRunDir = '';
     _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
@@ -692,14 +887,21 @@ async function refreshContactPreview() {
   }
   setMsg('加载建联复核预览中...');
   try {
-    await loadContactReviewForRun();
+    const loaded = await loadContactReviewForRun(false, runDir);
+    if (_selectedRunDir !== runDir) return;
+    if (!loaded) {
+      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: '复核状态读取失败' };
+      setMsg('加载复核预览失败：无法读取这个结果原有的复核状态，已停止刷新以避免覆盖。');
+      return;
+    }
     const r = await window.desktopAPI.exports.getContactPreview({
-      runDir: _selectedRunDir,
+      runDir,
       defaultGroupTag: _contactGroupTag,
       defaultGreeting: _contactGreeting,
       ...getContactSettings(),
       reviewRows: getReviewRows()
     });
+    if (_selectedRunDir !== runDir) return;
     if (!r?.ok) {
       _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: r?.error || 'unknown error' };
       setMsg(`加载复核预览失败：${r?.error || 'unknown error'}`);
@@ -712,18 +914,22 @@ async function refreshContactPreview() {
       loaded: true,
       error: ''
     };
-    _contactPreviewRunDir = _selectedRunDir;
+    _contactPreviewRunDir = runDir;
     const migratedReviewMap = new Map();
     _contactPreviewRows.forEach((row) => {
       const review = ensureReviewRow(row);
       if (review) migratedReviewMap.set(row.rowId, { ...review, rowId: row.rowId });
     });
     _contactReviewMap = migratedReviewMap;
-    await saveContactReviewNow();
+    const saveResult = await saveContactReviewNow(captureContactReviewSavePayload(runDir));
+    if (!saveResult?.ok) throw new Error(saveResult?.error || '保存复核状态失败');
+    if (_selectedRunDir !== runDir) return;
     await refreshXiaomifengApproval();
+    if (_selectedRunDir !== runDir) return;
     _contactSaveStatus = '';
     setMsg('');
   } catch (e) {
+    if (_selectedRunDir !== runDir) return;
     _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: e?.message || String(e) };
     setMsg(`加载复核预览异常：${e?.message || String(e)}`);
   }
@@ -733,9 +939,7 @@ export function renderExports(state) {
   ensureXhsContactProgressListener();
   const requestedRunDir = state.exports?.selectedRunDir || '';
   if (requestedRunDir && requestedRunDir !== _selectedRunDir) {
-    _selectedRunDir = requestedRunDir;
-    resetContactPreviewState();
-    _autoPreviewRequestedRunDir = '';
+    requestSelectedContactRunSwitch(requestedRunDir);
   }
   const autoEnrichRunDir = String(state.exports?.autoEnrichRunDir || '');
   if (
@@ -801,10 +1005,18 @@ export function renderExports(state) {
     if (it.path === _selectedRunDir) opt.selected = true;
     sel.appendChild(opt);
   });
-  sel.addEventListener('change', () => {
-    _selectedRunDir = sel.value;
-    resetContactPreviewState();
-    _autoPreviewRequestedRunDir = '';
+  sel.addEventListener('change', async () => {
+    const targetRunDir = sel.value;
+    sel.disabled = true;
+    const switched = await switchSelectedContactRun(targetRunDir);
+    sel.value = _selectedRunDir;
+    store.set({
+      exports: {
+        ...(store.state.exports || {}),
+        selectedRunDir: switched ? targetRunDir : _selectedRunDir,
+        _t: Date.now()
+      }
+    });
   });
 
   const btnRefresh = document.createElement('button');
@@ -1096,6 +1308,8 @@ export function renderExports(state) {
   pgyGrid.appendChild(emailBodyWrap);
 
   const filteredContactRows = getContactFilteredRows();
+  const contactReviewViewportKey = getContactReviewViewportKey();
+  const savedContactReviewViewport = _contactReviewViewportStates.get(contactReviewViewportKey);
   const selectedContactRows = filteredContactRows.filter((row) => ensureReviewRow(row)?.selected === true);
   const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
   const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
@@ -1109,25 +1323,66 @@ export function renderExports(state) {
   contactSec.appendChild(metrics);
 
   const xhsContactBar = document.createElement('div');
-  xhsContactBar.className = 'export-review-toolbar';
+  xhsContactBar.className = 'xhs-contact-status-panel';
   setStyles(xhsContactBar, { marginTop: '10px' });
   const xhsContactStatus = document.createElement('div');
-  xhsContactStatus.className = 'export-review-summary';
-  if (_xhsContactState.running && _xhsContactState.paused) {
-    xhsContactStatus.textContent = `小红书补采已暂停：${_xhsContactState.message || '请在右侧手工处理'}（${_xhsContactState.completed}/${_xhsContactState.total}）`;
+  xhsContactStatus.className = 'xhs-contact-status-copy';
+  xhsContactStatus.setAttribute('role', 'status');
+  xhsContactStatus.setAttribute('aria-live', 'polite');
+  const xhsPhaseLabels = {
+    starting: '正在启动',
+    resolving_pgy: '正在定位主页',
+    loading_xhs: '正在打开主页',
+    reading_xhs: '正在读取公开资料',
+    cooldown: '安全冷却中',
+    between_items: '准备下一位',
+    stopping: '正在安全停止',
+    stopped: '已停止',
+    finished: '已完成',
+    failed: '补采失败'
+  };
+  let xhsStatusLabel = xhsPhaseLabels[_xhsContactState.phase] || '补采未启动';
+  let xhsStatusDetail = '';
+  if (_xhsContactState.running && _xhsContactState.cancelPending) {
+    xhsStatusLabel = '正在安全停止';
+    xhsStatusDetail = '停止请求已收到；到达下一个安全点后结束，未处理达人不会继续。';
+  } else if (_xhsContactState.running && _xhsContactState.paused) {
+    xhsStatusLabel = '已暂停';
+    xhsStatusDetail = _xhsContactState.message || '补采已停在安全点，不会继续读取下一位达人。';
+  } else if (_xhsContactState.running && _xhsContactState.pausePending) {
+    xhsStatusLabel = '等待暂停';
+    xhsStatusDetail = '暂停请求已收到；将在当前页面读取的下一个安全点暂停。';
   } else if (_xhsContactState.running) {
-    xhsContactStatus.textContent = `正在补采小红书公开联系方式：${_xhsContactState.completed}/${_xhsContactState.total}，已找到 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}${_xhsContactState.message ? ` · ${_xhsContactState.message}` : ''}`;
+    xhsStatusDetail = [
+      _xhsContactState.currentCreatorName ? `当前：${_xhsContactState.currentCreatorName}` : '',
+      _xhsContactState.message
+    ].filter(Boolean).join(' · ') || '补采任务正在运行。';
   } else if (_xhsContactState.session === 'risk') {
-    xhsContactStatus.textContent = `小红书已触发安全验证或访问频繁：${_xhsContactState.message || '请查看右侧页面'}。补采已停止，请勿反复刷新或重试；页面恢复后先点击“检测登录”。`;
+    xhsStatusLabel = '安全验证阻断';
+    xhsStatusDetail = `${_xhsContactState.message || '请查看右侧页面'}。请勿反复刷新或重试；页面恢复后先检测登录。`;
   } else if (_xhsContactState.total) {
-    xhsContactStatus.textContent = `上次补采：完成 ${_xhsContactState.completed}/${_xhsContactState.total}，找到联系方式 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
+    xhsStatusDetail = `处理 ${_xhsContactState.completed}/${_xhsContactState.total}，找到 ${_xhsContactState.found}，失败 ${_xhsContactState.failed}`;
   } else if (_xhsContactState.session === 'ready') {
-    xhsContactStatus.textContent = selectedContactRows.length
-      ? `小红书页面可用，已选择 ${selectedContactRows.length} 位达人，可以开始补采公开简介中的联系方式。`
-      : '小红书页面可用。请先在下方达人名称前勾选“要建联”，再点击“补采已选达人联系方式”。';
+    xhsStatusLabel = '可以开始补采';
+    xhsStatusDetail = selectedContactRows.length
+      ? `已选择 ${selectedContactRows.length} 位达人。`
+      : '请先在下方勾选要建联的达人。';
   } else {
-    xhsContactStatus.textContent = '先在右侧完成小红书人工登录，再串行补采公开邮箱、微信或手机号。';
+    xhsStatusLabel = '等待登录';
+    xhsStatusDetail = '先在右侧完成人工登录，再读取公开联系方式。';
   }
+  const xhsStatusTitle = document.createElement('b');
+  xhsStatusTitle.textContent = xhsStatusLabel;
+  const xhsStatusBody = document.createElement('span');
+  xhsStatusBody.textContent = xhsStatusDetail;
+  const xhsStatusMetrics = document.createElement('small');
+  xhsStatusMetrics.textContent = `进度 ${_xhsContactState.completed}/${_xhsContactState.total || 0} · 找到 ${_xhsContactState.found} · 失败 ${_xhsContactState.failed}`;
+  xhsContactStatus.appendChild(xhsStatusTitle);
+  xhsContactStatus.appendChild(xhsStatusBody);
+  xhsContactStatus.appendChild(xhsStatusMetrics);
+
+  const xhsContactActions = document.createElement('div');
+  xhsContactActions.className = 'xhs-contact-actions';
 
   const btnOpenXhsLogin = makeSoftButton('打开小红书登录', async () => {
     const result = await window.desktopAPI.contacts.openXhsLogin();
@@ -1155,24 +1410,36 @@ export function renderExports(state) {
     ? '只补采当前明确勾选的达人，并保留串行低频和风险暂停'
     : '请先在下方达人名称前勾选“要建联”';
 
-  const btnPauseXhsContact = makeSoftButton(_xhsContactState.paused ? '继续' : '暂停', async () => {
-    const result = _xhsContactState.paused
+  const btnPauseXhsContact = makeSoftButton(
+    (_xhsContactState.paused || _xhsContactState.pausePending) ? '继续' : '暂停',
+    async () => {
+    const result = (_xhsContactState.paused || _xhsContactState.pausePending)
       ? await window.desktopAPI.contacts.resumeXhsEnrichment()
       : await window.desktopAPI.contacts.pauseXhsEnrichment();
     if (!result?.ok) setMsg(`补采任务操作失败：${result?.error || 'unknown error'}`);
-  }, { disabled: !_xhsContactState.running });
+  }, { disabled: !_xhsContactState.running || _xhsContactState.cancelPending });
 
-  const btnCancelXhsContact = makeSoftButton('停止', async () => {
+  const btnCancelXhsContact = makeSoftButton(_xhsContactState.cancelPending ? '正在安全停止' : '停止', async () => {
     const result = await window.desktopAPI.contacts.cancelXhsEnrichment();
-    if (!result?.ok) setMsg(`停止失败：${result?.error || 'unknown error'}`);
-  }, { disabled: !_xhsContactState.running });
+    if (!result?.ok) return setMsg(`停止失败：${result?.error || 'unknown error'}`);
+    _xhsContactState = { ..._xhsContactState, cancelPending: true, phase: 'stopping', message: '停止请求已收到' };
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  }, { disabled: !_xhsContactState.running || _xhsContactState.cancelPending });
+
+  const btnReturnCollection = makeSoftButton('返回筛选结果', async () => {
+    const result = await window.desktopAPI.browser.returnToCollectionResults();
+    if (!result?.ok) return setMsg(`返回筛选结果失败：${result?.error || 'unknown error'}`);
+    setMsg(result.warning || '已返回最近的蒲公英筛选结果页。');
+  }, { disabled: _xhsContactState.running });
 
   xhsContactBar.appendChild(xhsContactStatus);
-  xhsContactBar.appendChild(btnOpenXhsLogin);
-  xhsContactBar.appendChild(btnCheckXhsLogin);
-  xhsContactBar.appendChild(btnStartXhsContact);
-  xhsContactBar.appendChild(btnPauseXhsContact);
-  xhsContactBar.appendChild(btnCancelXhsContact);
+  xhsContactActions.appendChild(btnReturnCollection);
+  xhsContactActions.appendChild(btnOpenXhsLogin);
+  xhsContactActions.appendChild(btnCheckXhsLogin);
+  xhsContactActions.appendChild(btnStartXhsContact);
+  xhsContactActions.appendChild(btnPauseXhsContact);
+  xhsContactActions.appendChild(btnCancelXhsContact);
+  xhsContactBar.appendChild(xhsContactActions);
   contactSec.appendChild(xhsContactBar);
 
   const contactSettings = createAdvancedSection({
@@ -1271,7 +1538,8 @@ export function renderExports(state) {
   btnSaveReview.addEventListener('click', async () => {
     try {
       setContactSaveStatus('保存中...');
-      await saveContactReviewNow();
+      const result = await saveContactReviewNow();
+      if (!result?.ok) throw new Error(result?.error || '保存失败');
       setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
     } catch (e) {
       setContactSaveStatus(`保存失败：${e?.message || String(e)}`);
@@ -1296,7 +1564,7 @@ export function renderExports(state) {
   const btnUnselectAllContact = document.createElement('button');
   btnUnselectAllContact.className = 'btn ghost';
   btnUnselectAllContact.style.height = '34px';
-  btnUnselectAllContact.textContent = '清空全部勾选';
+  btnUnselectAllContact.textContent = '清空整批勾选';
   btnUnselectAllContact.disabled = !_contactPreviewRows.length;
   btnUnselectAllContact.addEventListener('click', () => {
     _contactPreviewRows.forEach((row) => {
@@ -1314,36 +1582,21 @@ export function renderExports(state) {
   const btnTencentEmail = document.createElement('button');
   btnTencentEmail.className = 'btn primary';
   btnTencentEmail.style.height = '34px';
-  btnTencentEmail.textContent = _emailHandoffState.status === 'preparing' ? '正在采集邮箱...' : '去邮箱建联';
+  btnTencentEmail.textContent = _emailHandoffState.status === 'preparing' ? '正在整理邮箱...' : '打开企业邮箱';
   btnTencentEmail.disabled = !selectedContactRows.length || _emailHandoffState.status === 'preparing' || _xhsContactState.running;
-  btnTencentEmail.title = '补采已勾选达人的公开邮箱并打开腾讯企业邮箱；邮箱由你手动复制粘贴，不会自动填写或发送';
+  btnTencentEmail.title = '只整理当前已有邮箱并打开腾讯企业邮箱；不会启动补采、自动填写或发送';
   btnTencentEmail.addEventListener('click', async () => {
     const selectedRows = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
     if (!selectedRows.length) return setMsg('请先在达人名称前勾选“要建联”。');
     _emailHandoffState = { status: 'preparing', emails: [], missingNames: [], message: '正在整理已勾选达人的公开邮箱。' };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
 
-    const missingEmailRows = selectedRows.filter((row) => !isValidEmail(ensureReviewRow(row)?.email || row?.email));
-    if (missingEmailRows.length) {
-      const enrichment = await startXhsContactRows(missingEmailRows, '已勾选达人', { confirm: false });
-      if (!enrichment?.ok) {
-        _emailHandoffState = {
-          status: 'error',
-          emails: [],
-          missingNames: missingEmailRows.map((row) => row.creatorName || row.xhsId || '未命名达人'),
-          message: enrichment?.canceled ? '邮箱采集已取消。' : `邮箱采集未完成：${enrichment?.error || '请检查右侧页面'}`
-        };
-        store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-        return;
-      }
-    }
-
     const handoff = getEmailHandoff(selectedRows);
     if (!handoff.emails.length) {
       _emailHandoffState = {
         status: 'error',
         ...handoff,
-        message: '已处理勾选达人，但没有找到可用的公开邮箱。'
+        message: '勾选达人中没有现成的可用邮箱。请先点击“补采已选达人联系方式”并确认补采范围。'
       };
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
       return;
@@ -1533,7 +1786,7 @@ export function renderExports(state) {
     selectionActions.className = 'export-filter-actions';
     setStyles(selectionActions, { padding: '8px 18px 0', alignItems: 'center' });
 
-    const selectAllButton = mkFilterBtn('全选', () => {
+    const selectAllButton = mkFilterBtn('全选整批', () => {
       _contactPreviewRows.forEach((row) => {
         const review = ensureReviewRow(row);
         markReviewSelected(review);
@@ -1545,7 +1798,7 @@ export function renderExports(state) {
     selectAllButton.title = '选中本批次全部已采集达人，不受当前筛选条件影响';
     selectionActions.appendChild(selectAllButton);
 
-    const resetSelectionButton = mkFilterBtn('重置', () => {
+    const resetSelectionButton = mkFilterBtn('清空整批勾选', () => {
       _contactPreviewRows.forEach((row) => {
         const review = ensureReviewRow(row);
         clearReviewSelected(review);
@@ -1563,6 +1816,24 @@ export function renderExports(state) {
     selectionActions.appendChild(selectionScope);
     contactSec.appendChild(selectionActions);
 
+    filterActions.appendChild(mkFilterBtn('全选当前筛选', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        markReviewSelected(review);
+      });
+      _xiaomifengApprovalCheck = null;
+      scheduleContactReviewSave();
+      setMsg(`已选中当前筛选中的 ${filteredContactRows.length} 位达人。`);
+    }));
+    filterActions.appendChild(mkFilterBtn('取消当前筛选勾选', () => {
+      filteredContactRows.forEach((row) => {
+        const review = ensureReviewRow(row);
+        clearReviewSelected(review);
+      });
+      _xiaomifengApprovalCheck = null;
+      scheduleContactReviewSave();
+      setMsg(`已取消当前筛选中 ${filteredContactRows.length} 位达人的勾选；其他达人不受影响。`);
+    }));
     filterActions.appendChild(mkFilterBtn('复制当前链接', async () => {
       const text = filteredContactRows.map((row) => row.creatorUrl).filter(Boolean).join('\n');
       if (!text) {
@@ -1718,7 +1989,18 @@ export function renderExports(state) {
     filteredContactRows.forEach((row) => {
       const review = ensureReviewRow(row);
       const card = document.createElement('div');
-      card.className = `contact-review-card ${defaultFollowupStatus(review) === '不建联' ? 'is-excluded' : ''}`;
+      const rowId = String(row.rowId || '');
+      const isActive = rowId && savedContactReviewViewport?.activeRowId === rowId;
+      card.className = [
+        'contact-review-card',
+        defaultFollowupStatus(review) === '不建联' ? 'is-excluded' : '',
+        isActive ? 'is-active' : ''
+      ].filter(Boolean).join(' ');
+      card.dataset.reviewRowId = rowId;
+      if (isActive) card.setAttribute('aria-current', 'true');
+      card.addEventListener('focusin', () => {
+        _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+      });
 
       const main = document.createElement('div');
       main.className = 'contact-review-main';
@@ -1730,7 +2012,7 @@ export function renderExports(state) {
       selectedInput.checked = review?.selected === true;
       selectedInput.addEventListener('change', () => {
         if (!review) return;
-        _contactReviewScrollTop = reviewList.scrollTop;
+        _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
         if (selectedInput.checked) markReviewSelected(review);
         else clearReviewSelected(review);
         _xiaomifengApprovalCheck = null;
@@ -1761,6 +2043,7 @@ export function renderExports(state) {
         pgyLink.title = row.creatorUrl;
         pgyLink.addEventListener('click', async (event) => {
           event.preventDefault();
+          _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
           const result = await window.desktopAPI.contacts.openPgyCreator(row.creatorUrl);
           if (!result?.ok) setMsg(`打开蒲公英主页失败：${result?.error || 'unknown error'}`);
         });
@@ -1792,6 +2075,24 @@ export function renderExports(state) {
       if (review?.contactCollectionStatus === 'not_public') appendChip('小红书主页', '未公开联系方式');
       if (review?.contactCollectionStatus === 'profile_not_found' || review?.contactCollectionStatus === 'profile_unavailable') {
         appendChip('小红书主页', '补采失败', 'warn');
+      }
+
+      let contactFailure = null;
+      if (review?.contactCollectionError) {
+        const failureLabels = {
+          PGY_PROFILE_LOAD_FAILED: '蒲公英达人页打开失败',
+          PGY_PROFILE_NOT_READY: '蒲公英达人页未加载稳定',
+          XHS_PROFILE_NOT_FOUND: '未找到小红书主页入口',
+          XHS_PROFILE_NOT_READY: '小红书主页未加载完整',
+          XHS_PROFILE_CONTENT_NOT_READY: '公开资料区域未出现',
+          XHS_PROFILE_STABILIZING: '公开资料仍在变化',
+          XHS_PROFILE_URL_MISMATCH: '打开了其他小红书主页'
+        };
+        contactFailure = document.createElement('div');
+        contactFailure.className = 'contact-collection-error';
+        const label = failureLabels[review.contactCollectionCode] || '补采失败';
+        contactFailure.textContent = `${label}：${review.contactCollectionError}`;
+        contactFailure.title = review.contactCollectionCode || '';
       }
 
       const fields = document.createElement('div');
@@ -1950,20 +2251,23 @@ export function renderExports(state) {
 
       card.appendChild(main);
       card.appendChild(quickMeta);
+      if (contactFailure) card.appendChild(contactFailure);
       card.appendChild(detail);
       reviewList.appendChild(card);
     });
     contactSec.appendChild(reviewList);
     reviewList.addEventListener('scroll', () => {
-      _contactReviewScrollTop = reviewList.scrollTop;
+      _contactReviewViewportStates.capture(contactReviewViewportKey, reviewList);
     });
   }
   root.appendChild(contactSec);
   if (contactReviewList) {
-    const scrollTop = _contactReviewScrollTop;
-    contactReviewList.scrollTop = scrollTop;
     requestAnimationFrame(() => {
-      if (contactReviewList.isConnected) contactReviewList.scrollTop = scrollTop;
+      if (!contactReviewList.isConnected || !savedContactReviewViewport) return;
+      restoreReviewViewport(contactReviewList, savedContactReviewViewport);
+      requestAnimationFrame(() => {
+        if (contactReviewList.isConnected) restoreReviewViewport(contactReviewList, savedContactReviewViewport);
+      });
     });
   }
 
@@ -2028,19 +2332,19 @@ export function renderExports(state) {
 
   tools.appendChild(search);
   tools.appendChild(
-    mkMiniBtn('全选', () => {
+    mkMiniBtn('全选全部列', () => {
       _columns.forEach((c) => _checked.add(c));
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     })
   );
   tools.appendChild(
-    mkMiniBtn('全不选', () => {
+    mkMiniBtn('取消全部列', () => {
       _checked = new Set();
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     })
   );
   tools.appendChild(
-    mkMiniBtn('反选', () => {
+    mkMiniBtn('反选全部列', () => {
       const next = new Set();
       _columns.forEach((c) => { if (!_checked.has(c)) next.add(c); });
       _checked = next;

@@ -1,10 +1,5 @@
 const path = require('path');
 
-function normalizeRoot(root) {
-  const resolved = path.resolve(String(root || ''));
-  return resolved.endsWith(path.sep) ? resolved : resolved + path.sep;
-}
-
 function resolveInsideRoot(maybePath, root) {
   const input = String(maybePath || '').trim();
   const base = String(root || '').trim();
@@ -12,8 +7,9 @@ function resolveInsideRoot(maybePath, root) {
 
   const resolvedRoot = path.resolve(base);
   const resolved = path.resolve(input);
-  if (resolved === resolvedRoot) return resolved;
-  if (!resolved.startsWith(normalizeRoot(resolvedRoot))) return null;
+  const relative = path.relative(resolvedRoot, resolved);
+  if (relative === '') return resolved;
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
   return resolved;
 }
 

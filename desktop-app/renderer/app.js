@@ -24,10 +24,19 @@ function h(tag, attrs = {}, children = []) {
   Object.entries(attrs).forEach(([k, v]) => {
     if (k === 'class') el.className = v;
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
-    else el.setAttribute(k, v);
+    else if (v !== false && v !== null && v !== undefined) el.setAttribute(k, v);
   });
   children.forEach((c) => el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
   return el;
+}
+
+function renderSafely(name, render) {
+  try {
+    render();
+  } catch (err) {
+    console.error(`[renderer] ${name} render failed`, err);
+    if (window.__renderAppError) window.__renderAppError(err);
+  }
 }
 
 function renderSidebar(state) {
@@ -134,10 +143,92 @@ function renderTopbar(state) {
   ]);
 
   const center = h('div', { class: 'topbar-center' }, []);
-  const navBack = h('button', { class: 'tb-btn ghost', title: '后退', onclick: () => window.desktopAPI.browser.nav('back') }, ['←']);
-  const navForward = h('button', { class: 'tb-btn ghost', title: '前进', onclick: () => window.desktopAPI.browser.nav('forward') }, ['→']);
-  const navReload = h('button', { class: 'tb-btn ghost', title: '刷新', onclick: () => window.desktopAPI.browser.nav('reload') }, ['⟳']);
-  const urlInput = h('input', { class: 'url-input', placeholder: '输入蒲公英网址，回车打开右侧网页' }, []);
+  const tabStrip = h('div', { class: 'browser-tab-strip', role: 'tablist', 'aria-label': '内嵌浏览器标签' }, [
+    h('span', { class: 'browser-tab-caption' }, ['网页标签'])
+  ]);
+  const tabs = Array.isArray(state.browser?.tabs) && state.browser.tabs.length
+    ? state.browser.tabs
+    : [{ id: 'collection', title: '采集', active: true, closable: false }];
+  tabs.forEach((tab) => {
+    const tabItem = h('div', { class: `browser-tab-item ${tab.active ? 'active' : ''}` }, []);
+    const label = tab.role === 'mail'
+      ? '企业邮箱'
+      : (tab.role === 'collection' ? '采集页' : (tab.title || '标签页'));
+    const tabButton = h('button', {
+      class: 'browser-tab-button',
+      role: 'tab',
+      title: tab.url || label,
+      'aria-selected': tab.active ? 'true' : 'false',
+      onclick: async () => {
+        const result = await window.desktopAPI.browser.activateTab(tab.id);
+        if (!result?.ok) alert(result?.error || '切换标签失败');
+      }
+    }, [label]);
+    tabItem.appendChild(tabButton);
+    if (tab.closable) {
+      tabItem.appendChild(h('button', {
+        class: 'browser-tab-close',
+        title: `关闭${label}标签`,
+        'aria-label': `关闭${label}标签`,
+        onclick: async () => {
+          const result = await window.desktopAPI.browser.closeTab(tab.id);
+          if (!result?.ok) alert(result?.error || '关闭标签失败');
+        }
+      }, ['×']));
+    }
+    tabStrip.appendChild(tabItem);
+  });
+  if (!tabs.some((tab) => tab.id === 'mail')) {
+    tabStrip.appendChild(h('button', {
+      class: 'browser-tab-new',
+      title: '在独立标签打开企业邮箱',
+      onclick: async () => {
+        const result = await window.desktopAPI.contacts.openTencentEmail();
+        if (!result?.ok) alert(result?.error || '打开企业邮箱失败');
+      }
+    }, ['+ 企业邮箱']));
+  }
+  if (state.browser?.locked) {
+    tabStrip.appendChild(h('span', {
+      class: 'browser-tab-lock',
+      title: state.browser.lockReason || '自动化运行期间锁定采集标签'
+    }, ['采集中已锁定']));
+  }
+
+  const controls = h('div', { class: 'browser-controls' }, []);
+  const activeTab = tabs.find((tab) => tab.id === state.browser?.activeTabId)
+    || tabs.find((tab) => tab.active)
+    || tabs[0];
+  const collectionNavigationLocked = Boolean(
+    state.browser?.locked && activeTab?.role === 'collection'
+  );
+  const runNav = async (action) => {
+    const result = await window.desktopAPI.browser.nav(action);
+    if (!result?.ok) alert(result?.error || '浏览器导航失败');
+  };
+  const navBack = h('button', {
+    class: 'tb-btn ghost',
+    title: '后退',
+    disabled: activeTab?.canGoBack && !collectionNavigationLocked ? null : '',
+    onclick: () => runNav('back')
+  }, ['←']);
+  const navForward = h('button', {
+    class: 'tb-btn ghost',
+    title: '前进',
+    disabled: activeTab?.canGoForward && !collectionNavigationLocked ? null : '',
+    onclick: () => runNav('forward')
+  }, ['→']);
+  const navReload = h('button', {
+    class: 'tb-btn ghost',
+    title: '刷新',
+    disabled: collectionNavigationLocked ? '' : null,
+    onclick: () => runNav('reload')
+  }, ['⟳']);
+  const urlInput = h('input', {
+    class: 'url-input',
+    placeholder: '输入蒲公英网址，回车打开右侧网页',
+    disabled: collectionNavigationLocked ? '' : null
+  }, []);
   urlInput.value = state.browser?.url || '';
   urlInput.addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
@@ -146,21 +237,30 @@ function renderTopbar(state) {
     const res = await window.desktopAPI.browser.open(v);
     if (!res?.ok) alert(`打开失败：${res?.error || 'unknown error'}`);
   });
-  const goBtn = h('button', { class: 'tb-btn primary', title: '打开', onclick: async () => {
+  const goBtn = h('button', {
+    class: 'tb-btn primary',
+    title: '打开',
+    disabled: collectionNavigationLocked ? '' : null,
+    onclick: async () => {
     const v = urlInput.value.trim();
     if (!v) return;
     const res = await window.desktopAPI.browser.open(v);
     if (!res?.ok) alert(`打开失败：${res?.error || 'unknown error'}`);
   }}, ['打开']);
 
-  center.appendChild(navBack);
-  center.appendChild(navForward);
-  center.appendChild(navReload);
-  center.appendChild(urlInput);
-  center.appendChild(goBtn);
+  controls.appendChild(navBack);
+  controls.appendChild(navForward);
+  controls.appendChild(navReload);
+  controls.appendChild(urlInput);
+  controls.appendChild(goBtn);
+  center.appendChild(tabStrip);
+  center.appendChild(controls);
 
   const right = h('div', { class: 'topbar-right' }, [
-    h('div', { class: `backend ${cls}` }, [backendText])
+    h('div', { class: `backend ${cls}` }, [backendText]),
+    h('div', { class: 'app-version', title: '当前应用版本' }, [
+      state.appInfo?.version ? `v${state.appInfo.version}` : '版本读取中'
+    ])
   ]);
 
   topbar.appendChild(left);
@@ -254,6 +354,11 @@ function initSplitters() {
 }
 
 async function bootstrap() {
+  try {
+    const info = await window.desktopAPI.app.info();
+    if (info?.ok) store.set({ appInfo: { version: info.version || '' } });
+  } catch (_) {}
+
   const applyBackendStatus = (status) => {
     if (!status) return;
     const next = {
@@ -314,12 +419,57 @@ async function bootstrap() {
   // URL 地址栏同步：初始化拉一次 + 后续订阅变化
   try {
     const r = await window.desktopAPI.browser.getUrl();
-    if (r?.ok) store.set({ browser: { url: r.url || '' } });
+    if (r?.ok) {
+      store.set({
+        browser: {
+          ...store.state.browser,
+          activeTabId: r.tabId || store.state.browser.activeTabId,
+          url: r.url || ''
+        }
+      });
+    }
   } catch (_) {}
   window.desktopAPI.browser.onUrlChange((payload) => {
     const url = payload?.url || '';
-    store.set({ browser: { url } });
+    store.set({
+      browser: {
+        ...store.state.browser,
+        activeTabId: payload?.tabId || store.state.browser.activeTabId,
+        url
+      }
+    });
   });
+  window.desktopAPI.browser.onTabsChange((payload) => {
+    if (!payload || !Array.isArray(payload.tabs)) return;
+    const activeTabId = payload.activeTabId || store.state.browser.activeTabId;
+    const active = payload.tabs.find((tab) => tab.id === activeTabId);
+    store.set({
+      browser: {
+        ...store.state.browser,
+        activeTabId,
+        tabs: payload.tabs,
+        url: active?.url || store.state.browser.url,
+        locked: Boolean(payload.locked),
+        lockReason: payload.lockReason || ''
+      }
+    });
+  });
+  try {
+    const tabs = await window.desktopAPI.browser.listTabs();
+    if (tabs?.ok) {
+      const active = tabs.tabs?.find((tab) => tab.id === tabs.activeTabId);
+      store.set({
+        browser: {
+          ...store.state.browser,
+          activeTabId: tabs.activeTabId || 'collection',
+          tabs: tabs.tabs || [],
+          url: active?.url || store.state.browser.url,
+          locked: Boolean(tabs.locked),
+          lockReason: tabs.lockReason || ''
+        }
+      });
+    }
+  } catch (_) {}
 
   // Task 6：任务队列状态推送
   try {
@@ -336,14 +486,14 @@ async function bootstrap() {
   } catch (_) {}
 
   store.subscribe((s) => {
-    renderSidebar(s);
-    renderTopbar(s);
-    renderContent(s);
+    renderSafely('sidebar', () => renderSidebar(s));
+    renderSafely('topbar', () => renderTopbar(s));
+    renderSafely('content', () => renderContent(s));
   });
 
-  renderSidebar(store.state);
-  renderTopbar(store.state);
-  renderContent(store.state);
+  renderSafely('sidebar', () => renderSidebar(store.state));
+  renderSafely('topbar', () => renderTopbar(store.state));
+  renderSafely('content', () => renderContent(store.state));
 
   // 分割条拖拽（左右宽度/侧栏宽度）
   initSplitters();

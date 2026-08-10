@@ -18,7 +18,7 @@ assert.strictEqual(makeRunKey(runDir), 'run_2026-06-30T00-00-00-000Z');
 assert.ok(getReviewPath(tmp, runDir).endsWith('run_2026-06-30T00-00-00-000Z.json'));
 
 const normalized = normalizeReviewRows([
-  { rowId: 'a', selected: false, followupStatus: ' 不建联 ', priority: ' P1 ', excludeReason: ' 报价高 ', note: ' 先不联系 ', email: ' a@example.com ', wechatId: ' wx ', phone: ' 123 ', xhsProfileUrl: ' https://www.xiaohongshu.com/user/profile/demo ', contactSource: ' xiaohongshu_public_profile ', contactCollectedAt: ' 2026-07-20T00:00:00.000Z ', contactCollectionStatus: ' found ', contactChannel: ' 邮件 ' },
+  { rowId: 'a', selected: false, followupStatus: ' 不建联 ', priority: ' P1 ', excludeReason: ' 报价高 ', note: ' 先不联系 ', email: ' a@example.com ', wechatId: ' wx ', phone: ' 123 ', xhsProfileUrl: ' https://www.xiaohongshu.com/user/profile/demo ', contactSource: ' xiaohongshu_public_profile ', contactCollectedAt: ' 2026-07-20T00:00:00.000Z ', contactCollectionStatus: ' profile_unavailable ', contactCollectionCode: ' XHS_PROFILE_NOT_READY ', contactCollectionError: ' 主页未加载完整 ', contactChannel: ' 邮件 ' },
   { rowId: 'a', selected: true },
   { rowId: '' }
 ]);
@@ -31,7 +31,9 @@ assert.strictEqual(normalized[0].email, 'a@example.com');
 assert.strictEqual(normalized[0].wechatId, 'wx');
 assert.strictEqual(normalized[0].xhsProfileUrl, 'https://www.xiaohongshu.com/user/profile/demo');
 assert.strictEqual(normalized[0].contactSource, 'xiaohongshu_public_profile');
-assert.strictEqual(normalized[0].contactCollectionStatus, 'found');
+assert.strictEqual(normalized[0].contactCollectionStatus, 'profile_unavailable');
+assert.strictEqual(normalized[0].contactCollectionCode, 'XHS_PROFILE_NOT_READY');
+assert.strictEqual(normalized[0].contactCollectionError, '主页未加载完整');
 assert.strictEqual(normalized[0].contactChannel, '邮件建联');
 assert.strictEqual(normalizeReviewRows([{ rowId: 'new-row' }])[0].selected, false);
 

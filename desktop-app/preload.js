@@ -1,25 +1,42 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktopAPI', {
+  app: {
+    info: () => ipcRenderer.invoke('app:info')
+  },
   backend: {
     info: () => ipcRenderer.invoke('backend:info'),
     onStatus: (cb) => ipcRenderer.on('backend:status', (_e, payload) => cb(payload))
   },
   browser: {
     open: (url) => ipcRenderer.invoke('browser:open', url),
+    openCollection: (url) => ipcRenderer.invoke('browser:openCollection', url),
     nav: (action) => ipcRenderer.invoke('browser:nav', action),
     getUrl: () => ipcRenderer.invoke('browser:getUrl'),
+    getCollectionUrl: () => ipcRenderer.invoke('browser:getCollectionUrl'),
+    returnToCollectionResults: () => ipcRenderer.invoke('browser:returnToCollectionResults'),
+    listTabs: () => ipcRenderer.invoke('browser:listTabs'),
+    activateTab: (tabId) => ipcRenderer.invoke('browser:activateTab', tabId),
+    closeTab: (tabId) => ipcRenderer.invoke('browser:closeTab', tabId),
     setLayout: (payload) => ipcRenderer.invoke('browser:setLayout', payload),
-    onUrlChange: (cb) => ipcRenderer.on('browser:url', (_e, payload) => cb(payload))
+    onUrlChange: (cb) => ipcRenderer.on('browser:url', (_e, payload) => cb(payload)),
+    onTabsChange: (cb) => ipcRenderer.on('browser:tabs', (_e, payload) => cb(payload))
   },
   pgy: {
     checkLogin: () => ipcRenderer.invoke('pgy:checkLogin'),
     pickElement: (payload) => ipcRenderer.invoke('pgy:pickElement', payload),
+    inspectCandidateSearchLayout: (templatePath) =>
+      ipcRenderer.invoke('pgy:inspectCandidateSearchLayout', templatePath),
+    validateCandidateSearchPagination: (templatePath) =>
+      ipcRenderer.invoke('pgy:validateCandidateSearchPagination', templatePath),
     scanPageBlocks: (payload) => ipcRenderer.invoke('pgy:scanPageBlocks', payload),
     clearPageBlockHints: () => ipcRenderer.invoke('pgy:clearPageBlockHints'),
     suggestNoteCardSelector: () => ipcRenderer.invoke('pgy:suggestNoteCardSelector'),
     parseCandidateInstruction: (instruction) => ipcRenderer.invoke('pgy:parseCandidateInstruction', instruction),
     extractSearchCandidates: (options) => ipcRenderer.invoke('pgy:extractSearchCandidates', options),
+    continueSearchCandidates: (sessionId) => ipcRenderer.invoke('pgy:continueSearchCandidates', sessionId),
+    cancelSearchCandidateCheckpoint: (sessionId) =>
+      ipcRenderer.invoke('pgy:cancelSearchCandidateCheckpoint', sessionId),
     extractCurrentMultiPage: (templatePath, options) =>
       ipcRenderer.invoke('pgy:extractCurrentMultiPage', templatePath, options)
   },
@@ -41,8 +58,10 @@ contextBridge.exposeInMainWorld('desktopAPI', {
   },
   tasks: {
     start: (payload) => ipcRenderer.invoke('tasks:start', payload),
+    recover: (runDir) => ipcRenderer.invoke('tasks:recover', runDir),
     pause: () => ipcRenderer.invoke('tasks:pause'),
     resume: () => ipcRenderer.invoke('tasks:resume'),
+    stop: () => ipcRenderer.invoke('tasks:stop'),
     skipCurrent: () => ipcRenderer.invoke('tasks:skipCurrent'),
     importExcel: () => ipcRenderer.invoke('tasks:importExcel'),
     exportCandidateSheet: (payload) => ipcRenderer.invoke('tasks:exportCandidateSheet', payload),

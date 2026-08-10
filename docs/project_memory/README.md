@@ -8,6 +8,7 @@ This directory is the repository-local memory layer for future AI/helper threads
 - `ACTIVE_CONTEXT.md`: current project state, recent milestones, volatile facts to recheck, and recommended next steps.
 - `DECISIONS.md`: important decisions, reasons, impact, and when to revisit them.
 - `HANDOFF_TEMPLATE.md`: short copyable template for starting a new continuation thread.
+- `LEARNINGS.md`: concise pitfalls, user corrections, and the correct reusable practice.
 - `PRODUCT_ARCHITECTURE_ROADMAP.md`: durable product-chain direction, external RPA/plugin assessment, and staged refactor plan.
 - `UX_REDESIGN_PLAN.md`: product-level UI/UX blueprint for the Electron workbench, including progressive disclosure, flow-first navigation, bulk-action rules, and list/detail patterns.
 - `PGY_ANTI_BOT_SAFETY_AUDIT.md`: Pugongying anti-bot/risk-control safety audit, conservative operation rules, and live-validation checklist.
@@ -27,6 +28,7 @@ This directory is the repository-local memory layer for future AI/helper threads
 - Write reusable facts, not chat transcripts.
 - Keep entries concise and dated when the timing matters.
 - Mark volatile facts as "needs recheck" instead of presenting them as permanent.
+- Add a short `LEARNINGS.md` entry after a material Codex mistake or user correction.
 - Never include real keys, cookies, private account data, private creator lists, or task spreadsheets.
 - Prefer links to repository files over copying long code or docs.
 - Run `python scripts/verify_project_memory.py` after editing memory files.

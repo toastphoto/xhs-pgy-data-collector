@@ -14,6 +14,7 @@ REQUIRED_FILES = [
     ROOT / "docs/project_memory/ACTIVE_CONTEXT.md",
     ROOT / "docs/project_memory/DECISIONS.md",
     ROOT / "docs/project_memory/HANDOFF_TEMPLATE.md",
+    ROOT / "docs/project_memory/LEARNINGS.md",
     ROOT / "docs/project_memory/PGY_ANTI_BOT_SAFETY_AUDIT.md",
     ROOT / "docs/project_memory/PGY_LIVE_VALIDATION_PROTOCOL.md",
     ROOT / "docs/project_memory/MVP_ACCEPTANCE_PLAN.md",

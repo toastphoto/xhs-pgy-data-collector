@@ -3,6 +3,7 @@ FastAPI 后端服务
 """
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -26,6 +27,8 @@ from app.platforms.douyin import DouYinCrawler
 from app.core.ai_analyzer import AIAnalyzer, AnalysisResult
 
 logger = get_logger(__name__)
+
+DESKTOP_BACKEND_PROTOCOL_VERSION = "1"
 
 # 全局任务状态存储
 task_status: Dict[str, Dict[str, Any]] = {}
@@ -602,6 +605,17 @@ async def get_config():
         "legacy_crawl_api_enabled": Config.ENABLE_LEGACY_CRAWL_API,
         "legacy_crawl_max_urls": Config.LEGACY_CRAWL_MAX_URLS,
         "legacy_crawl_max_contents": Config.LEGACY_CRAWL_MAX_CONTENTS
+    }
+
+
+@app.get("/api/desktop/health")
+async def get_desktop_health():
+    """Identify the exact local backend process launched by the desktop app."""
+    return {
+        "ok": True,
+        "protocol_version": DESKTOP_BACKEND_PROTOCOL_VERSION,
+        "instance_token": os.getenv("DESKTOP_INSTANCE_TOKEN", ""),
+        "pid": os.getpid(),
     }
 
 @app.post("/api/config")

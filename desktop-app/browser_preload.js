@@ -1,4 +1,5 @@
 const { ipcRenderer } = require('electron');
+const { isSensitiveInputElement } = require('./lib/recording_privacy');
 
 function safeText(s, max = 200) {
   if (!s) return '';
@@ -83,6 +84,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const tag = (el.tagName || '').toLowerCase();
     const isText = tag === 'input' || tag === 'textarea' || el.isContentEditable;
     if (!isText) return;
+    if (isSensitiveInputElement(el)) return;
 
     const selector = buildSelector(el);
     if (!selector) return;

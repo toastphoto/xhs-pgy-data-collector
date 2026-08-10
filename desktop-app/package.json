@@ -1,19 +1,24 @@
 {
   "name": "content-analyzer-desktop",
-  "version": "0.1.0",
+  "version": "0.1.9",
   "private": true,
   "description": "达人账号内容分析工具（桌面内嵌浏览器版）",
   "main": "main.js",
   "author": "",
   "license": "UNLICENSED",
   "scripts": {
+    "pretest": "node tests/renderer_syntax.test.js",
     "dev": "node ./scripts/run-electron.js",
     "start": "node ./scripts/run-electron.js",
-    "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/path_guard.test.js && node tests/quality_report.test.js && node tests/pgy_risk.test.js && node tests/task_runner_safety.test.js && node tests/pgy_candidate_command.test.js && node tests/pgy_candidate_response_cache.test.js && node tests/signing_task.test.js && node tests/signing_task_store.test.js && node tests/xhs_contact_enrichment.test.js && node tests/tencent_email_compose.test.js && node tests/candidate_sheet.test.js && node tests/pgy_excel.test.js && node tests/contact_sheet.test.js && node tests/contact_review_store.test.js && node tests/contact_review_excel.test.js && node tests/execution_approval.test.js && node tests/approval_store.test.js && node tests/feishu_contracts.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
+    "test": "node tests/normalize.test.js && node tests/providers.test.js && node tests/path_guard.test.js && node tests/quality_report.test.js && node tests/backend_runtime.test.js && node tests/recording_privacy.test.js && node tests/process_stdio.test.js && node tests/pgy_risk.test.js && node tests/task_runner_safety.test.js && node tests/pgy_candidate_command.test.js && node tests/pgy_candidate_response_cache.test.js && node tests/pgy_candidate_checkpoint.test.js && node tests/candidate_merge.test.mjs && node tests/calibration_selector.test.mjs && node tests/review_view_state.test.mjs && node tests/browser_tab_registry.test.js && node tests/signing_task.test.js && node tests/signing_task_store.test.js && node tests/xhs_contact_enrichment.test.js && node tests/tencent_email_compose.test.js && node tests/candidate_sheet.test.js && node tests/pgy_excel.test.js && node tests/contact_sheet.test.js && node tests/contact_review_store.test.js && node tests/contact_review_excel.test.js && node tests/execution_approval.test.js && node tests/approval_store.test.js && node tests/feishu_contracts.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
     "build:backend:mac": "cd ../content-analyzer && python3 -m PyInstaller -y main.py --name xhs-pgy-backend --onedir --clean --distpath dist-pyinstaller --workpath build-pyinstaller --specpath build-pyinstaller --add-data \"$PWD/app/static:app/static\"",
+    "build:backend:win": "node ./scripts/build-backend.js --platform win32",
     "dist": "electron-builder",
     "dist:mac": "npm run build:backend:mac && electron-builder --mac",
-    "dist:mac:app-only": "electron-builder --mac"
+    "dist:mac:app-only": "electron-builder --mac",
+    "dist:win": "node ./scripts/build-backend.js --platform win32 && electron-builder --win nsis --x64",
+    "dist:win:portable": "node ./scripts/build-backend.js --platform win32 && electron-builder --win portable --x64",
+    "dist:win:dir": "node ./scripts/build-backend.js --platform win32 && electron-builder --win dir --x64"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
@@ -49,6 +54,10 @@
           "!logs/**",
           "!output/**",
           "!data/**",
+          "!dist-pyinstaller/**",
+          "!build-pyinstaller/**",
+          "!.venv/**",
+          "!venv/**",
           "!.env",
           "!.env.local",
           "!.env.development",
@@ -68,7 +77,19 @@
       "target": "dmg"
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "artifactName": "${productName}-${version}-windows-${arch}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "小红书相关信息采集工具"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-windows-${arch}-portable.${ext}"
     }
   }
 }

@@ -1,4 +1,5 @@
 import { store } from '../state/store.js';
+import { buildCandidateMergePatch } from '../state/candidate_merge.mjs';
 import { createAdvancedSection, createStatusPill, createStepCard } from '../ui/components.js';
 
 const PRESETS = [
@@ -10,6 +11,7 @@ const PGY_DISCOVERY_URL = 'https://pgy.xiaohongshu.com/solar/pre-trade/note/kol'
 const SAFE_BATCH_LIMIT = 50;
 const MAX_CANDIDATE_RANK = 100;
 const RECOMMENDED_BATCH_TEXT = '建议 10-30 人/批，上限 50 人/批，批次间隔至少 5 分钟';
+const CANDIDATE_DRAFT_STORAGE_KEY = 'xhs-pgy:candidate-draft:v1';
 
 const SOURCE_MODE_OPTIONS = [
   ['import', '已有达人表/链接'],
@@ -35,12 +37,52 @@ let _lastPgyLoginCheck = null;
 let _lastSearchSnapshot = null;
 let _candidateInstruction = '将当前页面前30位达人加入候选';
 let _candidateInstructionStatus = '';
+let _candidateReadRunning = false;
+let _candidateCheckpoint = null;
+let _candidateCheckpointTimer = null;
 let _autoContactRunDir = '';
 const _forwardedContactRuns = new Set();
 let _candidateDirty = false;
 let _taskSetupOpen = false;
 let _searchAdvancedOpen = false;
 let _candidateBulkOpen = false;
+
+function persistCandidateDraft() {
+  try {
+    window.localStorage.setItem(CANDIDATE_DRAFT_STORAGE_KEY, JSON.stringify({
+      draftText: _draftText,
+      draftUrls: _draftUrls.slice(0, 500),
+      draftItems: _draftItems.slice(0, 500),
+      latestSegmentUrls: _latestSegmentUrls.slice(0, SAFE_BATCH_LIMIT),
+      collectionScope: _collectionScope,
+      dirty: Boolean(_candidateDirty)
+    }));
+  } catch (_) {}
+}
+
+function restoreCandidateDraft() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CANDIDATE_DRAFT_STORAGE_KEY) || 'null');
+    if (!saved || typeof saved !== 'object') return;
+    const urls = parseUrls((Array.isArray(saved.draftUrls) ? saved.draftUrls : []).join('\n')).slice(0, 500);
+    const urlSet = new Set(urls.map(normalizeDraftUrl));
+    _draftUrls = urls;
+    _draftItems = (Array.isArray(saved.draftItems) ? saved.draftItems : [])
+      .filter((item) => urlSet.has(normalizeDraftUrl(item?.pgy_url)))
+      .slice(0, 500);
+    _draftText = String(saved.draftText || urls.join('\n'));
+    _latestSegmentUrls = parseUrls(
+      (Array.isArray(saved.latestSegmentUrls) ? saved.latestSegmentUrls : []).join('\n')
+    ).filter((url) => urlSet.has(normalizeDraftUrl(url))).slice(0, SAFE_BATCH_LIMIT);
+    _collectionScope = ['latest_segment', 'active', 'selected', 'all'].includes(saved.collectionScope)
+      ? saved.collectionScope
+      : 'active';
+    _candidateDirty = Boolean(saved.dirty && urls.length);
+  } catch (_) {}
+}
+
+restoreCandidateDraft();
+window.addEventListener('beforeunload', persistCandidateDraft);
 let _signingTaskDraft = {
   taskName: '',
   sourceMode: 'import',
@@ -105,6 +147,7 @@ function addDraftUrls(urls) {
   _draftText = _draftUrls.join('\n');
   const added = _draftUrls.length - before;
   if (added) _candidateDirty = true;
+  if (added) persistCandidateDraft();
   return added;
 }
 
@@ -116,6 +159,7 @@ function normalizeDraftUrl(url) {
 
 function syncDraftText() {
   _draftText = _draftUrls.join('\n');
+  persistCandidateDraft();
 }
 
 function getDraftItem(url) {
@@ -134,6 +178,7 @@ function setDraftItemLabel(url, label) {
   item.pgy_url = normalized;
   item.creator_name = String(label || '').trim();
   _candidateDirty = true;
+  persistCandidateDraft();
 }
 
 function updateDraftItem(url, patch = {}) {
@@ -154,6 +199,7 @@ function updateDraftItem(url, patch = {}) {
     item.status = ['selected', 'excluded'].includes(status) ? status : 'candidate';
   }
   _candidateDirty = true;
+  persistCandidateDraft();
 }
 
 function removeDraftUrl(url) {
@@ -182,14 +228,40 @@ function markDraftUrls(urls, patch = {}) {
   list.forEach((url) => updateDraftItem(url, patch));
 }
 
+function firstNonEmptyCandidateField(item, keys) {
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(item || {}, key)) continue;
+    const value = String(item?.[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
 function normalizeImportedCandidateItem(item) {
+  const creatorName = firstNonEmptyCandidateField(item, ['creator_name', 'creatorName', 'name']);
+  const note = firstNonEmptyCandidateField(item, ['note']);
+  const priority = firstNonEmptyCandidateField(item, ['priority']);
+  const excludeReason = firstNonEmptyCandidateField(item, ['excludeReason', 'exclude_reason']);
+  const rawStatus = firstNonEmptyCandidateField(item, ['status']);
+  const status = ['candidate', 'selected', 'excluded'].includes(rawStatus) ? rawStatus : '';
   return {
-    pgy_url: normalizeDraftUrl(item?.pgy_url || item?.url || ''),
-    creator_name: String(item?.creator_name || item?.creatorName || item?.name || '').trim(),
-    note: String(item?.note || '').trim(),
-    status: ['selected', 'excluded'].includes(String(item?.status || '').trim()) ? String(item.status).trim() : 'candidate',
-    priority: String(item?.priority || '').trim(),
-    excludeReason: String(item?.excludeReason || item?.exclude_reason || '').trim()
+    record: {
+      pgy_url: normalizeDraftUrl(item?.pgy_url || item?.url || ''),
+      creator_name: creatorName,
+      note,
+      status: status || 'candidate',
+      priority,
+      excludeReason
+    },
+    // Merge only fields the new source actually supplied. Search responses omit
+    // review fields, so an existing operator decision cannot be reset by defaults.
+    mergePatch: {
+      ...(creatorName ? { creator_name: creatorName } : {}),
+      ...(note ? { note } : {}),
+      ...(status ? { status } : {}),
+      ...(priority ? { priority } : {}),
+      ...(excludeReason ? { excludeReason } : {})
+    }
   };
 }
 
@@ -206,13 +278,16 @@ function summarizeSearchFilters(filters) {
   return lines.join('\n');
 }
 
-function applyImportedCandidateItems(items, { merge = false } = {}) {
+function applyImportedCandidateItems(items, {
+  merge = false,
+  preserveManualReview = false
+} = {}) {
   const imported = (Array.isArray(items) ? items : [])
     .map(normalizeImportedCandidateItem)
-    .filter((item) => item.pgy_url);
+    .filter((item) => item.record.pgy_url);
   if (!merge) {
-    _draftUrls = parseUrls(imported.map((x) => x.pgy_url).join('\n'));
-    _draftItems = imported;
+    _draftUrls = parseUrls(imported.map((x) => x.record.pgy_url).join('\n'));
+    _draftItems = imported.map((x) => x.record);
     syncDraftText();
     _candidateDirty = true;
     return { imported: imported.length, added: imported.length, updated: 0 };
@@ -221,21 +296,127 @@ function applyImportedCandidateItems(items, { merge = false } = {}) {
   let added = 0;
   let updated = 0;
   imported.forEach((item) => {
-    const exists = getDraftItem(item.pgy_url);
-    if (exists) updated += 1;
-    else added += 1;
-    updateDraftItem(item.pgy_url, {
-      creator_name: item.creator_name,
-      note: item.note,
-      status: item.status,
-      priority: item.priority,
-      excludeReason: item.excludeReason
+    const exists = getDraftItem(item.record.pgy_url);
+    if (!exists) {
+      added += 1;
+      updateDraftItem(item.record.pgy_url, item.record);
+      return;
+    }
+    const changedPatch = buildCandidateMergePatch(exists, item.mergePatch, {
+      preserveManualReview
     });
+    if (!Object.keys(changedPatch).length) return;
+    updated += 1;
+    updateDraftItem(item.record.pgy_url, changedPatch);
   });
-  _draftUrls = parseUrls([..._draftUrls, ...imported.map((x) => x.pgy_url)].join('\n'));
+  _draftUrls = parseUrls([..._draftUrls, ...imported.map((x) => x.record.pgy_url)].join('\n'));
   syncDraftText();
-  _candidateDirty = true;
+  if (added || updated) _candidateDirty = true;
+  persistCandidateDraft();
   return { imported: imported.length, added, updated };
+}
+
+function stopCandidateCheckpointTimer() {
+  if (_candidateCheckpointTimer) window.clearInterval(_candidateCheckpointTimer);
+  _candidateCheckpointTimer = null;
+}
+
+function candidateCheckpointCountdown() {
+  if (!_candidateCheckpoint) return '';
+  const remainingSeconds = Math.max(
+    0,
+    Math.ceil((Number(_candidateCheckpoint.readyAt || 0) - Date.now()) / 1000)
+  );
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = String(remainingSeconds % 60).padStart(2, '0');
+  return remainingSeconds > 0 ? `${minutes}:${seconds}` : '可继续';
+}
+
+function startCandidateCheckpointTimer() {
+  stopCandidateCheckpointTimer();
+  _candidateCheckpointTimer = window.setInterval(() => {
+    if (!_candidateCheckpoint) {
+      stopCandidateCheckpointTimer();
+      return;
+    }
+    store.set({ tasks: { ...store.state.tasks } });
+  }, 1000);
+}
+
+function setCandidateCheckpoint(command, result) {
+  _candidateCheckpoint = {
+    ...(result?.checkpoint || {}),
+    command
+  };
+  _candidateInstructionStatus = result?.message
+    || `已定位到第 ${_candidateCheckpoint.rank} 位，安全暂停后继续。`;
+  startCandidateCheckpointTimer();
+}
+
+function completeCandidateSearchRead(command, result) {
+  const items = (Array.isArray(result.items) ? result.items : []).slice(0, command.requestedCount);
+  const mergeResult = applyImportedCandidateItems(items, {
+    merge: true,
+    preserveManualReview: true
+  });
+  _latestSegmentUrls = items
+    .map((item) => normalizeDraftUrl(item?.pgy_url || item?.url || ''))
+    .filter(Boolean)
+    .slice(0, SAFE_BATCH_LIMIT);
+  if (_latestSegmentUrls.length) _collectionScope = 'latest_segment';
+  persistCandidateDraft();
+  const rangeLabel = command.startRank === 1
+    ? `前 ${command.endRank} 位`
+    : `第 ${command.startRank}-${command.endRank} 位`;
+  _lastSearchSnapshot = {
+    url: result.url || '',
+    filters: result.filters || null,
+    stats: result.stats || {},
+    capturedAt: Date.now()
+  };
+  _importPreview = {
+    filePath: '当前蒲公英搜索页',
+    stats: {
+      ...(result.stats || {}),
+      mode: 'search-page',
+      imported: mergeResult.imported,
+      added: mergeResult.added,
+      updated: mergeResult.updated,
+      filterGroups: Array.isArray(result.filters?.groups) ? result.filters.groups.length : 0
+    },
+    filters: result.filters || null,
+    items: items.slice(0, 10)
+  };
+  _candidateInstructionStatus = items.length
+    ? `已完整读取${rangeLabel}中的 ${items.length} 位；本次采集已切到最近加入的一段`
+    : '未读取到达人，请确认右侧停留在蒲公英筛选结果页。';
+  const filterText = summarizeSearchFilters(result.filters);
+  alert([
+    result.message || '读取完成。',
+    `指令范围：${rangeLabel}；本次读取 ${items.length} 位，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
+    items.length ? '采集范围已自动切换为“最近加入的一段”，开始采集时不会重复带上前一批候选。' : '',
+    filterText ? `\n已记录当前筛选结构：\n${filterText.slice(0, 500)}` : ''
+  ].filter(Boolean).join('\n'));
+}
+
+function handleCandidateSearchResult(command, result) {
+  if (!result?.ok) {
+    if (result?.code !== 'PGY_CANDIDATE_CHECKPOINT_COOLDOWN') {
+      stopCandidateCheckpointTimer();
+      _candidateCheckpoint = null;
+    }
+    _candidateInstructionStatus = result?.error || '读取失败';
+    alert(`读取失败：${result?.error || 'unknown error'}`);
+    return false;
+  }
+  if (result.paused && result.checkpoint) {
+    setCandidateCheckpoint(command, result);
+    return false;
+  }
+  stopCandidateCheckpointTimer();
+  _candidateCheckpoint = null;
+  completeCandidateSearchRead(command, result);
+  return true;
 }
 
 function countDraftItemsWithLabel() {
@@ -603,6 +784,7 @@ export function renderTasks(state) {
     _autoContactRunDir &&
     completedRunDir === _autoContactRunDir &&
     !state.tasks?.running &&
+    state.tasks?.finishReason !== 'stopped_by_user' &&
     queueFinished &&
     !_forwardedContactRuns.has(completedRunDir)
   ) {
@@ -632,10 +814,23 @@ export function renderTasks(state) {
     ? state.tasks.queue
     : _draftUrls.map((u, i) => ({ id: `t${i + 1}`, url: u, status: 'pending', error: '' }));
   const stats = queueStats(queue);
-
-  const stText = state.tasks?.running
-    ? (state.tasks?.paused ? '已暂停' : '运行中')
-    : (state.tasks?.runId ? '已结束/未运行' : '未运行');
+  const currentIndex = queue.findIndex((item) => item.id === state.tasks?.currentId);
+  const processedCount = queue.filter((item) => ['ok', 'fail', 'skipped'].includes(String(item?.status || ''))).length;
+  const statusInfo = state.tasks?.running
+    ? state.tasks?.stopPending
+      ? { label: '正在安全停止', tone: 'warn', detail: '停止请求已收到；当前安全操作结束后不会再处理下一位达人。' }
+      : state.tasks?.paused
+        ? { label: '已暂停', tone: 'warn', detail: state.tasks?.pauseReason || '任务已经暂停，不会继续访问下一位达人。' }
+        : state.tasks?.pausePending
+          ? { label: '等待暂停', tone: 'warn', detail: '暂停请求已收到；完成当前达人后进入暂停。' }
+          : state.tasks?.skipPending
+            ? { label: '正在跳过当前', tone: 'warn', detail: '将在下一个安全点结束当前达人，然后继续队列。' }
+            : { label: '采集中', tone: 'live', detail: currentIndex >= 0 ? `正在处理第 ${currentIndex + 1}/${queue.length} 位达人。` : '任务已启动，正在准备下一位达人。' }
+    : state.tasks?.finishReason === 'stopped_by_user'
+      ? { label: '已停止', tone: 'warn', detail: '整批任务已由用户停止，未执行的达人不会在后台继续。' }
+      : state.tasks?.finishReason === 'completed'
+        ? { label: '已完成', tone: 'good', detail: `本批次已结束，共处理 ${processedCount}/${queue.length} 位达人。` }
+        : { label: '未运行', tone: 'neutral', detail: '尚未启动采集任务。' };
 
   const hero = document.createElement('section');
   hero.className = 'task-hero';
@@ -651,7 +846,7 @@ export function renderTasks(state) {
   heroMeta.className = 'run-meta';
   const statusLine = document.createElement('div');
   statusLine.appendChild(document.createTextNode('当前状态：'));
-  statusLine.appendChild(createStatusPill(stText, state.tasks?.running ? 'live' : runDir ? 'good' : 'neutral'));
+  statusLine.appendChild(createStatusPill(statusInfo.label, statusInfo.tone));
   heroMeta.appendChild(statusLine);
   const resultLine = document.createElement('div');
   resultLine.title = runDir || '';
@@ -678,6 +873,20 @@ export function renderTasks(state) {
     if (!r?.ok) alert(`打开失败：${r?.error || 'unknown error'}`);
   });
 
+  const btnReturnCollection = document.createElement('button');
+  btnReturnCollection.className = 'btn';
+  btnReturnCollection.textContent = '返回筛选结果';
+  btnReturnCollection.disabled = !!state.tasks?.running;
+  btnReturnCollection.title = state.tasks?.running
+    ? '采集运行时浏览器标签已锁定，请先暂停后停止或等待完成'
+    : '切回固定的蒲公英采集页，保留原筛选条件、页码和滚动位置';
+  btnReturnCollection.addEventListener('click', async () => {
+    const result = await window.desktopAPI.browser.returnToCollectionResults();
+    if (!result?.ok) return alert(`返回筛选结果失败：${result?.error || 'unknown error'}`);
+    if (result.warning) alert(result.warning);
+  });
+
+  btnRow.appendChild(btnReturnCollection);
   btnRow.appendChild(btnOpenRun);
   btnRow.appendChild(btnOpenRuns);
   if (runDir) {
@@ -691,6 +900,20 @@ export function renderTasks(state) {
   hero.appendChild(heroMain);
   hero.appendChild(heroMeta);
   root.appendChild(hero);
+
+  const taskStatusPanel = document.createElement('section');
+  taskStatusPanel.className = `task-run-status ${statusInfo.tone}`;
+  taskStatusPanel.setAttribute('role', 'status');
+  taskStatusPanel.setAttribute('aria-live', 'polite');
+  const taskStatusCopy = document.createElement('div');
+  taskStatusCopy.className = 'task-run-status-copy';
+  taskStatusCopy.innerHTML = `<b>${statusInfo.label}</b><span>${statusInfo.detail}</span>`;
+  const taskStatusProgress = document.createElement('div');
+  taskStatusProgress.className = 'task-run-status-progress';
+  taskStatusProgress.textContent = queue.length ? `${processedCount}/${queue.length}` : '0/0';
+  taskStatusPanel.appendChild(taskStatusCopy);
+  taskStatusPanel.appendChild(taskStatusProgress);
+  root.appendChild(taskStatusPanel);
 
   const decisionStatsForSteps = candidateDecisionStats();
   const collectionCountForSteps = getCollectionUrls().length;
@@ -835,7 +1058,7 @@ export function renderTasks(state) {
   openPgyBtn.textContent = '打开蒲公英搜索';
   openPgyBtn.addEventListener('click', async () => {
     try {
-      const r = await window.desktopAPI.browser.open(PGY_DISCOVERY_URL);
+      const r = await window.desktopAPI.browser.openCollection(PGY_DISCOVERY_URL);
       if (!r?.ok) alert(`打开失败：${r?.error || 'unknown error'}`);
     } catch (e) {
       alert(`打开异常：${e?.message || String(e)}`);
@@ -845,9 +1068,10 @@ export function renderTasks(state) {
   const readSearchBtn = document.createElement('button');
   readSearchBtn.className = 'btn primary';
   readSearchBtn.textContent = '执行指令';
-  readSearchBtn.disabled = !!state.tasks?.running;
+  readSearchBtn.disabled = !!state.tasks?.running || _candidateReadRunning || Boolean(_candidateCheckpoint);
   readSearchBtn.addEventListener('click', async () => {
     try {
+      _candidateReadRunning = true;
       _candidateInstructionStatus = '正在读取右侧蒲公英结果...';
       store.set({ tasks: { ...store.state.tasks } });
       const command = await window.desktopAPI.pgy.parseCandidateInstruction(_candidateInstruction);
@@ -860,57 +1084,15 @@ export function renderTasks(state) {
       const r = await window.desktopAPI.pgy.extractSearchCandidates({
         requestedCount: command.requestedCount,
         startRank: command.startRank,
-        endRank: command.endRank
+        endRank: command.endRank,
+        templatePath: _selectedTemplatePath || state.templates?.activeTemplatePath || ''
       });
-      if (!r?.ok) {
-        _candidateInstructionStatus = r?.error || '读取失败';
-        alert(`读取失败：${r?.error || 'unknown error'}`);
-        store.set({ tasks: { ...store.state.tasks } });
-        return;
-      }
-      const items = (Array.isArray(r.items) ? r.items : []).slice(0, command.requestedCount);
-      const mergeResult = applyImportedCandidateItems(items, { merge: true });
-      _latestSegmentUrls = items
-        .map((item) => normalizeDraftUrl(item?.pgy_url || item?.url || ''))
-        .filter(Boolean)
-        .slice(0, SAFE_BATCH_LIMIT);
-      if (_latestSegmentUrls.length) _collectionScope = 'latest_segment';
-      const rangeLabel = command.startRank === 1
-        ? `前 ${command.endRank} 位`
-        : `第 ${command.startRank}-${command.endRank} 位`;
-      _lastSearchSnapshot = {
-        url: r.url || '',
-        filters: r.filters || null,
-        stats: r.stats || {},
-        capturedAt: Date.now()
-      };
-      _importPreview = {
-        filePath: '当前蒲公英搜索页',
-        stats: {
-          ...(r.stats || {}),
-          mode: 'search-page',
-          imported: mergeResult.imported,
-          added: mergeResult.added,
-          updated: mergeResult.updated,
-          filterGroups: Array.isArray(r.filters?.groups) ? r.filters.groups.length : 0
-        },
-        filters: r.filters || null,
-        items: items.slice(0, 10)
-      };
-      _candidateInstructionStatus = items.length
-        ? `已读取${rangeLabel}中的 ${items.length} 位；本次采集已切到最近加入的一段`
-        : '未读取到达人，请确认右侧停留在蒲公英筛选结果页。';
-      store.set({ tasks: { ...store.state.tasks } });
-      const filterText = summarizeSearchFilters(r.filters);
-      alert([
-        r.message || '读取完成。',
-        `指令范围：${rangeLabel}；本次读取 ${items.length} 位，新增 ${mergeResult.added}，更新 ${mergeResult.updated}。`,
-        items.length ? '采集范围已自动切换为“最近加入的一段”，开始采集时不会重复带上前一批候选。' : '',
-        filterText ? `\n已记录当前筛选结构：\n${filterText.slice(0, 500)}` : ''
-      ].filter(Boolean).join('\n'));
+      handleCandidateSearchResult(command, r);
     } catch (e) {
       _candidateInstructionStatus = e?.message || String(e);
       alert(`读取当前搜索结果异常：${e?.message || String(e)}`);
+    } finally {
+      _candidateReadRunning = false;
       store.set({ tasks: { ...store.state.tasks } });
     }
   });
@@ -926,7 +1108,7 @@ export function renderTasks(state) {
   commandInput.className = 'tpl-input candidate-command-input';
   commandInput.placeholder = '例如：前30位，或第42位到第50位达人加入候选';
   commandInput.value = _candidateInstruction;
-  commandInput.disabled = !!state.tasks?.running;
+  commandInput.disabled = !!state.tasks?.running || _candidateReadRunning || Boolean(_candidateCheckpoint);
   commandInput.addEventListener('input', () => {
     _candidateInstruction = commandInput.value;
     _candidateInstructionStatus = '';
@@ -945,6 +1127,70 @@ export function renderTasks(state) {
   commandStatus.textContent = _candidateInstructionStatus
     || `支持前 N 位或第 A-B 位；单次最多 ${SAFE_BATCH_LIMIT} 位，可定位到第 ${MAX_CANDIDATE_RANK} 位`;
   commandWrap.appendChild(commandStatus);
+  if (_candidateCheckpoint) {
+    const checkpointRow = document.createElement('div');
+    checkpointRow.className = 'candidate-checkpoint-row';
+    const checkpointText = document.createElement('div');
+    checkpointText.className = 'candidate-checkpoint-text';
+    checkpointText.textContent = [
+      `已暂存到第 ${_candidateCheckpoint.rank} 位`,
+      `安全暂停 ${candidateCheckpointCountdown()}`,
+      `尚未加入候选池`
+    ].join(' · ');
+    checkpointRow.appendChild(checkpointText);
+
+    const continueBtn = document.createElement('button');
+    continueBtn.className = 'btn primary';
+    continueBtn.textContent = `继续读取 ${_candidateCheckpoint.nextRank}-${_candidateCheckpoint.endRank}`;
+    continueBtn.disabled = _candidateReadRunning || Date.now() < Number(_candidateCheckpoint.readyAt || 0);
+    continueBtn.addEventListener('click', async () => {
+      const checkpoint = _candidateCheckpoint;
+      if (!checkpoint) return;
+      try {
+        _candidateReadRunning = true;
+        _candidateInstructionStatus = `正在重新检查页面并继续读取第 ${checkpoint.nextRank}-${checkpoint.endRank} 位...`;
+        store.set({ tasks: { ...store.state.tasks } });
+        const result = await window.desktopAPI.pgy.continueSearchCandidates(checkpoint.sessionId);
+        handleCandidateSearchResult(checkpoint.command, result);
+      } catch (error) {
+        _candidateInstructionStatus = error?.message || String(error);
+        alert(`继续读取异常：${_candidateInstructionStatus}`);
+      } finally {
+        _candidateReadRunning = false;
+        store.set({ tasks: { ...store.state.tasks } });
+      }
+    });
+    checkpointRow.appendChild(continueBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = '结束本次';
+    cancelBtn.disabled = _candidateReadRunning;
+    cancelBtn.addEventListener('click', async () => {
+      const checkpoint = _candidateCheckpoint;
+      if (!checkpoint) return;
+      try {
+        const result = await window.desktopAPI.pgy.cancelSearchCandidateCheckpoint(checkpoint.sessionId);
+        if (!result?.ok) {
+          alert(result?.error || '结束本次读取失败');
+          return;
+        }
+        stopCandidateCheckpointTimer();
+        _candidateCheckpoint = null;
+        _candidateInstructionStatus = '本次读取已结束，暂存结果未加入候选池。';
+        store.set({ tasks: { ...store.state.tasks } });
+      } catch (error) {
+        alert(`结束本次读取异常：${error?.message || String(error)}`);
+      }
+    });
+    checkpointRow.appendChild(cancelBtn);
+    commandWrap.appendChild(checkpointRow);
+
+    const checkpointNote = document.createElement('div');
+    checkpointNote.className = 'task-note';
+    checkpointNote.textContent = '90 秒是保守工程默认值，不是平台官方安全值，也不能保证不会触发风控。继续前会重新检查页面、排名锚点和安全提示。';
+    commandWrap.appendChild(checkpointNote);
+  }
 
   const addCurrentBtn = document.createElement('button');
   addCurrentBtn.className = 'btn';
@@ -952,7 +1198,7 @@ export function renderTasks(state) {
   addCurrentBtn.disabled = !!state.tasks?.running;
   addCurrentBtn.addEventListener('click', async () => {
     try {
-      const current = await window.desktopAPI.browser.getUrl();
+      const current = await window.desktopAPI.browser.getCollectionUrl();
       if (!current?.ok) {
         alert(`读取当前页面失败：${current?.error || 'unknown error'}`);
         return;
@@ -1021,6 +1267,7 @@ export function renderTasks(state) {
       _selectedSigningTaskId = r.item?.id || _selectedSigningTaskId;
       applySigningTask(r.item);
       _candidateDirty = false;
+      persistCandidateDraft();
       store.set({ tasks: { ...store.state.tasks } });
     } catch (e) {
       alert(`保存异常：${e?.message || String(e)}`);
@@ -1147,6 +1394,23 @@ export function renderTasks(state) {
     banner.textContent =
       `队列已暂停：${state.tasks.pauseReason || '需要手工介入'}\n请在右侧浏览器完成登录/处理风控/切到正确页面后，点击“继续”；或点击“跳过当前”。`;
     root.appendChild(banner);
+  } else if (state.tasks?.pausePending) {
+    const banner = document.createElement('div');
+    banner.className = 'task-banner warn';
+    banner.textContent = '已登记暂停请求：当前达人仍在安全执行，完成后才会暂停。可点击“取消待暂停”撤销。';
+    root.appendChild(banner);
+  }
+  if (state.tasks?.stopPending) {
+    const banner = document.createElement('div');
+    banner.className = 'task-banner warn';
+    banner.textContent = '停止请求已收到：程序正在等当前读写动作到达安全点；随后会结束当前达人并停止整批，不会继续下一位。';
+    root.appendChild(banner);
+  }
+  if (state.tasks?.persistenceError) {
+    const banner = document.createElement('div');
+    banner.className = 'task-banner bad';
+    banner.textContent = `任务状态保存异常：${state.tasks.persistenceError.message || '无法写入任务状态'}。请停止新增操作并保留当前窗口，避免恢复信息丢失。`;
+    root.appendChild(banner);
   }
 
   // URL 输入
@@ -1172,6 +1436,7 @@ export function renderTasks(state) {
   textarea.value = _draftText;
   textarea.addEventListener('input', () => {
     _draftText = textarea.value;
+    persistCandidateDraft();
   });
 
   const inputBtns = document.createElement('div');
@@ -1188,6 +1453,7 @@ export function renderTasks(state) {
     _draftText = _draftUrls.join('\n');
     textarea.value = _draftText;
     if (urls.length) _candidateDirty = true;
+    persistCandidateDraft();
     // 触发一次 re-render（复用 store）
     store.set({ tasks: { ...store.state.tasks } });
   });
@@ -1202,11 +1468,13 @@ export function renderTasks(state) {
       if (!text) return;
       _draftText = text;
       textarea.value = _draftText;
+      persistCandidateDraft();
     } catch (e) {
       const next = window.prompt('无法直接读取剪贴板，请手工粘贴：');
       if (next) {
         _draftText = next;
         textarea.value = _draftText;
+        persistCandidateDraft();
       }
     }
   });
@@ -1395,6 +1663,7 @@ export function renderTasks(state) {
       syncDraftText();
       textarea.value = '';
       _candidateDirty = true;
+      persistCandidateDraft();
       store.set({ tasks: { ...store.state.tasks } });
     });
 
@@ -1422,7 +1691,7 @@ export function renderTasks(state) {
 
     const copyFilteredCandidates = document.createElement('button');
     copyFilteredCandidates.className = 'btn';
-    copyFilteredCandidates.textContent = '复制当前显示';
+    copyFilteredCandidates.textContent = '复制当前筛选URL';
     copyFilteredCandidates.disabled = !filteredDraftUrls.length;
     copyFilteredCandidates.addEventListener('click', async () => {
       const text = filteredDraftUrls.join('\n');
@@ -1453,7 +1722,7 @@ export function renderTasks(state) {
 
     const markSelected = document.createElement('button');
     markSelected.className = 'btn';
-    markSelected.textContent = '当前设为优先';
+    markSelected.textContent = '当前筛选设为优先';
     markSelected.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
     markSelected.addEventListener('click', () => {
       markDraftUrls(filteredDraftUrls, { status: 'selected' });
@@ -1462,7 +1731,7 @@ export function renderTasks(state) {
 
     const markCandidate = document.createElement('button');
     markCandidate.className = 'btn';
-    markCandidate.textContent = '当前设为待复核';
+    markCandidate.textContent = '当前筛选设为待复核';
     markCandidate.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
     markCandidate.addEventListener('click', () => {
       markDraftUrls(filteredDraftUrls, { status: 'candidate' });
@@ -1471,7 +1740,7 @@ export function renderTasks(state) {
 
     const markExcluded = document.createElement('button');
     markExcluded.className = 'btn ghost';
-    markExcluded.textContent = '当前设为排除';
+    markExcluded.textContent = '当前筛选设为排除';
     markExcluded.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
     markExcluded.addEventListener('click', () => {
       const reason = window.prompt(`给当前 ${filteredDraftUrls.length} 条候选填写排除原因（可留空）：`, '');
@@ -1482,10 +1751,10 @@ export function renderTasks(state) {
 
     const clearFiltered = document.createElement('button');
     clearFiltered.className = 'btn ghost';
-    clearFiltered.textContent = '移除当前显示';
+    clearFiltered.textContent = '移除当前筛选';
     clearFiltered.disabled = !!state.tasks?.running || !filteredDraftUrls.length;
     clearFiltered.addEventListener('click', () => {
-      if (!window.confirm(`确定只移除当前显示的 ${filteredDraftUrls.length} 条候选吗？其余候选会保留。`)) return;
+      if (!window.confirm(`确定只移除当前筛选中的 ${filteredDraftUrls.length} 条候选吗？整批中的其余候选会保留。`)) return;
       filteredDraftUrls.forEach((url) => removeDraftUrl(url));
       textarea.value = _draftText;
       store.set({ tasks: { ...store.state.tasks } });
@@ -1499,7 +1768,7 @@ export function renderTasks(state) {
     candidateTools.appendChild(markExcluded);
     candidateTools.appendChild(clearFiltered);
     const candidateBulk = createAdvancedSection({
-      title: `批量处理候选（当前显示 ${filteredDraftUrls.length} 人）`,
+      title: `批量处理当前筛选（${filteredDraftUrls.length} 人）`,
       open: _candidateBulkOpen,
       onToggle: (open) => { _candidateBulkOpen = open; },
       children: [candidateTools]
@@ -1714,6 +1983,7 @@ export function renderTasks(state) {
   scopeSel.addEventListener('change', () => {
     _collectionScope = scopeSel.value;
     _candidateDirty = true;
+    persistCandidateDraft();
     store.set({ tasks: { ...store.state.tasks } });
   });
   const scopeHint = document.createElement('span');
@@ -1812,6 +2082,18 @@ export function renderTasks(state) {
         signingTask: buildSigningTaskPayload()
       });
       if (!r?.ok) {
+        if (r?.code === 'PGY_UNFINISHED_RUN' && r?.runDir) {
+          const recover = window.confirm([
+            '检测到上次异常中断的采集任务。',
+            '为避免重复采集和绕过冷却，本次新任务没有启动。',
+            '是否恢复旧任务？恢复后会保持暂停，确认队列后再点“继续”。'
+          ].join('\n'));
+          if (recover) {
+            const recovered = await window.desktopAPI.tasks.recover(r.runDir);
+            if (!recovered?.ok) alert(`恢复失败：${recovered?.error || 'unknown error'}`);
+            return;
+          }
+        }
         alert(`启动失败：${r?.error || 'unknown error'}`);
         return;
       }
@@ -1826,11 +2108,15 @@ export function renderTasks(state) {
 
   const btnPause = document.createElement('button');
   btnPause.className = 'btn ghost';
-  btnPause.textContent = '暂停';
+  btnPause.textContent = state.tasks?.pausePending
+    ? '取消待暂停'
+    : (state.tasks?.currentId ? '完成当前后暂停' : '暂停');
   btnPause.disabled = !state.tasks?.running || !!state.tasks?.paused;
   btnPause.addEventListener('click', async () => {
     try {
-      const r = await window.desktopAPI.tasks.pause();
+      const r = state.tasks?.pausePending
+        ? await window.desktopAPI.tasks.resume()
+        : await window.desktopAPI.tasks.pause();
       if (!r?.ok) alert(`暂停失败：${r?.error || 'unknown error'}`);
     } catch (e) {
       alert(`暂停异常：${e?.message || String(e)}`);
@@ -1852,10 +2138,10 @@ export function renderTasks(state) {
 
   const btnSkip = document.createElement('button');
   btnSkip.className = 'btn ghost';
-  btnSkip.textContent = '跳过当前';
-  btnSkip.disabled = !state.tasks?.running || !state.tasks?.currentId;
+  btnSkip.textContent = state.tasks?.skipPending ? '等待安全点跳过' : '跳过当前';
+  btnSkip.disabled = !state.tasks?.running || !state.tasks?.currentId || !!state.tasks?.skipPending;
   btnSkip.addEventListener('click', async () => {
-    const ok = window.confirm('确定要跳过当前任务吗？');
+    const ok = window.confirm('确定跳过当前达人吗？系统会在下一个安全点停止；若页面已出现登录或风控提示，会优先暂停而不会继续下一位。');
     if (!ok) return;
     try {
       const r = await window.desktopAPI.tasks.skipCurrent();
@@ -1865,10 +2151,26 @@ export function renderTasks(state) {
     }
   });
 
+  const btnStop = document.createElement('button');
+  btnStop.className = 'btn danger';
+  btnStop.textContent = state.tasks?.stopPending ? '正在安全停止' : '停止整批';
+  btnStop.disabled = !state.tasks?.running || !!state.tasks?.stopPending;
+  btnStop.addEventListener('click', async () => {
+    const ok = window.confirm('确定停止整批任务吗？\n\n程序会在下一个安全点结束当前达人，后续未处理达人不会继续。已经完成的结果会保留。');
+    if (!ok) return;
+    try {
+      const result = await window.desktopAPI.tasks.stop();
+      if (!result?.ok) alert(`停止失败：${result?.error || 'unknown error'}`);
+    } catch (error) {
+      alert(`停止异常：${error?.message || String(error)}`);
+    }
+  });
+
   ctrl.appendChild(btnStart);
   ctrl.appendChild(btnPause);
   ctrl.appendChild(btnResume);
   ctrl.appendChild(btnSkip);
+  ctrl.appendChild(btnStop);
 
   root.appendChild(ctrl);
 

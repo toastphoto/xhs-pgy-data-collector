@@ -50,6 +50,7 @@ function normalizeReviewRows(rows) {
       wechatId: cleanStr(row?.wechatId),
       phone: cleanStr(row?.phone),
       xhsProfileUrl: cleanStr(row?.xhsProfileUrl),
+      xhsProfileSourceCreatorUrl: cleanStr(row?.xhsProfileSourceCreatorUrl),
       contactSource: cleanStr(row?.contactSource),
       contactCollectedAt: cleanStr(row?.contactCollectedAt),
       contactCollectionStatus: cleanStr(row?.contactCollectionStatus),

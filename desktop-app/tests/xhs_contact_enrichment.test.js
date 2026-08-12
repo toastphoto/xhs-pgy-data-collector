@@ -14,10 +14,12 @@ const {
   isXhsProfileSnapshotStable,
   isIgnorableXhsNavigationError,
   mergeContactFields,
+  normalizePgyCreatorUrl,
   normalizeXhsProfileUrl,
   parsePublicContactSnapshot,
   parsePublicContactText,
   xhsProfileMatchesPgyCreator,
+  xhsProfileSourceMatchesPgyCreator,
   xhsProfileUrlFromPgyCreator
 } = require('../lib/xhs_contact_enrichment');
 
@@ -67,6 +69,38 @@ assert.strictEqual(
   'https://www.xiaohongshu.com/user/profile/abc123'
 );
 assert.strictEqual(xhsProfileUrlFromPgyCreator('https://example.com/blogger-detail/abc123'), '');
+assert.strictEqual(
+  normalizePgyCreatorUrl('https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123?source=list'),
+  'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123'
+);
+assert.strictEqual(
+  xhsProfileSourceMatchesPgyCreator(
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123?source=old',
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123?source=list'
+  ),
+  true
+);
+assert.strictEqual(
+  xhsProfileSourceMatchesPgyCreator(
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/other',
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123'
+  ),
+  false
+);
+assert.strictEqual(
+  xhsProfileMatchesPgyCreator(
+    'https://www.xiaohongshu.com/user/profile/xhs-different-id',
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/pgy-id'
+  ),
+  false
+);
+assert.strictEqual(
+  xhsProfileSourceMatchesPgyCreator(
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/pgy-id',
+    'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/pgy-id'
+  ),
+  true
+);
 
 assert.deepStrictEqual(
   parsePublicContactText('商务合作：hello.brand@example.com，微信号: Brand_vx88'),
@@ -119,6 +153,10 @@ assert.deepStrictEqual(
   extractPublicEmails('合作请联系 hello（at）example［dot］com'),
   ['hello@example.com']
 );
+assert.deepStrictEqual(extractPublicEmails('合作邮箱 boffyayale❄️163.com'), ['boffyayale@163.com']);
+assert.deepStrictEqual(extractPublicEmails('商务联系 j.n.a📮163.com'), ['j.n.a@163.com']);
+assert.deepStrictEqual(extractPublicEmails('邮箱 cookiemm3@🐧.com'), ['cookiemm3@qq.com']);
+assert.deepStrictEqual(extractPublicEmails('今天 A❄️163.com 降温'), []);
 assert.deepStrictEqual(extractPublicEmails('无效地址 bad..dots@example.com'), []);
 assert.deepStrictEqual(
   extractVisibleMailtoEmails([

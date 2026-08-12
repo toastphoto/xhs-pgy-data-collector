@@ -1,6 +1,6 @@
 {
   "name": "content-analyzer-desktop",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "description": "达人账号内容分析工具（桌面内嵌浏览器版）",
   "main": "main.js",

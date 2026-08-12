@@ -602,14 +602,11 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
 
 function buildCandidatePageIdentityScript(items = [], options = {}) {
   const names = [];
-  const seen = new Set();
   for (const item of Array.isArray(items) ? items : []) {
     const name = String(item?.creator_name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-    const key = name.toLowerCase();
-    if (name.length < 2 || seen.has(key)) continue;
-    seen.add(key);
+    if (name.length < 2) continue;
     names.push(name);
-    if (names.length >= 5) break;
+    if (names.length >= 80) break;
   }
   const rowSelector = String(options?.rowSelector || '').trim().slice(0, 500);
   const nameSelector = String(options?.nameSelector || '').trim().slice(0, 500);
@@ -620,7 +617,7 @@ function buildCandidatePageIdentityScript(items = [], options = {}) {
       const nameSelector = ${JSON.stringify(nameSelector)};
       const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const calibrated = Boolean(rowSelector || nameSelector);
-      const required = Math.min(calibrated ? 8 : 3, names.length);
+      const required = calibrated ? names.length : Math.min(3, names.length);
       const visible = (element) => {
         if (!element || element.nodeType !== 1) return false;
         const rect = element.getBoundingClientRect?.();
@@ -675,7 +672,26 @@ function buildCandidatePageIdentityScript(items = [], options = {}) {
           evidence: 'calibrated-name-count-insufficient'
         };
       }
-      if (required >= 2 && visibleNames.length >= required) {
+      if (calibrated && required >= 2 && visibleNames.length >= 2) {
+        const normalizedNames = names.map(clean);
+        const exactMatch = visibleNames.length === normalizedNames.length
+          && normalizedNames.every((name, index) => visibleNames[index] === name);
+        return {
+          ok: exactMatch,
+          orderedMatch: exactMatch,
+          required,
+          matchedCount: exactMatch
+            ? required
+            : normalizedNames.filter((name, index) => visibleNames[index] === name).length,
+          candidateNameCount: names.length,
+          visibleNameCount: visibleNames.length,
+          calibratedRowCount: calibratedRows.length,
+          evidence: calibratedRows.length >= 2
+            ? 'calibrated-row-name-exact-order'
+            : 'calibrated-name-selector-exact-order'
+        };
+      }
+      if (!calibrated && required >= 2 && visibleNames.length >= required) {
         let visibleCursor = 0;
         let visibleMatched = 0;
         for (const rawName of names) {
@@ -766,28 +782,45 @@ function buildCandidateSearchLayoutScript(options = {}) {
       };
       const rows = queryVisible(rowSelector);
       const globalNameElements = queryVisible(nameSelector);
+      const candidateHref = (element) => {
+        if (!element) return '';
+        let href = '';
+        try { href = new URL(element.href || element.getAttribute?.('href'), location.href).href; } catch (_) {}
+        return /\\/blogger-detail\\//i.test(href) ? href : '';
+      };
+      const resolveRowLink = (row) => {
+        let scope = row;
+        for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.parentElement) {
+          const nameElements = [];
+          try {
+            if (nameSelector && scope.matches?.(nameSelector) && visible(scope)) nameElements.push(scope);
+            if (nameSelector) {
+              Array.from(scope.querySelectorAll(nameSelector)).filter(visible).forEach((element) => {
+                if (!nameElements.includes(element)) nameElements.push(element);
+              });
+            }
+          } catch (_) {}
+          if (depth > 0 && nameElements.length > 1) break;
+          const links = [];
+          try {
+            if (scope.matches?.('a[href]')) links.push(scope);
+            Array.from(scope.querySelectorAll('a[href]')).forEach((element) => links.push(element));
+          } catch (_) {}
+          const hrefs = Array.from(new Set(links.map(candidateHref).filter(Boolean)));
+          if (hrefs.length === 1) return hrefs[0];
+          if (hrefs.length > 1) return '';
+        }
+        return '';
+      };
       const rowCandidates = rows.map((row) => {
         let nameElement = null;
         try {
           if (nameSelector && row.matches?.(nameSelector)) nameElement = row;
           else if (nameSelector) nameElement = Array.from(row.querySelectorAll(nameSelector)).find(visible) || null;
         } catch (_) {}
-        let linkElement = null;
-        try {
-          linkElement = row.matches?.('a[href*="/blogger-detail/"]')
-            ? row
-            : row.querySelector('a[href*="/blogger-detail/"]');
-          if (!linkElement) {
-            linkElement = Array.from(row.querySelectorAll('a[href]')).find((element) => (
-              /blogger|creator|kol/i.test(String(element.getAttribute?.('href') || ''))
-            )) || null;
-          }
-        } catch (_) {}
-        let href = '';
-        try { href = linkElement ? new URL(linkElement.href || linkElement.getAttribute('href'), location.href).href : ''; } catch (_) {}
         return {
           name: clean(nameElement?.innerText || nameElement?.textContent || nameElement?.getAttribute?.('aria-label') || '', 80),
-          href: clean(href, 500)
+          href: clean(resolveRowLink(row), 500)
         };
       });
       const rowNames = rowCandidates.map((candidate) => candidate.name).filter(Boolean);

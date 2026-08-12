@@ -43,14 +43,18 @@ function normalizeEmailText(value) {
   try {
     text = text.normalize('NFKC');
   } catch (_) {}
-  return text
+  text = text
     .replace(/[\u200b-\u200d\ufeff]/g, '')
+    .replace(/[\ufe0e\ufe0f]/g, '')
     .replace(/[。｡﹒]/g, '.')
     .replace(/[﹫]/g, '@')
     .replace(/\s*(?:\[\s*(?:at|@|艾特)\s*\]|\(\s*(?:at|@|艾特)\s*\)|\{\s*(?:at|@|艾特)\s*\})\s*/gi, '@')
     .replace(/\s*(?:\[\s*(?:dot|\.|点)\s*\]|\(\s*(?:dot|\.|点)\s*\)|\{\s*(?:dot|\.|点)\s*\})\s*/gi, '.')
+    .replace(/@\s*🐧\s*(?=\.)/g, '@qq')
+    .replace(/([A-Z0-9][A-Z0-9._%+-]{1,61}[A-Z0-9])\s*(?:📮|📧|✉|💌|❄)\s*(?=[A-Z0-9-]+(?:\s*\.\s*[A-Z0-9-]+)+)/gi, '$1@')
     .replace(/\s*@\s*/g, '@')
     .replace(/\s*\.\s*/g, '.');
+  return text;
 }
 
 function extractPublicEmails(value) {
@@ -127,6 +131,26 @@ function extractPgyCreatorEntityId(value) {
   } catch (_) {
     return '';
   }
+}
+
+function normalizePgyCreatorUrl(value) {
+  const text = cleanStr(value);
+  if (!text) return '';
+  try {
+    const url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+    if (!/(^|\.)xiaohongshu\.com$/i.test(url.hostname)) return '';
+    const match = url.pathname.match(/^(.*\/blogger-detail\/)([^/?#]+)/i);
+    if (!match) return '';
+    return `https://${url.hostname.toLowerCase()}${match[1]}${encodeURIComponent(decodeURIComponent(match[2]))}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+function xhsProfileSourceMatchesPgyCreator(sourceCreatorUrl, creatorUrl) {
+  const source = normalizePgyCreatorUrl(sourceCreatorUrl);
+  const creator = normalizePgyCreatorUrl(creatorUrl);
+  return Boolean(source && creator && source === creator);
 }
 
 function extractXhsProfileEntityId(value) {
@@ -453,11 +477,13 @@ module.exports = {
   mergeContactFields,
   normalizeEmailText,
   normalizePhone,
+  normalizePgyCreatorUrl,
   normalizeXhsPageSnapshot,
   normalizeXhsProfileUrl,
   parsePublicContactSnapshot,
   parsePublicContactText,
   xhsProfileMatchesPgyCreator,
+  xhsProfileSourceMatchesPgyCreator,
   xhsProfileUrlFromPgyCreator,
   xhsProfileSnapshotFingerprint
 };

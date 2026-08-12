@@ -810,9 +810,7 @@ export function renderTasks(state) {
   root.className = 'view';
 
   const runDir = state.tasks?.runDir || '';
-  const queue = (state.tasks?.queue && state.tasks.queue.length)
-    ? state.tasks.queue
-    : _draftUrls.map((u, i) => ({ id: `t${i + 1}`, url: u, status: 'pending', error: '' }));
+  const queue = Array.isArray(state.tasks?.queue) ? state.tasks.queue : [];
   const stats = queueStats(queue);
   const currentIndex = queue.findIndex((item) => item.id === state.tasks?.currentId);
   const processedCount = queue.filter((item) => ['ok', 'fail', 'skipped'].includes(String(item?.status || ''))).length;
@@ -2175,10 +2173,55 @@ export function renderTasks(state) {
   root.appendChild(ctrl);
 
   // 队列表格
+  const tableHeader = document.createElement('div');
+  tableHeader.className = 'task-toolbar';
   const tableTitle = document.createElement('div');
   tableTitle.className = 'section-label';
   tableTitle.textContent = '采集队列';
-  root.appendChild(tableTitle);
+  tableTitle.classList.add('compact');
+  const hasQueueSession = Boolean(
+    queue.length
+    || state.tasks?.runId
+    || state.tasks?.runDir
+    || state.tasks?.logs?.length
+    || state.tasks?.finishReason
+    || state.tasks?.finishedAt
+  );
+  const btnClearQueue = document.createElement('button');
+  btnClearQueue.className = 'btn ghost';
+  btnClearQueue.textContent = '清空采集队列';
+  btnClearQueue.disabled = Boolean(
+    state.tasks?.running
+    || state.tasks?.recoveryPending
+    || !hasQueueSession
+  );
+  btnClearQueue.title = state.tasks?.running
+    ? '采集运行中不可清空，请先安全停止或等待完成'
+    : state.tasks?.recoveryPending
+      ? '待恢复任务必须先处理，不能直接清空'
+      : '只清空当前采集队列显示，不影响候选池和磁盘结果';
+  btnClearQueue.addEventListener('click', async () => {
+    const confirmed = window.confirm([
+      '确定清空当前采集队列吗？',
+      '',
+      '只会重置本页当前队列、处理进度、运行日志和本次结果引用。',
+      '候选池不会被清空，磁盘中的 run 结果也不会被删除。'
+    ].join('\n'));
+    if (!confirmed) return;
+    try {
+      const result = await window.desktopAPI.tasks.clearQueue();
+      if (!result?.ok) {
+        alert(`清空失败：${result?.error || 'unknown error'}`);
+        return;
+      }
+      _autoContactRunDir = '';
+    } catch (error) {
+      alert(`清空异常：${error?.message || String(error)}`);
+    }
+  });
+  tableHeader.appendChild(tableTitle);
+  tableHeader.appendChild(btnClearQueue);
+  root.appendChild(tableHeader);
 
   const table = document.createElement('table');
   table.className = 'task-table';
@@ -2196,7 +2239,7 @@ export function renderTasks(state) {
 
   if (!queue.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="3" class="empty-row">暂无队列。请先粘贴 URL 并“解析并加入队列”。</td>`;
+    tr.innerHTML = `<td colspan="3" class="empty-row">暂无本次采集队列。候选池仍会保留；确认采集范围后可开始下一批。</td>`;
     tbody.appendChild(tr);
   } else {
     queue.forEach((it) => {

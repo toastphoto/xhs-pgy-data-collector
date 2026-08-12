@@ -506,7 +506,23 @@
 
 ## 2026-08-10: Bind XHS Profiles To PGY Creator Identity
 
+Status: superseded on 2026-08-12 because field evidence disproved the shared-route-ID assumption. Keep this entry as history; use the provenance decision below.
+
 - Decision: resolve an XHS profile only after the PGY creator-detail identity region is stable, derive the canonical profile route from that creator-detail identity, and accept a saved profile URL only when the two route identities match. Page-wide links and visible-ID click navigation are not identity evidence.
 - Why: a live batch reused the first creator's saved profile URL for later rows because the resolver trusted prior state and scanned unrelated page links. The visible XHS-ID anchor also had no stable `href`, so click navigation was not a reliable mapping contract.
 - Impact: a cross-creator URL is rejected before reading or persistence; current live rows resolve deterministically without destroying the protected collection tab. Profile readiness ignores unrelated nested feed loaders only after stable profile identity is visible. Contact review prefers the selected candidate name over broad account/company headings.
 - Reevaluate when: PGY stops using the creator-detail route identity as the XHS profile route identity, or an official creator mapping API becomes available. Any replacement still needs per-row association proof and a real positive/negative installed-app test.
+
+## 2026-08-12: Bind Cross-Platform Profiles By Provenance, Not Route-ID Equality
+
+- Decision: treat PGY `blogger-detail` IDs and XHS `user/profile` IDs as different namespaces. Accept a profile only from the scoped XHS entry on the verified current PGY creator page, then persist the normalized PGY source URL beside the profile URL. Reuse requires the same source URL; legacy rows without provenance may use the old exact-ID condition only as a conservative compatibility path.
+- Why: field rows opened the correct XHS profile while the two route IDs differed, so equality rejected valid profiles. Removing all checks would be worse because a stale or page-wide link could silently attach one creator's contact to another.
+- Impact: derived XHS URLs and page-wide-link resolution are removed from the active resolver; successful and profile-unavailable outcomes preserve source provenance through renderer state and review storage.
+- Reevaluate when: PGY exposes an official stable mapping identifier or API. Any replacement must still prove per-row association and pass installed positive, negative, and cross-row leakage tests.
+
+## 2026-08-12: Require Full Visible-Page Identity Before Ranked Pagination
+
+- Decision: calibrated candidate snapshots must match the complete visible nickname sequence. A creator row may obtain one unique detail URL from a bounded parent card; duplicate, missing, or ambiguous URL mappings reject the DOM page. Revalidate visible page number and complete order immediately before each next-page click.
+- Why: matching only the first five names can accept a stale response whose later ranks differ, while requiring links inside the nickname region rejects valid rendered cards. Either defect breaks global ranks even when page 1 is visibly present.
+- Impact: stale first-five collisions and changed-page clicks fail closed; checkpoint resume retains only sanitized nickname-plus-URL anchors needed for the same verification.
+- Reevaluate when: PGY virtualizes a partial page or provides an official ordered export. Full global-rank evidence remains mandatory.

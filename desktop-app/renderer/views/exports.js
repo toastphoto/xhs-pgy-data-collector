@@ -176,6 +176,7 @@ function applyXhsContactUpdate(update = {}) {
   if (!String(review.wechatId || '').trim() && update.wechatId) review.wechatId = update.wechatId;
   if (!String(review.phone || '').trim() && update.phone) review.phone = update.phone;
   if (update.xhsProfileUrl) review.xhsProfileUrl = update.xhsProfileUrl;
+  if (update.xhsProfileSourceCreatorUrl) review.xhsProfileSourceCreatorUrl = update.xhsProfileSourceCreatorUrl;
   if (update.contactSource) review.contactSource = update.contactSource;
   if (update.contactCollectedAt) review.contactCollectedAt = update.contactCollectedAt;
   if (update.contactCollectionStatus) review.contactCollectionStatus = update.contactCollectionStatus;
@@ -391,6 +392,7 @@ function buildExportRowsFromContactRows(rows) {
       wechatId: review.wechatId || '',
       phone: review.phone || '',
       xhsProfileUrl: review.xhsProfileUrl || row.xhsProfileUrl || '',
+      xhsProfileSourceCreatorUrl: review.xhsProfileSourceCreatorUrl || row.xhsProfileSourceCreatorUrl || '',
       contactSource: review.contactSource || '',
       contactCollectedAt: review.contactCollectedAt || '',
       contactCollectionStatus: review.contactCollectionStatus || '',
@@ -574,6 +576,7 @@ function ensureReviewRow(row) {
       wechatId: row?.wechatId || '',
       phone: row?.phone || '',
       xhsProfileUrl: row?.xhsProfileUrl || '',
+      xhsProfileSourceCreatorUrl: row?.xhsProfileSourceCreatorUrl || '',
       contactSource: row?.contactSource || '',
       contactCollectedAt: row?.contactCollectedAt || '',
       contactCollectionStatus: row?.contactCollectionStatus || '',
@@ -1221,7 +1224,10 @@ export function renderExports(state) {
       };
       const statusCounts = formatFollowupStatusCounts(r.summary?.followupStatusCounts);
       const statusLine = statusCounts ? `\n跟进状态：${statusCounts}` : '';
-      setMsg(`导出成功：\n${r.outPath}\n\n统计：raw_result.json=${r.files}，建联达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}${statusLine}`);
+      const fallbackLine = r.savedAs
+        ? `\n\n原建联表正被 WPS/Excel 占用，已安全另存为新文件；未覆盖正在打开的文件。`
+        : '';
+      setMsg(`导出成功：\n${r.outPath}${fallbackLine}\n\n统计：raw_result.json=${r.files}，建联达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}${statusLine}`);
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     } catch (e) {
       _contactExportState = { status: 'error', message: `导出异常：${e?.message || String(e)}`, outPath: '' };
@@ -2081,6 +2087,7 @@ export function renderExports(state) {
       if (review?.contactCollectionError) {
         const failureLabels = {
           PGY_PROFILE_LOAD_FAILED: '蒲公英达人页打开失败',
+          PGY_PROFILE_LOAD_WRONG_PAGE: '蒲公英达人页尚未切换完成',
           PGY_PROFILE_NOT_READY: '蒲公英达人页未加载稳定',
           XHS_PROFILE_NOT_FOUND: '未找到小红书主页入口',
           XHS_PROFILE_NOT_READY: '小红书主页未加载完整',

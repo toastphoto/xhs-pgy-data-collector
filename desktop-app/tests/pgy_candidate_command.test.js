@@ -223,7 +223,7 @@ const calibratedIdentity = Function(
 );
 assert.strictEqual(calibratedIdentity.orderedMatch, true);
 assert.strictEqual(calibratedIdentity.visibleNameCount, 4);
-assert.strictEqual(calibratedIdentity.evidence, 'calibrated-name-selector');
+assert.strictEqual(calibratedIdentity.evidence, 'calibrated-name-selector-exact-order');
 const sameFirstThreeWrongFourth = Function(
   'document',
   'getComputedStyle',
@@ -241,6 +241,29 @@ const sameFirstThreeWrongFourth = Function(
   () => ({ display: 'block', visibility: 'visible', opacity: '1' })
 );
 assert.strictEqual(sameFirstThreeWrongFourth.orderedMatch, false);
+const sameFirstFiveWrongSixthNames = ['达人甲', '达人乙', '达人丙', '达人丁', '达人戊', '达人己'];
+const sameFirstFiveWrongSixthElements = sameFirstFiveWrongSixthNames.map((text, index) => ({
+  nodeType: 1,
+  innerText: index === 5 ? '另一个达人' : text,
+  textContent: index === 5 ? '另一个达人' : text,
+  getBoundingClientRect: () => ({ width: 80, height: 24 })
+}));
+const sameFirstFiveWrongSixth = Function(
+  'document',
+  'getComputedStyle',
+  `return (${buildCandidatePageIdentityScript(
+    sameFirstFiveWrongSixthNames.map((creator_name) => ({ creator_name })),
+    { nameSelector: '.candidate-name' }
+  )});`
+)(
+  {
+    body: { innerText: '无关文本' },
+    querySelectorAll: (selector) => selector === '.candidate-name' ? sameFirstFiveWrongSixthElements : []
+  },
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' })
+);
+assert.strictEqual(sameFirstFiveWrongSixth.orderedMatch, false);
+assert.strictEqual(sameFirstFiveWrongSixth.required, 6);
 const substringCollision = Function(
   'document',
   'getComputedStyle',
@@ -284,7 +307,7 @@ const calibratedRowIdentity = Function(
 );
 assert.strictEqual(calibratedRowIdentity.orderedMatch, true);
 assert.strictEqual(calibratedRowIdentity.calibratedRowCount, 4);
-assert.strictEqual(calibratedRowIdentity.evidence, 'calibrated-row-name-order');
+assert.strictEqual(calibratedRowIdentity.evidence, 'calibrated-row-name-exact-order');
 const missingRowName = Function(
   'document',
   'getComputedStyle',
@@ -303,6 +326,57 @@ const missingRowName = Function(
 );
 assert.strictEqual(missingRowName.orderedMatch, false);
 assert.strictEqual(missingRowName.evidence, 'calibrated-row-name-count-mismatch');
+const visibleElement = (extra = {}) => ({
+  nodeType: 1,
+  getBoundingClientRect: () => ({ width: 120, height: 30 }),
+  ...extra
+});
+const parentLink = visibleElement({
+  href: '/solar/pre-trade/blogger-detail/parent-link-id',
+  getAttribute: (name) => name === 'href' ? '/solar/pre-trade/blogger-detail/parent-link-id' : '',
+  matches: (selector) => selector === 'a[href]',
+  querySelectorAll: () => []
+});
+const nestedName = visibleElement({
+  innerText: '父卡片达人',
+  textContent: '父卡片达人',
+  getAttribute: () => '',
+  matches: (selector) => selector === '.candidate-name',
+  querySelectorAll: () => []
+});
+const parentCard = visibleElement({
+  parentElement: null,
+  matches: () => false,
+  querySelectorAll: (selector) => {
+    if (selector === '.candidate-name') return [nestedName];
+    if (selector === 'a[href]') return [parentLink];
+    return [];
+  }
+});
+const nestedRow = visibleElement({
+  parentElement: parentCard,
+  matches: () => false,
+  querySelectorAll: (selector) => selector === '.candidate-name' ? [nestedName] : []
+});
+const nestedLayout = Function(
+  'document',
+  'getComputedStyle',
+  'location',
+  'URL',
+  `return (${buildCandidateSearchLayoutScript({
+    rowSelector: '.candidate-row',
+    nameSelector: '.candidate-name'
+  })});`
+)(
+  {
+    querySelectorAll: (selector) => selector === '.candidate-row' ? [nestedRow, { ...nestedRow }] : []
+  },
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  { href: 'https://pgy.xiaohongshu.com/solar/pre-trade/kol-selection' },
+  URL
+);
+assert.strictEqual(nestedLayout.candidates[0].href, 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/parent-link-id');
+assert.strictEqual(nestedLayout.rowsWithLink, 2);
 const calibratedPagination = executePagination(buildSearchPaginationScript(
   'inspect',
   1,

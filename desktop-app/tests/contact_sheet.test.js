@@ -146,6 +146,9 @@ const pendingExported = exportContactWorkbook(runDir, {
   reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }]
 });
 assert.ok(fs.existsSync(pendingExported.outPath));
+assert.strictEqual(pendingExported.savedAs, false);
+assert.strictEqual(pendingExported.requestedOutPath, pendingExported.outPath);
+assert.strictEqual(pendingExported.saveFallbackCode, '');
 assert.strictEqual(pendingExported.creators, 1);
 assert.strictEqual(pendingExported.xiaomifengRows, 0);
 assert.strictEqual(pendingExported.pendingContactRows, 1);
@@ -184,6 +187,8 @@ const exported = exportContactWorkbook(runDir, {
   reviewRows: [{ rowId: preview.rows[0].rowId, selected: true, wechatId: 'wx_test' }]
 });
 assert.ok(fs.existsSync(exported.outPath));
+assert.strictEqual(exported.outPath, pendingExported.outPath);
+assert.strictEqual(exported.savedAs, false);
 assert.strictEqual(exported.creators, 1);
 assert.strictEqual(exported.xiaomifengRows, 1);
 assert.strictEqual(exported.pendingContactRows, 0);
@@ -315,6 +320,100 @@ assert.strictEqual(filteredContact[0]['跟进状态'], '需二次跟进');
 assert.strictEqual(filteredContact[0]['优先级'], 'P1');
 const filteredPending = XLSX.utils.sheet_to_json(filteredWb.Sheets['待补联系方式'], { defval: '' });
 assert.strictEqual(filteredPending[0]['备注'], '单独导出给同事补联系方式');
+
+const fixedContactPath = path.join(runDir, `建联表_${path.basename(runDir)}.xlsx`);
+const fallbackTimestamp = '20260812-101112';
+const occupiedFallbackPath = path.join(
+  runDir,
+  `建联表_${path.basename(runDir)}_${fallbackTimestamp}.xlsx`
+);
+fs.writeFileSync(occupiedFallbackPath, 'existing fallback must not be overwritten', 'utf-8');
+
+const originalWriteFile = XLSX.writeFile;
+const writeAttempts = [];
+XLSX.writeFile = (workbook, outPath, ...args) => {
+  writeAttempts.push(outPath);
+  if (outPath === fixedContactPath) {
+    const error = new Error('EBUSY: resource busy or locked, open workbook');
+    error.code = 'EBUSY';
+    throw error;
+  }
+  return originalWriteFile.call(XLSX, workbook, outPath, ...args);
+};
+
+let lockedExported;
+try {
+  lockedExported = exportContactWorkbook(runDir, {
+    reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }],
+    fallbackTimestamp
+  });
+} finally {
+  XLSX.writeFile = originalWriteFile;
+}
+
+const expectedFallbackPath = path.join(
+  runDir,
+  `建联表_${path.basename(runDir)}_${fallbackTimestamp}_2.xlsx`
+);
+assert.deepStrictEqual(writeAttempts, [fixedContactPath]);
+assert.strictEqual(lockedExported.requestedOutPath, fixedContactPath);
+assert.strictEqual(lockedExported.outPath, expectedFallbackPath);
+assert.strictEqual(lockedExported.savedAs, true);
+assert.strictEqual(lockedExported.saveFallbackCode, 'EBUSY');
+assert.ok(fs.existsSync(expectedFallbackPath));
+assert.strictEqual(fs.readFileSync(occupiedFallbackPath, 'utf-8'), 'existing fallback must not be overwritten');
+assert.ok(XLSX.readFile(expectedFallbackPath).SheetNames.includes('建联表'));
+
+for (const lockCode of ['EPERM', 'EACCES']) {
+  XLSX.writeFile = () => {
+    const error = new Error(`${lockCode}: workbook is unavailable`);
+    error.code = lockCode;
+    throw error;
+  };
+  try {
+    const lockResult = exportContactWorkbook(runDir, {
+      reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }],
+      fallbackTimestamp: `${fallbackTimestamp}-${lockCode}`
+    });
+    assert.strictEqual(lockResult.savedAs, true);
+    assert.strictEqual(lockResult.saveFallbackCode, lockCode);
+    assert.ok(fs.existsSync(lockResult.outPath));
+  } finally {
+    XLSX.writeFile = originalWriteFile;
+  }
+}
+
+XLSX.writeFile = () => {
+  throw new Error('resource busy or locked, open workbook');
+};
+try {
+  const messageLockedResult = exportContactWorkbook(runDir, {
+    reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }],
+    fallbackTimestamp: `${fallbackTimestamp}-message`
+  });
+  assert.strictEqual(messageLockedResult.savedAs, true);
+  assert.strictEqual(messageLockedResult.saveFallbackCode, 'RESOURCE_LOCKED');
+  assert.ok(fs.existsSync(messageLockedResult.outPath));
+} finally {
+  XLSX.writeFile = originalWriteFile;
+}
+
+const nonLockError = new Error('ENOSPC: no space left on device');
+nonLockError.code = 'ENOSPC';
+XLSX.writeFile = () => {
+  throw nonLockError;
+};
+try {
+  assert.throws(
+    () => exportContactWorkbook(runDir, {
+      reviewRows: [{ rowId: preview.rows[0].rowId, selected: true }],
+      fallbackTimestamp: `${fallbackTimestamp}-disk`
+    }),
+    (error) => error === nonLockError
+  );
+} finally {
+  XLSX.writeFile = originalWriteFile;
+}
 
 const collisionRunDir = path.join(tmp, 'run_collision');
 const collisionCreators = [

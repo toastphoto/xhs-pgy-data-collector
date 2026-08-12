@@ -37,13 +37,13 @@ const {
   buildXhsRiskDetectionSnippet,
   classifyXhsProfilePageRead,
   contactFieldCount,
-  extractPgyCreatorEntityId,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
+  normalizePgyCreatorUrl,
   normalizeXhsProfileUrl,
   parsePublicContactSnapshot,
   xhsProfileMatchesPgyCreator,
-  xhsProfileUrlFromPgyCreator
+  xhsProfileSourceMatchesPgyCreator
 } = require('./lib/xhs_contact_enrichment');
 const {
   TENCENT_MAIL_HOME_URL,
@@ -1189,10 +1189,12 @@ async function readCandidatePageFromVisibleComponents(expectedPage, calibration 
           priority: '',
           excludeReason: ''
         }));
+      const uniqueDomUrls = new Set(domItems.map((item) => item.pgy_url));
       if (
         domItems.length >= 2
         && Number(layout?.rowCount || 0) === domItems.length
         && Number(layout?.nameCount || 0) === domItems.length
+        && uniqueDomUrls.size === domItems.length
       ) {
         return {
           ok: true,
@@ -1420,7 +1422,12 @@ async function readPgyCandidatesFromResponsePages({
       ? resumeSession.waitedCheckpoints.slice()
       : [];
     currentPageEvidence = {
-      items: (resumeSession.pageAnchorUrls || []).map((pgy_url) => ({ pgy_url })),
+      items: Array.isArray(resumeSession.pageAnchorItems) && resumeSession.pageAnchorItems.length
+        ? resumeSession.pageAnchorItems.map((item) => ({
+            pgy_url: String(item?.pgy_url || ''),
+            creator_name: String(item?.creator_name || '')
+          }))
+        : (resumeSession.pageAnchorUrls || []).map((pgy_url) => ({ pgy_url })),
       fingerprint: resumeSession.pageFingerprint || (resumeSession.pageAnchorUrls || []).join('|'),
       sequence: Number(resumeSession.pageSequence || 0),
       pageNumber: currentPage
@@ -1586,6 +1593,10 @@ async function readPgyCandidatesFromResponsePages({
         url: browserView.webContents.getURL() || '',
         webContentsId: browserView.webContents.id,
         pageAnchorUrls: candidatePageAnchorUrls(currentPageEvidence),
+        pageAnchorItems: (currentPageEvidence?.items || []).map((item) => ({
+          pgy_url: String(item?.pgy_url || ''),
+          creator_name: String(item?.creator_name || '')
+        })),
         pageFingerprint: currentPageEvidence?.fingerprint || '',
         pageSequence: Number(currentPageEvidence?.sequence || 0)
       };
@@ -1624,6 +1635,17 @@ async function readPgyCandidatesFromResponsePages({
     if (pagesRead >= PGY_CANDIDATE_MAX_PAGES) break;
 
     const previousPage = currentPageEvidence;
+    const anchorConfirmation = await confirmCandidateSnapshotOnVisiblePage(
+      previousPage,
+      currentPage,
+      calibration
+    );
+    if (!anchorConfirmation.ok) {
+      return failIncomplete(
+        'PGY_PAGINATION_ANCHOR_LOST',
+        `准备读取第 ${currentPage + 1} 页前，当前第 ${currentPage} 页的页码或完整达人顺序已经变化。为避免错位，本次没有点击下一页。`
+      );
+    }
     const previous = {
       capturedAt: previousPage?.capturedAt,
       fingerprint: previousPage?.fingerprint,
@@ -2609,99 +2631,6 @@ async function waitForProfileNavigation(view, timeoutMs = 10000) {
   return '';
 }
 
-async function resolveXhsProfileUrlFromPgyOnce(row = {}, view = browserView) {
-  const saved = normalizeXhsProfileUrl(row.xhsProfileUrl);
-  if (saved) return { ok: true, profileUrl: saved, source: 'saved' };
-
-  const creatorUrl = String(row.creatorUrl || '').trim();
-  if (!isAllowedTaskUrl(creatorUrl)) {
-    return { ok: false, code: 'PGY_PROFILE_URL_REQUIRED', error: '缺少有效的蒲公英达人详情链接' };
-  }
-
-  if (!view?.webContents) {
-    return { ok: false, code: 'XHS_BROWSER_TAB_NOT_READY', error: '小红书主页标签未初始化' };
-  }
-  await view.webContents.loadURL(creatorUrl);
-  mainWindow?.webContents.send('browser:url', { url: creatorUrl });
-  await sleep(3500);
-
-  const risk = await pgyDetectRiskOnCurrentPage(view.webContents);
-  if (risk?.riskDetected) {
-    return {
-      ok: false,
-      code: 'PGY_RISK_DETECTED',
-      error: `蒲公英页面触发验证：${risk.riskText || '请手工确认'}`,
-      manualIntervention: true
-    };
-  }
-
-  const xhsId = String(row.xhsId || '').trim();
-  const resolved = await view.webContents.executeJavaScript(
-    `
-      (function(){
-        const wanted = ${JSON.stringify(xhsId)};
-        const isVisible = (el) => {
-          try {
-            const rect = el.getBoundingClientRect();
-            const style = getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          } catch (_) { return false; }
-        };
-        const hrefs = [];
-        const addHref = (value) => {
-          const text = String(value || '').trim();
-          if (text && !hrefs.includes(text)) hrefs.push(text);
-        };
-        document.querySelectorAll('a[href], [data-href], [data-url]').forEach((el) => {
-          addHref(el.href);
-          addHref(el.getAttribute('href'));
-          addHref(el.getAttribute('data-href'));
-          addHref(el.getAttribute('data-url'));
-        });
-        let target = null;
-        if (wanted) {
-          const nodes = Array.from(document.querySelectorAll('a,button,span,div,p'))
-            .filter(isVisible)
-            .filter((el) => {
-              const text = String(el.textContent || '').replace(/\\s+/g, ' ').trim();
-              return text === wanted || text === '小红书号：' + wanted || text === '小红书号:' + wanted || text === '小红书号: ' + wanted;
-            })
-            .sort((a, b) => String(a.textContent || '').length - String(b.textContent || '').length);
-          target = nodes[0] || null;
-          const anchor = target?.closest?.('a') || target?.querySelector?.('a');
-          if (anchor) {
-            addHref(anchor.href);
-            addHref(anchor.getAttribute('href'));
-          }
-          let cursor = target;
-          for (let i = 0; cursor && i < 4; i += 1, cursor = cursor.parentElement) {
-            Array.from(cursor.attributes || []).forEach((attr) => addHref(attr.value));
-          }
-        }
-        const direct = hrefs.find((href) => /xiaohongshu\\.com\\/user\\/profile\\//i.test(href)) || '';
-        if (direct) return { ok: true, hrefs, clicked: false };
-        if (target) {
-          try {
-            target.scrollIntoView({ block: 'center', inline: 'center' });
-            target.click();
-            return { ok: true, hrefs, clicked: true };
-          } catch (_) {}
-        }
-        return { ok: false, hrefs, clicked: false };
-      })()
-    `,
-    true
-  );
-
-  const direct = firstProfileUrl(resolved?.hrefs);
-  if (direct) return { ok: true, profileUrl: direct, source: 'pgy_link' };
-  if (resolved?.clicked) {
-    const navigated = await waitForProfileNavigation(view, 10000);
-    if (navigated) return { ok: true, profileUrl: navigated, source: 'pgy_click' };
-  }
-  return { ok: false, code: 'XHS_PROFILE_NOT_FOUND', error: '未能从蒲公英页面解析小红书主页链接' };
-}
-
 async function inspectPgyXhsProfileLink(view, xhsId = '', allowClick = false) {
   return await view.webContents.executeJavaScript(
     `
@@ -2785,9 +2714,18 @@ async function inspectPgyXhsProfileLink(view, xhsId = '', allowClick = false) {
 
 async function resolveXhsProfileUrlFromPgy(row = {}, view = browserView) {
   const creatorUrl = String(row.creatorUrl || '').trim();
+  const normalizedCreatorUrl = normalizePgyCreatorUrl(creatorUrl);
   const saved = normalizeXhsProfileUrl(row.xhsProfileUrl);
-  if (saved && xhsProfileMatchesPgyCreator(saved, creatorUrl)) {
-    return { ok: true, profileUrl: saved, source: 'saved' };
+  const savedSource = normalizePgyCreatorUrl(row.xhsProfileSourceCreatorUrl);
+  const sourceMatches = xhsProfileSourceMatchesPgyCreator(savedSource, normalizedCreatorUrl);
+  const legacyExactIdMatch = !savedSource && xhsProfileMatchesPgyCreator(saved, normalizedCreatorUrl);
+  if (saved && (sourceMatches || legacyExactIdMatch)) {
+    return {
+      ok: true,
+      profileUrl: saved,
+      source: sourceMatches ? 'saved_verified_source' : 'saved_legacy_exact_id',
+      sourceCreatorUrl: normalizedCreatorUrl
+    };
   }
 
   if (!isAllowedTaskUrl(creatorUrl)) {
@@ -2805,26 +2743,31 @@ async function resolveXhsProfileUrlFromPgy(row = {}, view = browserView) {
   }
   mainWindow?.webContents.send('browser:url', { url: creatorUrl });
 
-  const expectedCreatorId = extractPgyCreatorEntityId(creatorUrl);
   const xhsId = String(row.xhsId || '').trim();
   const deadline = Date.now() + PGY_XHS_PROFILE_READY_TIMEOUT_MS;
   let stableEvidenceReads = 0;
   let lastInspection = null;
   let clickAttempted = false;
+  let clickNavigationAuthorized = false;
   while (Date.now() < deadline) {
     if (await waitForXhsControl(0) === 'cancel') {
       return { ok: false, canceled: true, code: 'XHS_CONTACT_CANCELED', error: '补采已停止' };
     }
     const navigatedProfile = normalizeXhsProfileUrl(view.webContents.getURL());
     if (navigatedProfile) {
-      if (xhsProfileMatchesPgyCreator(navigatedProfile, creatorUrl)) {
-        return { ok: true, profileUrl: navigatedProfile, source: 'pgy_navigation' };
+      if (clickNavigationAuthorized) {
+        return {
+          ok: true,
+          profileUrl: navigatedProfile,
+          source: 'pgy_click_navigation',
+          sourceCreatorUrl: normalizedCreatorUrl
+        };
       }
       return {
         ok: false,
-        retryable: false,
-        code: 'XHS_PROFILE_ID_MISMATCH',
-        error: `蒲公英达人 ${expectedCreatorId || '当前记录'} 打开了不匹配的小红书主页，已拒绝写入`
+        retryable: true,
+        code: 'PGY_PROFILE_LOAD_WRONG_PAGE',
+        error: '蒲公英达人页尚未稳定打开，当前标签仍停留在其他小红书主页'
       };
     }
 
@@ -2842,43 +2785,50 @@ async function resolveXhsProfileUrlFromPgy(row = {}, view = browserView) {
       lastInspection = await inspectPgyXhsProfileLink(view, xhsId, false);
     } catch (_) {
       const currentProfile = normalizeXhsProfileUrl(view.webContents.getURL());
-      if (currentProfile && xhsProfileMatchesPgyCreator(currentProfile, creatorUrl)) {
-        return { ok: true, profileUrl: currentProfile, source: 'pgy_navigation' };
+      if (currentProfile && clickNavigationAuthorized) {
+        return {
+          ok: true,
+          profileUrl: currentProfile,
+          source: 'pgy_click_navigation',
+          sourceCreatorUrl: normalizedCreatorUrl
+        };
       }
       if (await waitForXhsControl(PGY_XHS_PROFILE_READY_POLL_MS) === 'cancel') break;
       continue;
     }
     const direct = firstProfileUrl(lastInspection?.targetHrefs);
-    if (direct && xhsProfileMatchesPgyCreator(direct, creatorUrl)) {
-      return { ok: true, profileUrl: direct, source: 'pgy_link' };
+    if (direct) {
+      return {
+        ok: true,
+        profileUrl: direct,
+        source: 'pgy_scoped_link',
+        sourceCreatorUrl: normalizedCreatorUrl
+      };
     }
 
     const documentReady = ['interactive', 'complete'].includes(String(lastInspection?.documentReadyState || ''));
     stableEvidenceReads = documentReady && lastInspection?.pageEvidence ? stableEvidenceReads + 1 : 0;
-    if (stableEvidenceReads >= 2 && lastInspection?.targetFound) {
-      const derivedProfile = xhsProfileUrlFromPgyCreator(creatorUrl);
-      if (derivedProfile) {
-        return { ok: true, profileUrl: derivedProfile, source: 'pgy_creator_id' };
-      }
-    }
     if (!clickAttempted && stableEvidenceReads >= 2 && lastInspection?.targetFound) {
       clickAttempted = true;
       const clicked = await inspectPgyXhsProfileLink(view, xhsId, true).catch(() => null);
       const clickedDirect = firstProfileUrl(clicked?.targetHrefs);
-      if (clickedDirect && xhsProfileMatchesPgyCreator(clickedDirect, creatorUrl)) {
-        return { ok: true, profileUrl: clickedDirect, source: 'pgy_link' };
+      if (clickedDirect) {
+        return {
+          ok: true,
+          profileUrl: clickedDirect,
+          source: 'pgy_scoped_link',
+          sourceCreatorUrl: normalizedCreatorUrl
+        };
       }
       if (clicked?.clicked) {
+        clickNavigationAuthorized = true;
         const navigated = await waitForProfileNavigation(view, 10000);
-        if (navigated && xhsProfileMatchesPgyCreator(navigated, creatorUrl)) {
-          return { ok: true, profileUrl: navigated, source: 'pgy_click' };
-        }
         if (navigated) {
           return {
-            ok: false,
-            retryable: false,
-            code: 'XHS_PROFILE_ID_MISMATCH',
-            error: `蒲公英达人 ${expectedCreatorId || '当前记录'} 打开了不匹配的小红书主页，已拒绝写入`
+            ok: true,
+            profileUrl: navigated,
+            source: 'pgy_click',
+            sourceCreatorUrl: normalizedCreatorUrl
           };
         }
       }
@@ -3175,6 +3125,7 @@ async function runXhsContactBatch(rows) {
       const update = {
         rowId: row.rowId,
         xhsProfileUrl: profile.profileUrl,
+        xhsProfileSourceCreatorUrl: profile.sourceCreatorUrl,
         contactCollectionStatus: 'profile_unavailable',
         contactCollectionCode: inspected?.code || 'XHS_PROFILE_NOT_READY',
         contactCollectionError: inspected?.error || '个人主页未完整加载',
@@ -3191,6 +3142,7 @@ async function runXhsContactBatch(rows) {
     const update = {
       rowId: row.rowId,
       xhsProfileUrl: profile.profileUrl,
+      xhsProfileSourceCreatorUrl: profile.sourceCreatorUrl,
       email: contact.email,
       wechatId: contact.wechatId,
       phone: contact.phone,
@@ -3332,7 +3284,8 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
     creatorName: String(row?.creatorName || '').trim(),
     creatorUrl: String(row?.creatorUrl || '').trim(),
     xhsId: String(row?.xhsId || '').trim(),
-    xhsProfileUrl: normalizeXhsProfileUrl(row?.xhsProfileUrl)
+    xhsProfileUrl: normalizeXhsProfileUrl(row?.xhsProfileUrl),
+    xhsProfileSourceCreatorUrl: normalizePgyCreatorUrl(row?.xhsProfileSourceCreatorUrl)
   })).filter((row) => {
     if (!row.rowId || seen.has(row.rowId)) return false;
     seen.add(row.rowId);
@@ -5816,6 +5769,11 @@ ipcMain.handle('tasks:stop', async () => {
 ipcMain.handle('tasks:skipCurrent', async () => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
   return await taskRunner.skipCurrent();
+});
+
+ipcMain.handle('tasks:clearQueue', async () => {
+  if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
+  return taskRunner.clearQueue();
 });
 
 ipcMain.handle('tasks:openRunDir', async () => {

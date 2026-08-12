@@ -62,6 +62,7 @@ assert.ok(jitteredDelayMs(1000, 500) >= 1000);
   const corruptCooldownDir = freshDir('xhs-pgy-task-runner-corrupt-cooldown');
   const writeFailureDir = freshDir('xhs-pgy-task-runner-write-failure');
   const loopFailureDir = freshDir('xhs-pgy-task-runner-loop-failure');
+  const clearQueueDir = freshDir('xhs-pgy-task-runner-clear-queue');
 
   const runner = new TaskRunner({
     getRunsDir: () => safetyDir,
@@ -132,6 +133,72 @@ assert.ok(jitteredDelayMs(1000, 500) >= 1000);
   });
   assert.strictEqual(persistedCooldown.ok, false);
   assert.strictEqual(persistedCooldown.code, 'PGY_RUN_COOLDOWN');
+
+  const clearEvents = [];
+  const clearRunner = new TaskRunner({
+    getRunsDir: () => clearQueueDir,
+    makeRunId: () => 'clear-queue-test',
+    sendState: (state) => clearEvents.push(state),
+    openUrl: async () => {},
+    getCurrentUrl: () => 'about:blank',
+    checkLogin: async () => ({ ok: true, loggedIn: true }),
+    extractCurrentMultiPage: async () => ({ ok: true })
+  });
+  const preservedRunDir = path.join(clearQueueDir, 'preserved-run');
+  const preservedTaskStatePath = path.join(preservedRunDir, TASK_STATE_FILE);
+  const preservedResultPath = path.join(preservedRunDir, 'raw_result.json');
+  fs.mkdirSync(preservedRunDir, { recursive: true });
+  fs.writeFileSync(preservedTaskStatePath, '{"preserved":true}', 'utf-8');
+  fs.writeFileSync(preservedResultPath, '{"rows":[{"id":"kept"}]}', 'utf-8');
+  clearRunner.state = {
+    ...clearRunner.state,
+    runId: 'preserved-run',
+    runDir: preservedRunDir,
+    signingTask: { taskName: '保留候选池来源' },
+    queue: [{ id: 't1', url: pgyUrl('clear-done'), status: 'ok' }],
+    currentId: null,
+    logs: [{ t: 1, ts: 'test', level: 'info', message: 'completed' }],
+    finishReason: 'completed',
+    finishedAt: Date.now()
+  };
+  const preservedTaskState = fs.readFileSync(preservedTaskStatePath, 'utf-8');
+  const preservedResult = fs.readFileSync(preservedResultPath, 'utf-8');
+  const cleared = clearRunner.clearQueue();
+  assert.strictEqual(cleared.ok, true);
+  assert.strictEqual(cleared.cleared, true);
+  assert.deepStrictEqual(clearRunner.state.queue, []);
+  assert.strictEqual(clearRunner.state.currentId, null);
+  assert.deepStrictEqual(clearRunner.state.logs, []);
+  assert.strictEqual(clearRunner.state.runId, '');
+  assert.strictEqual(clearRunner.state.runDir, '');
+  assert.strictEqual(clearRunner.state.signingTask, null);
+  assert.strictEqual(clearRunner.state.finishReason, '');
+  assert.strictEqual(clearRunner.state.finishedAt, null);
+  assert.strictEqual(clearEvents.at(-1).runDir, '');
+  assert.strictEqual(fs.readFileSync(preservedTaskStatePath, 'utf-8'), preservedTaskState);
+  assert.strictEqual(fs.readFileSync(preservedResultPath, 'utf-8'), preservedResult);
+
+  clearRunner.state.running = true;
+  clearRunner.state.queue = [{ id: 't2', url: pgyUrl('clear-running'), status: 'running' }];
+  const runningClear = clearRunner.clearQueue();
+  assert.strictEqual(runningClear.ok, false);
+  assert.strictEqual(runningClear.code, 'PGY_TASK_CLEAR_RUNNING');
+  assert.strictEqual(clearRunner.state.queue.length, 1);
+  clearRunner.state.running = false;
+  clearRunner.state.recoveryPending = true;
+  const recoveryClear = clearRunner.clearQueue();
+  assert.strictEqual(recoveryClear.ok, false);
+  assert.strictEqual(recoveryClear.code, 'PGY_TASK_CLEAR_RECOVERY_PENDING');
+
+  const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf-8');
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf-8');
+  const taskViewSource = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'views', 'tasks.js'), 'utf-8');
+  assert.match(preloadSource, /clearQueue:\s*\(\)\s*=>\s*ipcRenderer\.invoke\('tasks:clearQueue'\)/);
+  assert.match(mainSource, /ipcMain\.handle\('tasks:clearQueue'[\s\S]*?taskRunner\.clearQueue\(\)/);
+  assert.match(taskViewSource, /确定清空当前采集队列吗/);
+  assert.match(taskViewSource, /候选池不会被清空，磁盘中的 run 结果也不会被删除/);
+  assert.match(taskViewSource, /暂无本次采集队列。候选池仍会保留/);
+  assert.match(taskViewSource, /const queue = Array\.isArray\(state\.tasks\?\.queue\) \? state\.tasks\.queue : \[\]/);
 
   let optionsSeen = null;
   const optionsRunner = new TaskRunner({

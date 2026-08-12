@@ -163,3 +163,39 @@ Record the mistake, the correct practice, and the reusable impact. Do not includ
 - Pitfall: treating a successful global first-50 command as sufficient evidence that a direct rank 35-50 command uses the same global offsets and continuation boundary correctly.
 - Correct practice: run both commands independently on the installed app and verify page composition, the rank-40 manual checkpoint, enforced cooldown, latest-segment uniqueness, deduplicated total membership, and restoration to page 1.
 - Reusable impact: accept each natural-language range shape on its own control path; shared pagination code is supporting evidence, not end-to-end proof.
+
+## 2026-08-12: Similar-Looking Platform IDs Are Not A Shared Identity Namespace
+
+- Pitfall: the resolver assumed a PGY `blogger-detail` route ID could be copied into an XHS `user/profile` route and used as an equality check. Field evidence showed valid creator mappings with different IDs.
+- Correct practice: prove association from the scoped XHS entry on the verified current PGY detail page, persist the source creator URL, and validate that provenance on reuse. Never replace a false equality rule with no association check.
+- Reusable impact: cross-system identifiers need an explicit mapping contract; visual similarity and one successful sample are not a schema guarantee.
+
+## 2026-08-12: Test Generated JavaScript After Template-Literal Escaping
+
+- Pitfall: a correct-looking regex in Node source became `//blogger-detail//` after template-string evaluation, so the generated browser script silently treated it as a comment and returned no links.
+- Correct practice: compile or execute the final generated page script in tests and assert the emitted regex text, especially for slash and backslash-heavy selectors.
+- Reusable impact: source syntax validation cannot prove generated-code syntax or behavior.
+
+## 2026-08-12: A UI Bridge Is Incomplete Without Its Main-Process Handler
+
+- Pitfall: the queue-clear control and preload API existed, but the matching Electron IPC handler was absent, so the visible button would always fail at runtime.
+- Correct practice: test renderer action, preload bridge, IPC handler, runner state transition, and persistence boundary as one command path.
+- Reusable impact: Electron features cross multiple trust boundaries; partial wiring is not a feature.
+
+## 2026-08-12: A Fixed Export Filename Is Operator-Hostile When The Workbook Is Open
+
+- Pitfall: WPS/Excel locks the current workbook on Windows, so overwriting a fixed filename raised `EBUSY` and made a successful export look broken.
+- Correct practice: on lock-specific errors only, write an exclusive timestamped sibling file, preserve the open workbook, and tell the operator which file was created. Disk-full and other errors must still surface.
+- Reusable impact: desktop export flows must distinguish file locking from real write failures.
+
+## 2026-08-12: An External CDP Client Can Invalidate An Embedded-Browser Test
+
+- Pitfall: attaching Playwright CDP to the Electron instance while the app was using `webContents.debugger` for sanitized PGY response capture produced a false rank-zero failure. The same installed build completed ranks 18-22 when tested through ordinary Windows input with no external debugger.
+- Correct practice: do not attach a second debugger to a BrowserView whose production path depends on Electron's debugger session. Use normal UI input for end-to-end acceptance, and reserve CDP for isolated diagnostics that are explicitly labeled as potentially interfering.
+- Reusable impact: a test harness can change the runtime contract it is trying to measure; clean-control reproduction is required before classifying an instrumentation-only failure as a product bug.
+
+## 2026-08-12: Screenshot Coordinates Are Not Screen Coordinates
+
+- Pitfall: a Windows acceptance helper treated coordinates inside a captured window as global desktop coordinates after the app had opened on another display, so input was sent to the wrong window.
+- Correct practice: read the target window rectangle and translate every window-relative point to screen coordinates, or move the test window to a known origin before sending input. Confirm focus and the visible field value before executing a state-changing action.
+- Reusable impact: multi-monitor desktop automation must make its coordinate space explicit and visually verify the pending input before clicking the command.

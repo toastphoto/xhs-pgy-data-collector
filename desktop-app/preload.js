@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     resume: () => ipcRenderer.invoke('tasks:resume'),
     stop: () => ipcRenderer.invoke('tasks:stop'),
     skipCurrent: () => ipcRenderer.invoke('tasks:skipCurrent'),
+    clearQueue: () => ipcRenderer.invoke('tasks:clearQueue'),
     importExcel: () => ipcRenderer.invoke('tasks:importExcel'),
     exportCandidateSheet: (payload) => ipcRenderer.invoke('tasks:exportCandidateSheet', payload),
     openRunDir: () => ipcRenderer.invoke('tasks:openRunDir'),

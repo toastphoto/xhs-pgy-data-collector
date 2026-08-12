@@ -837,6 +837,58 @@ class TaskRunner {
     return { ok: true, pending: true, message: '将在下一个安全点停止整批任务' };
   }
 
+  clearQueue() {
+    if (this.state.running || this._loopPromise) {
+      return {
+        ok: false,
+        code: 'PGY_TASK_CLEAR_RUNNING',
+        error: '采集任务仍在运行或正在收尾，不能清空采集队列'
+      };
+    }
+    if (this.state.recoveryPending || this._recoveryPending) {
+      return {
+        ok: false,
+        code: 'PGY_TASK_CLEAR_RECOVERY_PENDING',
+        error: '当前任务仍待恢复处理，不能清空采集队列'
+      };
+    }
+
+    // Clear only the in-memory session reference. Leaving runDir blank before
+    // emitting prevents this reset from overwriting the completed run on disk.
+    this.state = {
+      ...this.state,
+      running: false,
+      paused: false,
+      pauseReason: '',
+      signingTask: null,
+      runId: '',
+      runDir: '',
+      queue: [],
+      currentId: null,
+      logs: [],
+      pausePending: false,
+      pauseRequestedAt: null,
+      stopPending: false,
+      stopRequestedAt: null,
+      stopReason: '',
+      finishReason: '',
+      finishedAt: null,
+      skipPending: false,
+      skipRequestedAt: null,
+      recoveryPending: false,
+      recoveredAt: null,
+      persistenceError: null
+    };
+    this._pauseGate = null;
+    this._pauseGateResolve = null;
+    this._skipRequested = false;
+    this._stopRequested = false;
+    this._recoveryPending = false;
+    this._controlWaiters.clear();
+    this._emitState();
+    return { ok: true, cleared: true };
+  }
+
   _wakeControlWaiters(action) {
     for (const resolve of Array.from(this._controlWaiters)) resolve(action);
   }

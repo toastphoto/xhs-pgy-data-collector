@@ -114,6 +114,34 @@ function timestampForFilename(date = new Date()) {
   ].join('');
 }
 
+function isResourceLockError(error) {
+  const code = cleanStr(error?.code).toUpperCase();
+  if (['EBUSY', 'EPERM', 'EACCES'].includes(code)) return true;
+
+  const message = cleanStr(error?.message);
+  return /resource busy or locked|resource (?:is )?locked|file (?:is )?locked|(?:being )?used by another process/i.test(message);
+}
+
+function writeWorkbookToUnusedSibling(wb, requestedOutPath, timestamp) {
+  const parsed = path.parse(requestedOutPath);
+  const safeTimestamp = cleanStr(timestamp).replace(/[\\/:*?"<>|]+/g, '_') || timestampForFilename();
+  const workbookBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+
+  for (let collision = 0; collision < 1000; collision += 1) {
+    const collisionSuffix = collision ? `_${collision + 1}` : '';
+    const candidate = path.join(parsed.dir, `${parsed.name}_${safeTimestamp}${collisionSuffix}${parsed.ext}`);
+    try {
+      fs.writeFileSync(candidate, workbookBuffer, { flag: 'wx' });
+      return candidate;
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+
+  throw new Error(`无法为被占用的建联表生成不冲突的另存文件名：${requestedOutPath}`);
+}
+
 function normalizeUrl(value) {
   const s = cleanStr(value);
   if (!s) return '';
@@ -234,6 +262,7 @@ function normalizeReviewMap(reviewRows) {
       wechatId: cleanStr(row?.wechatId),
       phone: cleanStr(row?.phone),
       xhsProfileUrl: cleanStr(row?.xhsProfileUrl),
+      xhsProfileSourceCreatorUrl: cleanStr(row?.xhsProfileSourceCreatorUrl),
       contactSource: cleanStr(row?.contactSource),
       contactCollectedAt: cleanStr(row?.contactCollectedAt),
       contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
@@ -346,6 +375,7 @@ function buildContactPreviewRows(runDir, options = {}) {
       wechatId: review.wechatId || '',
       phone: review.phone || '',
       xhsProfileUrl: review.xhsProfileUrl || xhsProfileUrl,
+      xhsProfileSourceCreatorUrl: review.xhsProfileSourceCreatorUrl || '',
       contactSource: review.contactSource || '',
       contactCollectedAt: review.contactCollectedAt || '',
       contactCollectionStatus: review.contactCollectionStatus || '',
@@ -642,7 +672,8 @@ function sheetFromRows(rows, columns) {
 function exportContactWorkbook(runDir, options = {}) {
   const rows = buildContactRowsFromRun(runDir, options);
   return writeContactWorkbook(runDir, rows, {
-    outName: `建联表_${path.basename(runDir)}.xlsx`
+    outName: `建联表_${path.basename(runDir)}.xlsx`,
+    fallbackTimestamp: options.fallbackTimestamp
   });
 }
 
@@ -657,10 +688,21 @@ function writeContactWorkbook(runDir, rows, options = {}) {
   XLSX.utils.book_append_sheet(wb, sheetFromRows(pendingContactRows, PENDING_CONTACT_COLUMNS), '待补联系方式');
 
   const outName = cleanStr(options.outName) || `建联表_${path.basename(runDir)}.xlsx`;
-  const outPath = path.join(runDir, outName);
-  XLSX.writeFile(wb, outPath);
+  const requestedOutPath = path.join(runDir, outName);
+  let outPath = requestedOutPath;
+  let saveFallbackCode = '';
+  try {
+    XLSX.writeFile(wb, requestedOutPath);
+  } catch (error) {
+    if (!isResourceLockError(error)) throw error;
+    outPath = writeWorkbookToUnusedSibling(wb, requestedOutPath, options.fallbackTimestamp);
+    saveFallbackCode = cleanStr(error?.code).toUpperCase() || 'RESOURCE_LOCKED';
+  }
   return {
     outPath,
+    requestedOutPath,
+    savedAs: outPath !== requestedOutPath,
+    saveFallbackCode,
     creators: contactRows.length,
     pgyInviteRows: pgyInviteRows.length,
     emailContactRows: emailContactRows.length,

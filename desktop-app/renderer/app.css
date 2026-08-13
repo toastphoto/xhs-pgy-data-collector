@@ -1576,6 +1576,52 @@ body {
 .candidate-list {
   display: grid;
   gap: 10px;
+  max-height: min(64vh, 720px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 8px;
+  scrollbar-gutter: stable;
+  scrollbar-color: #64748b #eef2f7;
+}
+.candidate-list:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, 0.45);
+  outline-offset: 3px;
+}
+.candidate-list::-webkit-scrollbar {
+  width: 16px;
+}
+.candidate-list::-webkit-scrollbar-track {
+  border-radius: 8px;
+  background: #eef2f7;
+}
+.candidate-list::-webkit-scrollbar-thumb {
+  min-height: 52px;
+  border: 3px solid #eef2f7;
+  border-radius: 8px;
+  background: #64748b;
+}
+.candidate-list::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+.candidate-list-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 8px;
+}
+.candidate-list-nav-label {
+  flex: 1;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.candidate-list-jump {
+  width: 34px;
+  min-width: 34px;
+  height: 32px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
 }
 .candidate-card {
   display: grid;

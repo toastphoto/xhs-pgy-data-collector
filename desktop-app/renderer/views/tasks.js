@@ -46,6 +46,8 @@ let _candidateDirty = false;
 let _taskSetupOpen = false;
 let _searchAdvancedOpen = false;
 let _candidateBulkOpen = false;
+let _candidateListScrollTop = 0;
+let _candidateListViewportKey = '';
 
 function persistCandidateDraft() {
   try {
@@ -1594,6 +1596,11 @@ export function renderTasks(state) {
     candidateTitle.className = 'section-label compact';
     const filteredDraftUrls = getFilteredDraftUrls();
     const decisionStats = candidateDecisionStats();
+    const candidateViewportKey = `${_candidateStatusFilter}\u0000${String(_candidateQuery || '').trim().toLowerCase()}`;
+    if (_candidateListViewportKey !== candidateViewportKey) {
+      _candidateListViewportKey = candidateViewportKey;
+      _candidateListScrollTop = 0;
+    }
     candidateTitle.textContent = `候选达人队列（${filteredDraftUrls.length}/${_draftUrls.length}） · 优先 ${decisionStats.selected} / 排除 ${decisionStats.excluded}`;
 
     const candidateFilters = document.createElement('div');
@@ -1658,6 +1665,8 @@ export function renderTasks(state) {
       _collectionScope = 'active';
       _candidateQuery = '';
       _candidateStatusFilter = 'all';
+      _candidateListScrollTop = 0;
+      _candidateListViewportKey = '';
       _importPreview = null;
       _lastSearchSnapshot = null;
       _candidateInstructionStatus = '候选列表已清空，可以开始新一轮筛选。';
@@ -1779,6 +1788,8 @@ export function renderTasks(state) {
 
     const candidateList = document.createElement('div');
     candidateList.className = 'candidate-list';
+    candidateList.tabIndex = 0;
+    candidateList.setAttribute('aria-label', `候选达人列表，共 ${filteredDraftUrls.length} 人`);
     if (!filteredDraftUrls.length) {
       const empty = document.createElement('div');
       empty.className = 'contact-review-empty';
@@ -1937,7 +1948,54 @@ export function renderTasks(state) {
         candidateList.appendChild(card);
       });
     }
+    const candidateListNav = document.createElement('div');
+    candidateListNav.className = 'candidate-list-nav';
+    const candidateListNavLabel = document.createElement('span');
+    candidateListNavLabel.className = 'candidate-list-nav-label';
+    candidateListNavLabel.textContent = `当前显示 ${filteredDraftUrls.length} 位`;
+
+    const jumpToTop = document.createElement('button');
+    jumpToTop.className = 'btn ghost candidate-list-jump';
+    jumpToTop.type = 'button';
+    jumpToTop.title = '跳到候选列表顶部';
+    jumpToTop.setAttribute('aria-label', '跳到候选列表顶部');
+    jumpToTop.textContent = '↑';
+
+    const jumpToBottom = document.createElement('button');
+    jumpToBottom.className = 'btn ghost candidate-list-jump';
+    jumpToBottom.type = 'button';
+    jumpToBottom.title = '跳到候选列表底部';
+    jumpToBottom.setAttribute('aria-label', '跳到候选列表底部');
+    jumpToBottom.textContent = '↓';
+
+    const updateCandidateListNav = () => {
+      const maxScrollTop = Math.max(0, candidateList.scrollHeight - candidateList.clientHeight);
+      jumpToTop.disabled = candidateList.scrollTop <= 1;
+      jumpToBottom.disabled = candidateList.scrollTop >= maxScrollTop - 1;
+    };
+    jumpToTop.addEventListener('click', () => {
+      candidateList.scrollTo({ top: 0, behavior: 'auto' });
+      candidateList.focus({ preventScroll: true });
+    });
+    jumpToBottom.addEventListener('click', () => {
+      candidateList.scrollTo({ top: candidateList.scrollHeight, behavior: 'auto' });
+      candidateList.focus({ preventScroll: true });
+    });
+    candidateList.addEventListener('scroll', () => {
+      _candidateListScrollTop = candidateList.scrollTop;
+      updateCandidateListNav();
+    }, { passive: true });
+
+    candidateListNav.appendChild(candidateListNavLabel);
+    candidateListNav.appendChild(jumpToTop);
+    candidateListNav.appendChild(jumpToBottom);
+    candidatePanel.appendChild(candidateListNav);
     candidatePanel.appendChild(candidateList);
+    window.requestAnimationFrame(() => {
+      const maxScrollTop = Math.max(0, candidateList.scrollHeight - candidateList.clientHeight);
+      candidateList.scrollTop = Math.min(_candidateListScrollTop, maxScrollTop);
+      updateCandidateListNav();
+    });
     root.appendChild(candidatePanel);
   }
 

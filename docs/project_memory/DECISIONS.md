@@ -548,3 +548,10 @@ Update on 2026-08-12: exact navigation-context equality was too strict after a v
 - Why: A return button cannot preserve a search result's exact filter, page, and scroll state after the same BrowserView has navigated through creator details. This was a responsibility conflict, not a history-navigation bug.
 - Impact: Both views share the authenticated `persist:pgy_default` session but keep independent page history and scroll. Registered BrowserViews stay attached at full bounds and tab activation changes z-order rather than detaching inactive views, so background capture and DOM work continue. Operators may switch back to the search page during a task; the automatic page remains input-locked while running and becomes available for manual intervention when paused.
 - Reevaluate when: Electron BrowserView is replaced, the platform provides a stable official API/export, or concurrent same-session pages cause verified platform behavior problems. The manual search workspace must never again be used as the main task runner's navigation target.
+
+## 2026-08-13: Give The Candidate Queue Its Own Scroll Viewport
+
+- Decision: cap the visible candidate queue height and make that queue the scroll owner. Expose a wide native scrollbar, top/bottom icon controls, keyboard focus, and same-filter scroll-position restoration.
+- Why: an unbounded 100-plus-card queue forced operators to wheel through the entire task page and made the browser-style drag handle hard to find. Faster wheel scrolling does not solve direct positioning.
+- Impact: operators can drag directly to any depth without moving the surrounding workflow; candidate edits and status rerenders retain the current queue position. Search/status filter changes intentionally reset the queue to the top because they create a different result set.
+- Reevaluate when: candidate counts grow enough to require virtualization. Any virtualized replacement must preserve direct drag positioning, stable rank identity, keyboard access, and rerender restoration.

@@ -238,3 +238,9 @@ Record the mistake, the correct practice, and the reusable impact. Do not includ
 - Pitfall: `BrowserWindow.setBrowserView(activeView)` removes the previous BrowserView. Its webContents may still navigate, but a hidden task stalled during extraction/evidence capture until the automatic view was selected again.
 - Correct approach: Keep all registered BrowserViews attached at the same bounds and use `setTopBrowserView` to select the visible tab. This preserves full-size background rendering and capture while the operator works in the search page above it.
 - Guardrail: A live isolation test must switch to `采集页` while one creator is in `抽取中` and prove the task finishes without bringing `自动采集` back to the front.
+
+## 2026-08-13: A Long List Needs A Local Scroll Owner
+
+- Pitfall: rendering more than 100 candidate cards into the task page's outer scroller made direct navigation effectively unavailable; operators had to repeat wheel gestures and state rerenders could disorient them.
+- Correct approach: constrain the list itself, expose a visible draggable native scrollbar plus top/bottom controls, and restore the list scroll position for the same filter key.
+- Guardrail: test with at least 100 rows, verify one-action bottom navigation, then trigger a real rerender and assert that the scroll position remains unchanged.

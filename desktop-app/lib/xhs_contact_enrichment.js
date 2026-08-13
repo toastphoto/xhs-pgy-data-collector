@@ -120,6 +120,18 @@ function detectXhsRisk(urlValue, textValue) {
   };
 }
 
+function isXhsWebUrl(value) {
+  const text = cleanStr(value);
+  if (!text) return false;
+  try {
+    const url = new URL(text);
+    return /^https?:$/i.test(url.protocol)
+      && XHS_PROFILE_HOSTS.includes(url.hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
 function extractPgyCreatorEntityId(value) {
   const text = cleanStr(value);
   if (!text) return '';
@@ -473,6 +485,7 @@ module.exports = {
   extractVisibleMailtoEmails,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
+  isXhsWebUrl,
   isXhsProfileSnapshotStable,
   mergeContactFields,
   normalizeEmailText,

@@ -1,4 +1,5 @@
 const COLLECTION_TAB_ID = 'collection';
+const AUTOMATION_TAB_ID = 'automation';
 const MAIL_TAB_ID = 'mail';
 const XHS_TAB_ID = 'xhs-profile';
 
@@ -73,6 +74,7 @@ class BrowserTabRegistry {
 module.exports = {
   BrowserTabRegistry,
   COLLECTION_TAB_ID,
+  AUTOMATION_TAB_ID,
   MAIL_TAB_ID,
   XHS_TAB_ID
 };

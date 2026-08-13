@@ -405,8 +405,11 @@ function handleCandidateSearchResult(command, result) {
       stopCandidateCheckpointTimer();
       _candidateCheckpoint = null;
     }
-    _candidateInstructionStatus = result?.error || '读取失败';
-    alert(`读取失败：${result?.error || 'unknown error'}`);
+    const errorCode = String(result?.code || '').trim();
+    _candidateInstructionStatus = [errorCode ? `[${errorCode}]` : '', result?.error || '读取失败']
+      .filter(Boolean)
+      .join(' ');
+    alert(`读取失败：${_candidateInstructionStatus}`);
     return false;
   }
   if (result.paused && result.checkpoint) {

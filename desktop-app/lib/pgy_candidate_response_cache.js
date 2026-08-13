@@ -182,6 +182,19 @@ function normalizeSourceContext(value) {
   return context ? context.slice(0, 160) : null;
 }
 
+function sourceContextOwner(value) {
+  const context = normalizeSourceContext(value);
+  if (!context) return null;
+  const match = context.match(/^web-contents:(\d+):navigation:/i);
+  return match ? `web-contents:${match[1]}` : context;
+}
+
+function sameSourceOwner(left, right) {
+  const leftOwner = sourceContextOwner(left);
+  const rightOwner = sourceContextOwner(right);
+  return Boolean(leftOwner && rightOwner && leftOwner === rightOwner);
+}
+
 function extractPageNumberFromPayload(payload, options = {}) {
   const maxDepth = Math.max(1, Number(options.maxDepth || 6));
   const seen = new Set();
@@ -512,6 +525,174 @@ class PgyCandidateResponseCache {
       requestScope: passive.requestScope,
       sequence
     };
+  }
+
+  promoteVerifiedSnapshot(commandWindow, options = {}) {
+    const windowState = commandWindow ? this.commandWindows.get(commandWindow) : null;
+    if (!windowState?.requestScope) {
+      return { promoted: 0, code: 'PGY_RESPONSE_COMMAND_WINDOW_INVALID' };
+    }
+    const sourceContext = normalizeSourceContext(options.sourceContext) || windowState.sourceContext;
+    if (!sourceContext || sourceContext !== windowState.sourceContext) {
+      return { promoted: 0, code: 'PGY_RESPONSE_SOURCE_CONTEXT_MISMATCH' };
+    }
+    const pageNumber = normalizePageNumber(options.pageNumber);
+    const sequence = Number(options.sequence || 0);
+    const fingerprint = String(options.fingerprint || '');
+    if (!pageNumber || !Number.isFinite(sequence) || sequence < 1 || !fingerprint) {
+      return { promoted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_INVALID' };
+    }
+
+    const entry = this.entries.find((candidate) => (
+      candidate.commandWindow === commandWindow
+      && candidate.requestScope === windowState.requestScope
+      && candidate.sourceContext === sourceContext
+      && candidate.sequence === sequence
+    ));
+    if (!entry) return { promoted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING' };
+    const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
+      ? entry.alternatives
+      : [{
+          rows: entry.rows,
+          path: entry.path,
+          pageNumber: entry.pageNumber,
+          fingerprint: entry.fingerprint
+        }];
+    const selected = alternatives.find((alternative) => (
+      String(alternative.fingerprint || candidatePageFingerprint(alternative.rows)) === fingerprint
+      && (!alternative.pageNumber || Number(alternative.pageNumber) === pageNumber)
+    ));
+    if (!selected?.rows?.length) {
+      return { promoted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH' };
+    }
+
+    const capturedAtValue = Number(options.capturedAt);
+    const capturedAt = Number.isFinite(capturedAtValue) ? capturedAtValue : Date.now();
+    const promotedSequence = ++this.captureSequence;
+    const passiveAlternative = {
+      rows: selected.rows,
+      path: selected.path,
+      pageNumber,
+      fingerprint
+    };
+    this.entries.unshift({
+      capturedAt,
+      sequence: promotedSequence,
+      rows: selected.rows,
+      path: selected.path,
+      pageNumber,
+      fingerprint,
+      alternatives: [passiveAlternative],
+      requestScope: entry.requestScope,
+      commandWindow: null,
+      sourceContext,
+      promotedFromSequence: entry.sequence
+    });
+    this.entries = this.entries.slice(0, this.maxEntries);
+    return { promoted: selected.rows.length, pageNumber, fingerprint, sequence: promotedSequence };
+  }
+
+  recentCandidates(limit, query = {}) {
+    const sourceContext = normalizeSourceContext(query.sourceContext);
+    if (!sourceContext) return [];
+    const nowValue = Number(query.now);
+    const now = Number.isFinite(nowValue) ? nowValue : Date.now();
+    const requestedMaxAgeMs = Number(query.maxAgeMs);
+    const maxAgeMs = Number.isFinite(requestedMaxAgeMs)
+      ? Math.max(1000, Math.min(this.maxAgeMs, requestedMaxAgeMs))
+      : this.maxAgeMs;
+    const requested = Math.max(1, Number(limit || 50));
+    this.entries = this.entries.filter((entry) => {
+      const age = now - entry.capturedAt;
+      return age >= 0 && age <= this.maxAgeMs;
+    });
+    const snapshots = [];
+    const seen = new Set();
+    for (const entry of this.entries) {
+      if (!sameSourceOwner(entry.sourceContext, sourceContext)) continue;
+      if (now - entry.capturedAt > maxAgeMs) continue;
+      const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
+        ? entry.alternatives
+        : [{
+            rows: entry.rows,
+            path: entry.path,
+            pageNumber: entry.pageNumber,
+            fingerprint: entry.fingerprint
+          }];
+      for (const alternative of alternatives) {
+        const fingerprint = String(alternative.fingerprint || candidatePageFingerprint(alternative.rows));
+        if (!fingerprint || seen.has(fingerprint)) continue;
+        seen.add(fingerprint);
+        snapshots.push({
+          sequence: entry.sequence,
+          capturedAt: entry.capturedAt,
+          sourceContext: entry.sourceContext,
+          requestScope: entry.requestScope,
+          pageNumber: alternative.pageNumber,
+          fingerprint,
+          items: alternative.rows.slice(0, requested)
+        });
+        if (snapshots.length >= 30) return snapshots;
+      }
+    }
+    return snapshots;
+  }
+
+  adoptVerifiedSnapshot(commandWindow, options = {}) {
+    const windowState = commandWindow ? this.commandWindows.get(commandWindow) : null;
+    if (!windowState) return { adopted: 0, code: 'PGY_RESPONSE_COMMAND_WINDOW_INVALID' };
+    const sourceContext = normalizeSourceContext(options.sourceContext) || windowState.sourceContext;
+    if (!sourceContext || windowState.sourceContext !== sourceContext) {
+      return { adopted: 0, code: 'PGY_RESPONSE_SOURCE_CONTEXT_MISMATCH' };
+    }
+    const pageNumber = normalizePageNumber(options.pageNumber);
+    const sequence = Number(options.sequence || 0);
+    const fingerprint = String(options.fingerprint || '');
+    if (!pageNumber || !Number.isFinite(sequence) || sequence < 1 || !fingerprint) {
+      return { adopted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_INVALID' };
+    }
+    const entry = this.entries.find((candidate) => (
+      candidate.sequence === sequence
+      && sameSourceOwner(candidate.sourceContext, sourceContext)
+    ));
+    if (!entry) return { adopted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING' };
+    if (windowState.requestScope && windowState.requestScope !== entry.requestScope) {
+      return { adopted: 0, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
+    }
+    const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
+      ? entry.alternatives
+      : [{
+          rows: entry.rows,
+          path: entry.path,
+          pageNumber: entry.pageNumber,
+          fingerprint: entry.fingerprint
+        }];
+    const selected = alternatives.find((alternative) => (
+      String(alternative.fingerprint || candidatePageFingerprint(alternative.rows)) === fingerprint
+      && (!alternative.pageNumber || Number(alternative.pageNumber) === pageNumber)
+    ));
+    if (!selected?.rows?.length) {
+      return { adopted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH' };
+    }
+    windowState.requestScope = entry.requestScope;
+    const capturedAtValue = Number(options.capturedAt);
+    const capturedAt = Number.isFinite(capturedAtValue) ? capturedAtValue : Date.now();
+    const adoptedSequence = ++this.captureSequence;
+    this.entries.unshift({
+      capturedAt,
+      sequence: adoptedSequence,
+      rows: selected.rows,
+      path: selected.path,
+      pageNumber,
+      fingerprint,
+      alternatives: [{ ...selected, pageNumber, fingerprint }],
+      requestScope: entry.requestScope,
+      commandWindow,
+      sourceContext,
+      adoptedFromSequence: entry.sequence
+    });
+    this.entries = this.entries.slice(0, this.maxEntries);
+    return { adopted: selected.rows.length, pageNumber, fingerprint, sequence: adoptedSequence };
   }
 
   latest(limit, query = {}) {

@@ -199,3 +199,42 @@ Record the mistake, the correct practice, and the reusable impact. Do not includ
 - Pitfall: a Windows acceptance helper treated coordinates inside a captured window as global desktop coordinates after the app had opened on another display, so input was sent to the wrong window.
 - Correct practice: read the target window rectangle and translate every window-relative point to screen coordinates, or move the test window to a known origin before sending input. Confirm focus and the visible field value before executing a state-changing action.
 - Reusable impact: multi-monitor desktop automation must make its coordinate space explicit and visually verify the pending input before clicking the command.
+
+## 2026-08-12: One Successful Read Does Not Prove Repeatability
+
+- Pitfall: a clean rank 18-22 run was used to attribute an earlier failure mainly to external CDP interference. The next normal rank 1-5 request failed because the successful command's verified page snapshot became inaccessible when its command window closed.
+- Correct practice: repeat the same workflow without refreshing, then vary only one boundary at a time. Preserve a completed snapshot across commands only after rechecking visible page number, full ordered names, response fingerprint, and navigation context.
+- Reusable impact: acceptance matrices must test first use, immediate repeat, same-page range, and cross-page range; one positive path is evidence of capability, not stability.
+
+## 2026-08-12: Same-Page Repeat Does Not Prove Post-Pagination Repeat
+
+- Pitfall: preserving a verified snapshot at command completion fixed an immediate 1-5 repeat after an 18-22 read, but the next 21-25 command still failed because page-turn restoration had advanced the BrowserView navigation epoch.
+- Correct practice: at the start of a new command, collect recent sanitized snapshots only from the same BrowserView owner, then require current page number and full ordered names to reauthorize the exact fingerprint before adoption. Do not use exact navigation epoch as the only lifetime rule.
+- Reusable impact: browser automation acceptance must include a sequence that turns a page, restores, reads the same page, and turns again; isolated same-page and one-time cross-page tests miss lifecycle defects.
+
+## 2026-08-12: A Blank Contact Tab Is Not A Logged-Out Session
+
+- Pitfall: I treated the UI's waiting-for-login state after checking `about:blank` as evidence that the user's XHS login had expired. Opening XHS in the same dedicated partition immediately showed the authenticated feed.
+- Correct practice: record the inspected tab and URL before classifying authentication. If the dedicated tab is blank or on another host, open the XHS check page first; then evaluate visible login, risk, and account evidence.
+- Reusable impact: session claims require evidence from the relevant origin. An empty or unrelated page is an invalid observation, not a negative login result.
+## 2026-08-12: A Return Button Does Not Preserve Search State
+
+- Pitfall: Treating the original PGY search page as both the operator's workspace and the automatic task browser caused creator-detail navigation to destroy the filter, page, and scroll context. History-based return was only a fragile recovery path.
+- Correct approach: Give manual search and automatic execution separate BrowserViews. Share only the authenticated session partition; isolate navigation history, scroll position, and input-lock policy.
+- Guardrail: Main task dependencies (`openUrl`, `getCurrentUrl`, login check, and extraction) must all target the automatic BrowserView. Add a source contract test so a future refactor cannot silently bind any one of them back to `采集页`.
+
+## 2026-08-12: Do Not Put Extraction-Visible Status Text Into The Task Page
+
+- Pitfall: A DOM overlay with visible status text can leak into broad `innerText` or selector-based extraction and contaminate collected fields.
+- Correct approach: Keep the task-page input shield text-free and report task state in the desktop application's own top bar. Programmatic extraction can continue while human pointer input is blocked.
+- Guardrail: Treat injected DOM as part of the scraped page surface. Any automation-only marker must avoid user data selectors and page text extraction.
+## 2026-08-13: Never Package Previous Build Outputs Into The App
+
+- Pitfall: Building to a versioned output directory disabled electron-builder's implicit exclusion of the normal `dist` directory. Historical installers under `desktop-app/dist` were recursively packed into `app.asar`, inflating a roughly 109 MB installer to 761 MB.
+- Correct approach: Explicitly exclude `dist`, `dist-*`, tests, and build-only scripts in `build.files`; do not rely on the current output directory being excluded implicitly.
+- Guardrail: Before accepting a Windows artifact, inspect installer size and ASAR top-level entries. Reject any package containing `dist`, tests, or prior installers even if installation succeeds.
+## 2026-08-13: A Detached BrowserView Is Not A Working Background Tab
+
+- Pitfall: `BrowserWindow.setBrowserView(activeView)` removes the previous BrowserView. Its webContents may still navigate, but a hidden task stalled during extraction/evidence capture until the automatic view was selected again.
+- Correct approach: Keep all registered BrowserViews attached at the same bounds and use `setTopBrowserView` to select the visible tab. This preserves full-size background rendering and capture while the operator works in the search page above it.
+- Guardrail: A live isolation test must switch to `采集页` while one creator is in `抽取中` and prove the task finishes without bringing `自动采集` back to the front.

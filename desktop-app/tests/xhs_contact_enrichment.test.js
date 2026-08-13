@@ -11,6 +11,7 @@ const {
   extractXhsProfileEntityId,
   extractVisibleMailtoEmails,
   firstProfileUrl,
+  isXhsWebUrl,
   isXhsProfileSnapshotStable,
   isIgnorableXhsNavigationError,
   mergeContactFields,
@@ -44,6 +45,10 @@ assert.strictEqual(
   'https://www.xiaohongshu.com/user/profile/abc123'
 );
 assert.strictEqual(normalizeXhsProfileUrl('https://pgy.xiaohongshu.com/user/profile/abc123'), '');
+assert.strictEqual(isXhsWebUrl('https://www.xiaohongshu.com/explore'), true);
+assert.strictEqual(isXhsWebUrl('https://xiaohongshu.com/login'), true);
+assert.strictEqual(isXhsWebUrl('about:blank'), false);
+assert.strictEqual(isXhsWebUrl('https://pgy.xiaohongshu.com/solar/pre-trade/note/kol'), false);
 assert.strictEqual(firstProfileUrl(['', '/relative', 'xiaohongshu.com/user/profile/user_1']), 'https://www.xiaohongshu.com/user/profile/user_1');
 assert.strictEqual(
   extractPgyCreatorEntityId('https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123?source=list'),

@@ -133,6 +133,96 @@ assert.deepStrictEqual(
   passiveCache.latest(2, { now: 2100, commandWindow: seededWindow }).items.map((row) => row.creator_name),
   ['达人A', '达人B']
 );
+const promoted = passiveCache.promoteVerifiedSnapshot(seededWindow, {
+  now: 2150,
+  capturedAt: 2150,
+  sourceContext: passiveContext,
+  pageNumber: 1,
+  sequence: seeded.sequence,
+  fingerprint: seeded.fingerprint
+});
+assert.strictEqual(promoted.promoted, 2);
+assert.strictEqual(passiveCache.endCommandWindow(seededWindow), true);
+const repeatedWindow = passiveCache.beginCommandWindow({
+  startedAt: 2200,
+  maxAgeMs: 5000,
+  sourceContext: passiveContext
+});
+const repeatedSeed = passiveCache.seedCommandWindow(repeatedWindow, {
+  now: 2200,
+  sourceContext: passiveContext,
+  expectedPage: 1
+});
+assert.strictEqual(repeatedSeed.seeded, 2);
+assert.deepStrictEqual(
+  passiveCache.latest(2, { now: 2250, commandWindow: repeatedWindow }).items.map((row) => row.creator_name),
+  ['达人A', '达人B']
+);
+assert.strictEqual(passiveCache.promoteVerifiedSnapshot(repeatedWindow, {
+  capturedAt: 2260,
+  sourceContext: passiveContext,
+  pageNumber: 2,
+  sequence: repeatedSeed.sequence,
+  fingerprint: repeatedSeed.fingerprint
+}).code, 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH');
+const pageUnknownCache = new PgyCandidateResponseCache({ maxAgeMs: 5000 });
+const pageUnknownWindow = pageUnknownCache.beginCommandWindow({
+  startedAt: 3000,
+  sourceContext: passiveContext
+});
+const pageUnknownCapture = pageUnknownCache.capture(payload, {
+  capturedAt: 3100,
+  requestUrl: 'https://pgy.xiaohongshu.com/api/creator/list',
+  commandWindow: pageUnknownWindow,
+  sourceContext: passiveContext
+});
+assert.strictEqual(pageUnknownCapture.pageNumber, null);
+assert.strictEqual(pageUnknownCache.promoteVerifiedSnapshot(pageUnknownWindow, {
+  capturedAt: 3200,
+  sourceContext: passiveContext,
+  pageNumber: 1,
+  sequence: pageUnknownCapture.sequence,
+  fingerprint: pageUnknownCapture.fingerprint
+}).promoted, 2);
+pageUnknownCache.endCommandWindow(pageUnknownWindow);
+const navigatedContext = 'web-contents:7:navigation:4';
+const adoptedWindow = pageUnknownCache.beginCommandWindow({
+  startedAt: 3300,
+  sourceContext: navigatedContext
+});
+const recentAcrossNavigation = pageUnknownCache.recentCandidates(10, {
+  now: 3300,
+  sourceContext: navigatedContext
+});
+assert.ok(recentAcrossNavigation.some((snapshot) => snapshot.fingerprint === pageUnknownCapture.fingerprint));
+const adopted = pageUnknownCache.adoptVerifiedSnapshot(adoptedWindow, {
+  capturedAt: 3350,
+  sourceContext: navigatedContext,
+  pageNumber: 1,
+  sequence: recentAcrossNavigation[0].sequence,
+  fingerprint: recentAcrossNavigation[0].fingerprint
+});
+assert.strictEqual(adopted.adopted, 2);
+assert.strictEqual(pageUnknownCache.latest(10, {
+  now: 3400,
+  commandWindow: adoptedWindow,
+  expectedPage: 1
+}).items.length, 2);
+const otherWebContentsWindow = pageUnknownCache.beginCommandWindow({
+  startedAt: 3500,
+  sourceContext: 'web-contents:8:navigation:4'
+});
+assert.deepStrictEqual(pageUnknownCache.recentCandidates(10, {
+  now: 3500,
+  sourceContext: 'web-contents:8:navigation:4'
+}), []);
+assert.strictEqual(pageUnknownCache.adoptVerifiedSnapshot(otherWebContentsWindow, {
+  capturedAt: 3550,
+  sourceContext: 'web-contents:8:navigation:4',
+  pageNumber: 1,
+  sequence: recentAcrossNavigation[0].sequence,
+  fingerprint: recentAcrossNavigation[0].fingerprint
+}).code, 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING');
 assert.ok(!JSON.stringify(passiveCache.entries).includes('do-not-store'));
 const alternativeCache = new PgyCandidateResponseCache({ maxAgeMs: 5000 });
 const alternativePayload = {

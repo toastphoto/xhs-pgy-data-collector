@@ -39,6 +39,7 @@ const {
   contactFieldCount,
   firstProfileUrl,
   isIgnorableXhsNavigationError,
+  isXhsWebUrl,
   normalizePgyCreatorUrl,
   normalizeXhsProfileUrl,
   parsePublicContactSnapshot,
@@ -82,6 +83,7 @@ const {
 const {
   BrowserTabRegistry,
   COLLECTION_TAB_ID,
+  AUTOMATION_TAB_ID,
   MAIL_TAB_ID,
   XHS_TAB_ID
 } = require('./lib/browser_tab_registry');
@@ -92,10 +94,12 @@ if (!hasSingleInstanceLock) app.quit();
 
 let mainWindow = null;
 let browserView = null;
+let taskBrowserView = null;
 let mailBrowserView = null;
 let xhsBrowserView = null;
 let applyBrowserBounds = () => {};
 let collectionInteractionLockState = '';
+let taskInteractionLockState = '';
 const browserTabRegistry = new BrowserTabRegistry();
 const browserTabViews = new Map();
 let backendProc = null;
@@ -181,6 +185,36 @@ function currentBrowserAutomationLock() {
   return '';
 }
 
+function browserTabNavigationLockReason(tabId) {
+  const safeId = String(tabId || '');
+  if (safeId === COLLECTION_TAB_ID) {
+    if (pgyCandidateReadRunning) return '正在读取蒲公英候选，请等待本次读取结束';
+    if (pgyCandidateCheckpointSession) return '候选读取正处于安全暂停，请继续或结束本次读取';
+    if (directPgyExtractionRunning) return '当前达人页面采集运行中';
+    if (recordingReplayRunning) return '蒲公英录制回放运行中';
+    if (recordingEnabled) return '蒲公英录制排查进行中';
+    return '';
+  }
+  if (safeId === AUTOMATION_TAB_ID && taskRunner?.state?.running && !taskRunner?.state?.paused) {
+    return '蒲公英自动采集任务运行中';
+  }
+  if (safeId === XHS_TAB_ID && xhsContactJob.running && !xhsContactJob.paused) {
+    return '小红书联系方式补采运行中';
+  }
+  return '';
+}
+
+function canSwitchBrowserTabDuringAutomation(tabId) {
+  const safeId = String(tabId || '');
+  if (taskRunner?.state?.running) {
+    return safeId === COLLECTION_TAB_ID || safeId === AUTOMATION_TAB_ID;
+  }
+  if (xhsContactJob.running) {
+    return safeId === COLLECTION_TAB_ID || safeId === XHS_TAB_ID;
+  }
+  return false;
+}
+
 function rejectBrowserAutomationStart(actionLabel, { allowTaskRunner = false } = {}) {
   const reason = currentBrowserAutomationLock();
   if (!reason) return null;
@@ -197,12 +231,10 @@ async function syncCollectionInteractionLock({ force = false } = {}) {
   const shouldBlock = Boolean(
     pgyCandidateReadRunning
     || pgyCandidateCheckpointSession
-    || (taskRunner?.state?.running && !taskRunner?.state?.paused)
-    || (xhsContactJob.running && !xhsContactJob.paused)
     || directPgyExtractionRunning
     || recordingReplayRunning
   );
-  const reason = currentBrowserAutomationLock();
+  const reason = browserTabNavigationLockReason(COLLECTION_TAB_ID);
   const nextState = shouldBlock ? reason : '';
   if (!force && collectionInteractionLockState === nextState) return;
   collectionInteractionLockState = nextState;
@@ -236,6 +268,41 @@ async function syncCollectionInteractionLock({ force = false } = {}) {
   } catch (_) {}
 }
 
+async function syncTaskInteractionLock({ force = false } = {}) {
+  if (!taskBrowserView || taskBrowserView.webContents.isDestroyed()) return;
+  const shouldBlock = Boolean(taskRunner?.state?.running && !taskRunner?.state?.paused);
+  const reason = browserTabNavigationLockReason(AUTOMATION_TAB_ID);
+  const nextState = shouldBlock ? reason : '';
+  if (!force && taskInteractionLockState === nextState) return;
+  taskInteractionLockState = nextState;
+  try {
+    await taskBrowserView.webContents.executeJavaScript(`
+      (() => {
+        const id = '__codex_task_interaction_lock__';
+        const existing = document.getElementById(id);
+        if (${JSON.stringify(shouldBlock)}) {
+          const lock = existing || document.createElement('div');
+          lock.id = id;
+          lock.setAttribute('role', 'status');
+          lock.style.cssText = [
+            'position:fixed',
+            'inset:0',
+            'z-index:2147483647',
+            'background:rgba(255,255,255,0.02)',
+            'cursor:wait',
+            'pointer-events:auto'
+          ].join(';');
+          lock.setAttribute('aria-label', ${JSON.stringify(reason || '自动采集运行中，暂停后可人工操作此页')});
+          if (!existing) (document.body || document.documentElement).appendChild(lock);
+        } else if (existing) {
+          existing.remove();
+        }
+        return true;
+      })()
+    `, true);
+  } catch (_) {}
+}
+
 function sendBrowserTabsSnapshot() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const tabs = browserTabRegistry.list().map((tab) => {
@@ -253,7 +320,17 @@ function sendBrowserTabsSnapshot() {
       canGoBack = Boolean(webContents?.canGoBack?.());
       canGoForward = Boolean(webContents?.canGoForward?.());
     } catch (_) {}
-    return { ...tab, url, title, loading, canGoBack, canGoForward };
+    const navigationLockReason = browserTabNavigationLockReason(tab.id);
+    return {
+      ...tab,
+      url,
+      title,
+      loading,
+      canGoBack,
+      canGoForward,
+      navigationLocked: Boolean(navigationLockReason),
+      navigationLockReason
+    };
   });
   mainWindow.webContents.send('browser:tabs', {
     activeTabId: browserTabRegistry.activeId,
@@ -262,6 +339,7 @@ function sendBrowserTabsSnapshot() {
     lockReason: currentBrowserAutomationLock()
   });
   syncCollectionInteractionLock().catch(() => {});
+  syncTaskInteractionLock().catch(() => {});
 }
 
 function sendActiveBrowserUrl() {
@@ -316,6 +394,7 @@ function configureBrowserTabView(view, tabId) {
   webContents.on('did-stop-loading', sendBrowserTabsSnapshot);
   webContents.on('did-finish-load', () => {
     if (tabId === COLLECTION_TAB_ID) syncCollectionInteractionLock({ force: true }).catch(() => {});
+    if (tabId === AUTOMATION_TAB_ID) syncTaskInteractionLock({ force: true }).catch(() => {});
   });
   webContents.on('page-title-updated', sendBrowserTabsSnapshot);
 }
@@ -326,13 +405,17 @@ function activateBrowserTab(tabId, { force = false } = {}) {
     return { ok: false, code: 'BROWSER_TAB_NOT_FOUND', error: '浏览器标签不存在' };
   }
   const lockReason = currentBrowserAutomationLock();
-  if (!force && lockReason && safeId !== browserTabRegistry.activeId) {
+  if (
+    !force
+    && lockReason
+    && safeId !== browserTabRegistry.activeId
+    && !canSwitchBrowserTabDuringAutomation(safeId)
+  ) {
     return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换标签` };
   }
   const view = browserTabViews.get(safeId);
   if (!view) return { ok: false, code: 'BROWSER_TAB_NOT_READY', error: '浏览器标签尚未就绪' };
   browserTabRegistry.activate(safeId);
-  mainWindow?.setBrowserView(view);
   applyBrowserBounds();
   sendActiveBrowserUrl();
   return { ok: true, activeTabId: safeId };
@@ -340,6 +423,30 @@ function activateBrowserTab(tabId, { force = false } = {}) {
 
 function ensureCollectionTabActive(options = {}) {
   return activateBrowserTab(COLLECTION_TAB_ID, { force: true, ...options });
+}
+
+function ensureTaskBrowserTab() {
+  if (taskBrowserView && !taskBrowserView.webContents.isDestroyed()) return taskBrowserView;
+  taskBrowserView = new BrowserView({
+    webPreferences: {
+      // Share authentication with the manual search workspace, but isolate
+      // navigation history and scroll position from it.
+      partition: 'persist:pgy_default',
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  browserTabRegistry.add({
+    id: AUTOMATION_TAB_ID,
+    role: 'automation',
+    title: '自动采集',
+    closable: false
+  });
+  browserTabViews.set(AUTOMATION_TAB_ID, taskBrowserView);
+  configureBrowserTabView(taskBrowserView, AUTOMATION_TAB_ID);
+  taskBrowserView.webContents.loadURL('about:blank');
+  sendBrowserTabsSnapshot();
+  return taskBrowserView;
 }
 
 function ensureMailBrowserTab() {
@@ -390,8 +497,8 @@ function ensureXhsBrowserTab() {
 
 function closeBrowserTab(tabId) {
   const safeId = String(tabId || '');
-  if (safeId === COLLECTION_TAB_ID) {
-    return { ok: false, code: 'BROWSER_TAB_PROTECTED', error: '采集标签固定绑定自动化，不能关闭' };
+  if (safeId === COLLECTION_TAB_ID || safeId === AUTOMATION_TAB_ID) {
+    return { ok: false, code: 'BROWSER_TAB_PROTECTED', error: '采集工作标签不能关闭' };
   }
   const lockReason = currentBrowserAutomationLock();
   if (lockReason) {
@@ -404,6 +511,9 @@ function closeBrowserTab(tabId) {
   try {
     browserTabRegistry.close(safeId);
     browserTabViews.delete(safeId);
+    try {
+      mainWindow?.removeBrowserView?.(view);
+    } catch (_) {}
     if (!view.webContents.isDestroyed()) view.webContents.destroy();
     if (safeId === MAIL_TAB_ID) mailBrowserView = null;
     if (safeId === XHS_TAB_ID) xhsBrowserView = null;
@@ -1121,6 +1231,27 @@ async function seedCandidateCommandFromVisiblePage(commandWindow, calibration = 
     if (result?.seeded) return result;
     await sleep(150);
   } while (Date.now() < deadline);
+  if (hasCompleteCandidateSearchCalibration(calibration) && expectedPage) {
+    const recent = pgyCandidateResponseCache.recentCandidates(MAX_CANDIDATE_COUNT, {
+      sourceContext: currentCandidateSourceContext()
+    });
+    for (const snapshot of recent) {
+      if (snapshot.pageNumber && Number(snapshot.pageNumber) !== Number(expectedPage)) continue;
+      const confirmation = await confirmCandidateSnapshotOnVisiblePage(
+        snapshot,
+        expectedPage,
+        calibration
+      );
+      if (!confirmation.ok) continue;
+      const adopted = pgyCandidateResponseCache.adoptVerifiedSnapshot(commandWindow, {
+        sourceContext: currentCandidateSourceContext(),
+        pageNumber: expectedPage,
+        sequence: snapshot.sequence,
+        fingerprint: snapshot.fingerprint
+      });
+      if (adopted?.adopted) return adopted;
+    }
+  }
   return result || { seeded: 0 };
 }
 
@@ -1282,7 +1413,60 @@ async function resolveCandidateSnapshotForVisiblePage({
   return null;
 }
 
-function closeCandidateCommandWindow(commandWindow = pgyCandidateCommandWindow) {
+async function preserveVisibleCandidateSnapshot(commandWindow, calibration = {}) {
+  if (!commandWindow || !browserView?.webContents) return { promoted: 0 };
+  if (!hasCompleteCandidateSearchCalibration(calibration)) {
+    return { promoted: 0, code: 'PGY_CANDIDATE_CALIBRATION_REQUIRED' };
+  }
+  let pagination = null;
+  try {
+    pagination = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('inspect', 1, calibration),
+      true
+    );
+  } catch (_) {}
+  const pageNumber = resolvePgyStartPage({ pagination }).visiblePageNumber;
+  if (!pageNumber) return { promoted: 0, code: 'PGY_VISIBLE_PAGE_UNKNOWN' };
+  const exact = pgyCandidateResponseCache.latestCandidates(MAX_CANDIDATE_COUNT, {
+    commandWindow,
+    expectedPage: pageNumber
+  });
+  const broad = pgyCandidateResponseCache.latestCandidates(MAX_CANDIDATE_COUNT, {
+    commandWindow
+  });
+  const snapshots = [];
+  const seen = new Set();
+  for (const snapshot of [...exact, ...broad]) {
+    const key = `${Number(snapshot?.sequence || 0)}:${String(snapshot?.fingerprint || '')}`;
+    if (!snapshot?.items?.length || seen.has(key)) continue;
+    if (snapshot.pageNumber && Number(snapshot.pageNumber) !== Number(pageNumber)) continue;
+    seen.add(key);
+    snapshots.push(snapshot);
+  }
+  for (const snapshot of snapshots) {
+    const confirmation = await confirmCandidateSnapshotOnVisiblePage(
+      snapshot,
+      pageNumber,
+      calibration
+    );
+    if (!confirmation.ok) continue;
+    return pgyCandidateResponseCache.promoteVerifiedSnapshot(commandWindow, {
+      sourceContext: currentCandidateSourceContext(),
+      pageNumber,
+      sequence: snapshot.sequence,
+      fingerprint: snapshot.fingerprint
+    });
+  }
+  return { promoted: 0, code: 'PGY_VISIBLE_VERIFIED_SNAPSHOT_MISSING' };
+}
+
+async function closeCandidateCommandWindow(
+  commandWindow = pgyCandidateCommandWindow,
+  options = {}
+) {
+  if (commandWindow && options.preserveVerifiedSnapshot) {
+    await preserveVisibleCandidateSnapshot(commandWindow, options.calibration || {});
+  }
   if (commandWindow) pgyCandidateResponseCache.endCommandWindow(commandWindow);
   if (pgyCandidateCommandWindow === commandWindow) pgyCandidateCommandWindow = null;
 }
@@ -1910,7 +2094,7 @@ function createMainWindow() {
     if (isMainFrame && !isInPlace) pgyCandidateCaptureEpoch += 1;
   });
   attachPgyCandidateResponseCapture(browserView.webContents);
-  mainWindow.setBrowserView(browserView);
+  mainWindow.addBrowserView(browserView);
 
   // 初始打开空白页
   browserView.webContents.loadURL('about:blank');
@@ -1928,9 +2112,17 @@ function createMainWindow() {
     const y = TOPBAR_HEIGHT;
     const width = Math.max(BROWSER_MIN_WIDTH, w - x);
     const height = Math.max(240, h - TOPBAR_HEIGHT);
-    activeView.setBounds({ x, y, width, height });
-    // width 由我们根据 uiWidth 控制；height 跟随窗口即可
-    activeView.setAutoResize({ width: false, height: true });
+    const bounds = { x, y, width, height };
+    const attachedViews = mainWindow.getBrowserViews();
+    for (const view of browserTabViews.values()) {
+      if (!view || view.webContents.isDestroyed()) continue;
+      if (!attachedViews.includes(view)) mainWindow.addBrowserView(view);
+      // Keep background automation views attached at full size. Electron can
+      // otherwise stall capturePage/DOM work when setBrowserView detaches them.
+      view.setBounds(bounds);
+      view.setAutoResize({ width: false, height: true });
+    }
+    mainWindow.setTopBrowserView(activeView);
   };
 
   mainWindow.on('resize', applyBrowserBounds);
@@ -1976,21 +2168,22 @@ function createMainWindow() {
       sendBrowserTabsSnapshot();
     },
     openUrl: async (url) => {
-      if (!browserView) throw new Error('browserView 未初始化');
-      ensureCollectionTabActive();
+      const taskView = ensureTaskBrowserTab();
       const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
-      await browserView.webContents.loadURL(finalUrl);
-      sendActiveBrowserUrl();
+      await taskView.webContents.loadURL(finalUrl);
+      sendBrowserTabsSnapshot();
     },
     getCurrentUrl: () => {
       try {
-        return browserView?.webContents?.getURL?.() || '';
+        return taskBrowserView?.webContents?.getURL?.() || '';
       } catch (_) {
         return '';
       }
     },
-    checkLogin: pgyCheckLogin,
-    extractCurrentMultiPage: pgyExtractCurrentMultiPage
+    checkLogin: () => pgyCheckLogin(taskBrowserView?.webContents),
+    extractCurrentMultiPage: (templatePath, options) => (
+      pgyExtractCurrentMultiPage(templatePath, options, taskBrowserView?.webContents)
+    )
   });
   // 推一份初始 state，避免渲染端等待
   try {
@@ -2007,9 +2200,12 @@ function createMainWindow() {
     browserTabViews.clear();
     mainWindow = null;
     browserView = null;
+    taskBrowserView = null;
     mailBrowserView = null;
+    xhsBrowserView = null;
     applyBrowserBounds = () => {};
     collectionInteractionLockState = '';
+    taskInteractionLockState = '';
     taskRunner = null;
     pgyCandidateDebuggerAttached = false;
     pgyCandidateResponseCache.clear();
@@ -2406,7 +2602,14 @@ ipcMain.handle('browser:listTabs', async () => {
       url = view?.webContents?.getURL?.() || '';
       title = view?.webContents?.getTitle?.() || title;
     } catch (_) {}
-    return { ...tab, url, title };
+    const navigationLockReason = browserTabNavigationLockReason(tab.id);
+    return {
+      ...tab,
+      url,
+      title,
+      navigationLocked: Boolean(navigationLockReason),
+      navigationLockReason
+    };
   });
   return {
     ok: true,
@@ -2423,8 +2626,8 @@ ipcMain.handle('browser:closeTab', async (_e, tabId) => closeBrowserTab(tabId));
 ipcMain.handle('browser:open', async (_e, url) => {
   const activeView = getActiveBrowserView();
   if (!activeView) return { ok: false, error: 'browserView 未初始化' };
-  const lockReason = currentBrowserAutomationLock();
-  if (lockReason && browserTabRegistry.activeId === COLLECTION_TAB_ID) {
+  const lockReason = browserTabNavigationLockReason(browserTabRegistry.activeId);
+  if (lockReason) {
     return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开其他网页` };
   }
   const finalUrl = url && /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -2439,7 +2642,7 @@ ipcMain.handle('browser:open', async (_e, url) => {
 
 ipcMain.handle('browser:openCollection', async (_e, url) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
-  const lockReason = currentBrowserAutomationLock();
+  const lockReason = browserTabNavigationLockReason(COLLECTION_TAB_ID);
   if (lockReason) {
     return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开其他网页` };
   }
@@ -2457,8 +2660,8 @@ ipcMain.handle('browser:openCollection', async (_e, url) => {
 ipcMain.handle('browser:nav', async (_e, action) => {
   const activeView = getActiveBrowserView();
   if (!activeView) return { ok: false, error: 'browserView 未初始化' };
-  const lockReason = currentBrowserAutomationLock();
-  if (lockReason && browserTabRegistry.activeId === COLLECTION_TAB_ID) {
+  const lockReason = browserTabNavigationLockReason(browserTabRegistry.activeId);
+  if (lockReason) {
     return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能导航或刷新` };
   }
   try {
@@ -2475,10 +2678,12 @@ ipcMain.handle('browser:nav', async (_e, action) => {
 // =========================
 // IPC：PGY 登录态检测
 // =========================
-async function pgyCheckLogin() {
-  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+async function pgyCheckLogin(targetWebContents = browserView?.webContents) {
+  if (!targetWebContents || targetWebContents.isDestroyed?.()) {
+    return { ok: false, error: '蒲公英页面未初始化' };
+  }
   try {
-    const result = await browserView.webContents.executeJavaScript(
+    const result = await targetWebContents.executeJavaScript(
       `
         (function(){
           const url = location.href;
@@ -3248,12 +3453,28 @@ ipcMain.handle('contacts:openTencentEmail', async () => {
 });
 
 ipcMain.handle('contacts:checkXhsLogin', async () => {
-  ensureXhsBrowserTab();
+  const contactView = ensureXhsBrowserTab();
   activateBrowserTab(XHS_TAB_ID, { force: true });
+  let currentUrl = String(contactView.webContents.getURL() || '');
+  if (!isXhsWebUrl(currentUrl)) {
+    try {
+      await contactView.webContents.loadURL(XHS_LOGIN_URL);
+    } catch (err) {
+      currentUrl = String(contactView.webContents.getURL() || '');
+      if (!isXhsWebUrl(currentUrl)) {
+        return {
+          ok: false,
+          code: 'XHS_LOGIN_PAGE_OPEN_FAILED',
+          error: `无法打开小红书登录检测页：${String(err?.message || err)}`
+        };
+      }
+    }
+    sendActiveBrowserUrl();
+  }
   const inspected = await inspectXhsProfilePage();
   if (!inspected?.ok) return inspected;
-  const currentUrl = String(inspected.url || '');
-  const isXhsPage = /^https:\/\/(?:www\.)?xiaohongshu\.com\//i.test(currentUrl);
+  currentUrl = String(inspected.url || '');
+  const isXhsPage = isXhsWebUrl(currentUrl);
   return {
     ok: true,
     loggedIn: isXhsPage && !inspected.loginRequired && !inspected.riskDetected,
@@ -4579,7 +4800,7 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   const busy = rejectBrowserAutomationStart('读取蒲公英候选');
   if (busy) return busy;
   ensureCollectionTabActive();
-  closeCandidateCommandWindow();
+  await closeCandidateCommandWindow();
   const commandWindow = pgyCandidateResponseCache.beginCommandWindow({
     sourceContext: currentCandidateSourceContext()
   });
@@ -4587,12 +4808,23 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   pgyCandidateReadRunning = true;
   sendBrowserTabsSnapshot();
   let keepCommandWindow = false;
+  let completedResult = null;
   try {
     const result = await extractPgySearchCandidates(options);
+    completedResult = result;
     keepCommandWindow = Boolean(result?.paused);
     return result;
   } finally {
-    if (!keepCommandWindow) closeCandidateCommandWindow(commandWindow);
+    if (!keepCommandWindow) {
+      await closeCandidateCommandWindow(commandWindow, {
+        preserveVerifiedSnapshot: Boolean(
+          completedResult?.ok
+          && !completedResult?.paused
+          && !completedResult?.stats?.stoppedForRisk
+        ),
+        calibration: loadCandidateSearchCalibration(options?.templatePath)?.calibration || {}
+      });
+    }
     pgyCandidateReadRunning = false;
     sendBrowserTabsSnapshot();
   }
@@ -4612,7 +4844,7 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
   ensureCollectionTabActive();
   const validated = await validateCandidateCheckpointSession(sessionId);
   if (!validated.ok) {
-    if (!pgyCandidateCheckpointSession) closeCandidateCommandWindow();
+    if (!pgyCandidateCheckpointSession) await closeCandidateCommandWindow();
     return validated;
   }
   const session = validated.session;
@@ -4621,6 +4853,7 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
   pgyCandidateReadRunning = true;
   sendBrowserTabsSnapshot();
   let keepCommandWindow = false;
+  let completedResult = null;
   try {
     const result = await readPgyCandidatesFromResponsePages({
       startRank: session.startRank,
@@ -4628,10 +4861,20 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
       resumeSession: session,
       calibration: session.calibration || {}
     });
+    completedResult = result;
     keepCommandWindow = Boolean(result?.paused);
     return { ...result, url: browserView.webContents.getURL() };
   } finally {
-    if (!keepCommandWindow) closeCandidateCommandWindow(session.commandWindow);
+    if (!keepCommandWindow) {
+      await closeCandidateCommandWindow(session.commandWindow, {
+        preserveVerifiedSnapshot: Boolean(
+          completedResult?.ok
+          && !completedResult?.paused
+          && !completedResult?.stats?.stoppedForRisk
+        ),
+        calibration: session.calibration || {}
+      });
+    }
     pgyCandidateReadRunning = false;
     sendBrowserTabsSnapshot();
   }
@@ -4639,7 +4882,7 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
 
 ipcMain.handle('pgy:cancelSearchCandidateCheckpoint', async (_e, sessionId) => {
   const result = await cancelCandidateCheckpointSession(sessionId);
-  if (!pgyCandidateCheckpointSession) closeCandidateCommandWindow();
+  if (!pgyCandidateCheckpointSession) await closeCandidateCommandWindow();
   return result;
 });
 
@@ -5054,8 +5297,14 @@ async function pgySuggestNoteCardSelectorForCurrentPage(webContents) {
 // =========================
 // IPC：PGY 从当前达人页测试提取（多页：达人详情页 + tabs）
 // =========================
-async function pgyExtractCurrentMultiPage(templatePath, options) {
-  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+async function pgyExtractCurrentMultiPage(
+  templatePath,
+  options,
+  targetWebContents = browserView?.webContents
+) {
+  if (!targetWebContents || targetWebContents.isDestroyed?.()) {
+    return { ok: false, error: '蒲公英采集页面未初始化' };
+  }
 
   const safeTemplatePath = resolveInsideTemplates(templatePath);
   if (!safeTemplatePath) return { ok: false, error: '非法路径：只允许使用 templates 目录内模板' };
@@ -5068,7 +5317,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
     return { ok: false, error: `模板解析失败：${String(err?.message || err)}` };
   }
 
-  const currentPageUrl = browserView.webContents.getURL();
+  const currentPageUrl = targetWebContents.getURL();
   if (!isAllowedTaskUrl(currentPageUrl)) {
     return {
       ok: false,
@@ -5113,14 +5362,14 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
   let noteCardSelector = String(template?.noteCardSelector || '').trim();
 
   const assertNoRiskPage = async (stage) => {
-    const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+    const risk = await pgyDetectRiskOnCurrentPage(targetWebContents);
     if (risk?.ok && risk?.riskDetected) {
       const err = new Error(`检测到页面可能触发安全验证/风控：${risk.riskText || '请在右侧手工确认后继续'}`);
       err.code = 'PGY_RISK_DETECTED';
       err.riskDetected = true;
       err.riskText = risk.riskText || '';
       err.riskStage = stage || '';
-      err.url = risk.url || browserView.webContents.getURL();
+      err.url = risk.url || targetWebContents.getURL();
       throw err;
     }
     return risk;
@@ -5138,13 +5387,13 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
 
   const extractOnce = async (pageName, tabText) => {
     await assertNoRiskPage(`before_extract:${pageName}`);
-    const baseUrl = browserView.webContents.getURL();
-    const extracted = await extractFromTemplate(browserView.webContents, template, { baseUrl });
+    const baseUrl = targetWebContents.getURL();
+    const extracted = await extractFromTemplate(targetWebContents, template, { baseUrl });
     // 强制以真实页面 URL 为准，避免被历史遗留的非空字段（例如带反引号）“锁死”不更新
     try {
       if (extracted?.creator_summary) extracted.creator_summary.creator_url = baseUrl;
     } catch (_) {}
-    const evidence = await saveEvidence(browserView.webContents, evidenceDir, pageName);
+    const evidence = await saveEvidence(targetWebContents, evidenceDir, pageName);
     pages.push({
       name: pageName,
       url: baseUrl,
@@ -5156,10 +5405,10 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
       await assertNoRiskPage(`before_resource_delta:${pageName}`);
       const key = tabText ? String(tabText) : 'base';
       if (key.includes('笔记') && !noteCardSelector) {
-        const s = await pgySuggestNoteCardSelectorForCurrentPage(browserView.webContents);
+        const s = await pgySuggestNoteCardSelectorForCurrentPage(targetWebContents);
         if (s?.ok && s.noteCardSelector) noteCardSelector = String(s.noteCardSelector);
       }
-      const delta = await pgyExtractResourceDelta(browserView.webContents, key, noteCardSelector);
+      const delta = await pgyExtractResourceDelta(targetWebContents, key, noteCardSelector);
       if (delta?.creator && typeof delta.creator === 'object') {
         // 关键字段强覆盖：避免被“登录账号名”等历史值锁死
         if (delta.creator.creator_name) {
@@ -5194,7 +5443,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
     for (let i = 0; i < tabTexts.length; i++) {
       const tabText = tabTexts[i];
       if (!tabText) continue;
-      const click = await clickTabByText(browserView.webContents, tabText);
+      const click = await clickTabByText(targetWebContents, tabText);
       if (!click.ok) {
         pages.push({
           name: `tab_${i + 1}_${safeName(tabText)}`,
@@ -5212,7 +5461,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
         try {
           await assertNoRiskPage(`before_note_url_resolve:${tabText}`);
           noteUrlResolve = await resolveNoteUrlsByClick(
-            browserView.webContents,
+            targetWebContents,
             r.notes,
             r?._meta?.noteCardSelector,
             { limit: resolveLimit }
@@ -5284,7 +5533,7 @@ async function pgyExtractCurrentMultiPage(templatePath, options) {
     };
   } catch (err) {
     try {
-      const evidence = await saveEvidence(browserView.webContents, evidenceDir, 'error_current_page');
+      const evidence = await saveEvidence(targetWebContents, evidenceDir, 'error_current_page');
       fs.writeFileSync(
         path.join(runDir, 'error.json'),
         JSON.stringify({ error: String(err?.message || err), evidence }, null, 2),
@@ -5721,7 +5970,8 @@ ipcMain.handle('tasks:start', async (_e, payload) => {
   }
   const busy = rejectBrowserAutomationStart('开始蒲公英采集任务', { allowTaskRunner: true });
   if (busy) return busy;
-  ensureCollectionTabActive();
+  ensureTaskBrowserTab();
+  activateBrowserTab(AUTOMATION_TAB_ID, { force: true });
   const r = await taskRunner.start(payload || {});
   if (r?.ok) {
     try {
@@ -5745,7 +5995,8 @@ ipcMain.handle('tasks:recover', async (_e, runDir) => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
   const busy = rejectBrowserAutomationStart('恢复未完成任务');
   if (busy) return busy;
-  ensureCollectionTabActive();
+  ensureTaskBrowserTab();
+  activateBrowserTab(AUTOMATION_TAB_ID, { force: true });
   const result = taskRunner.recoverFromTaskState(runDir);
   if (result?.ok) sendBrowserTabsSnapshot();
   return result;

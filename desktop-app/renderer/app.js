@@ -153,7 +153,9 @@ function renderTopbar(state) {
     const tabItem = h('div', { class: `browser-tab-item ${tab.active ? 'active' : ''}` }, []);
     const label = tab.role === 'mail'
       ? '企业邮箱'
-      : (tab.role === 'collection' ? '采集页' : (tab.title || '标签页'));
+      : (tab.role === 'collection'
+          ? '采集页'
+          : (tab.role === 'automation' ? '自动采集' : (tab.title || '标签页')));
     const tabButton = h('button', {
       class: 'browser-tab-button',
       role: 'tab',
@@ -188,20 +190,23 @@ function renderTopbar(state) {
       }
     }, ['+ 企业邮箱']));
   }
-  if (state.browser?.locked) {
-    tabStrip.appendChild(h('span', {
-      class: 'browser-tab-lock',
-      title: state.browser.lockReason || '自动化运行期间锁定采集标签'
-    }, ['采集中已锁定']));
-  }
-
-  const controls = h('div', { class: 'browser-controls' }, []);
   const activeTab = tabs.find((tab) => tab.id === state.browser?.activeTabId)
     || tabs.find((tab) => tab.active)
     || tabs[0];
-  const collectionNavigationLocked = Boolean(
-    state.browser?.locked && activeTab?.role === 'collection'
-  );
+  if (state.browser?.locked) {
+    const taskRunningWithSearchVisible = Boolean(
+      state.tasks?.running && activeTab?.role === 'collection'
+    );
+    tabStrip.appendChild(h('span', {
+      class: 'browser-tab-lock',
+      title: taskRunningWithSearchVisible
+        ? '自动任务正在独立标签运行，当前采集页可继续人工核验'
+        : (state.browser.lockReason || '自动化运行中')
+    }, [taskRunningWithSearchVisible ? '搜索页可核验' : '自动化运行中']));
+  }
+
+  const controls = h('div', { class: 'browser-controls' }, []);
+  const activeNavigationLocked = Boolean(activeTab?.navigationLocked);
   const runNav = async (action) => {
     const result = await window.desktopAPI.browser.nav(action);
     if (!result?.ok) alert(result?.error || '浏览器导航失败');
@@ -209,25 +214,25 @@ function renderTopbar(state) {
   const navBack = h('button', {
     class: 'tb-btn ghost',
     title: '后退',
-    disabled: activeTab?.canGoBack && !collectionNavigationLocked ? null : '',
+    disabled: activeTab?.canGoBack && !activeNavigationLocked ? null : '',
     onclick: () => runNav('back')
   }, ['←']);
   const navForward = h('button', {
     class: 'tb-btn ghost',
     title: '前进',
-    disabled: activeTab?.canGoForward && !collectionNavigationLocked ? null : '',
+    disabled: activeTab?.canGoForward && !activeNavigationLocked ? null : '',
     onclick: () => runNav('forward')
   }, ['→']);
   const navReload = h('button', {
     class: 'tb-btn ghost',
     title: '刷新',
-    disabled: collectionNavigationLocked ? '' : null,
+    disabled: activeNavigationLocked ? '' : null,
     onclick: () => runNav('reload')
   }, ['⟳']);
   const urlInput = h('input', {
     class: 'url-input',
     placeholder: '输入蒲公英网址，回车打开右侧网页',
-    disabled: collectionNavigationLocked ? '' : null
+    disabled: activeNavigationLocked ? '' : null
   }, []);
   urlInput.value = state.browser?.url || '';
   urlInput.addEventListener('keydown', async (e) => {
@@ -240,7 +245,7 @@ function renderTopbar(state) {
   const goBtn = h('button', {
     class: 'tb-btn primary',
     title: '打开',
-    disabled: collectionNavigationLocked ? '' : null,
+    disabled: activeNavigationLocked ? '' : null,
     onclick: async () => {
     const v = urlInput.value.trim();
     if (!v) return;

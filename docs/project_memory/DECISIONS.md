@@ -526,3 +526,25 @@ Status: superseded on 2026-08-12 because field evidence disproved the shared-rou
 - Why: matching only the first five names can accept a stale response whose later ranks differ, while requiring links inside the nickname region rejects valid rendered cards. Either defect breaks global ranks even when page 1 is visibly present.
 - Impact: stale first-five collisions and changed-page clicks fail closed; checkpoint resume retains only sanitized nickname-plus-URL anchors needed for the same verification.
 - Reevaluate when: PGY virtualizes a partial page or provides an official ordered export. Full global-rank evidence remains mandatory.
+
+## 2026-08-12: Preserve A Completed Visible Page Across Candidate Commands
+
+- Decision: after a candidate command completes normally, promote its current-page response to a passive same-navigation snapshot only when the visible page number and complete calibrated nickname order still match the exact response fingerprint and sequence. Do not promote failed, canceled, risk-stopped, or paused commands.
+- Why: command-window isolation correctly prevented cross-command leakage, but made a second command fail on an unchanged visible page because PGY emitted no new list response. Blindly reusing any old command response would reintroduce stale-page risk.
+- Impact: repeated reads can seed from the last visibly verified page without refreshing PGY, while navigation, page, order, and source-context changes still fail closed. UI failures include a stable code for field diagnosis.
+- Reevaluate when: PGY provides stable row URLs directly in the visible DOM or an official ordered export endpoint eliminates response-cache dependence.
+
+Update on 2026-08-12: exact navigation-context equality was too strict after a verified page-turn/restore cycle. A new command may inspect recent sanitized snapshots owned by the same BrowserView across navigation epochs, but may adopt one only after current visible page number and the complete calibrated nickname order reauthorize the exact fingerprint. Same-window ownership is a candidate filter, not sufficient identity proof.
+
+## 2026-08-12: Login Checks Must Inspect An XHS Page
+
+- Decision: when the dedicated contact tab is blank or on another host, `检测登录` first opens the XHS explore page in that same isolated session and only then evaluates login, risk, and visible-page evidence.
+- Why: `about:blank` proves nothing about authentication. Reporting it as logged out contradicted the still-valid session and sent the operator toward unnecessary re-login attempts.
+- Impact: the check becomes a useful one-click diagnostic while XHS login modals and risk pages still stop enrichment. The contact tab remains isolated from the protected PGY result tab.
+- Reevaluate when: XHS provides a stable session API or the dedicated tab is replaced. Never infer account state from a non-XHS page.
+## 2026-08-12: Separate Manual Search From Automatic Collection
+
+- Decision: Keep `采集页` as the operator's stable PGY search and verification workspace. Lazily create a protected `自动采集` BrowserView when a main task starts or recovers, and bind task navigation, login checks, and extraction exclusively to that view.
+- Why: A return button cannot preserve a search result's exact filter, page, and scroll state after the same BrowserView has navigated through creator details. This was a responsibility conflict, not a history-navigation bug.
+- Impact: Both views share the authenticated `persist:pgy_default` session but keep independent page history and scroll. Registered BrowserViews stay attached at full bounds and tab activation changes z-order rather than detaching inactive views, so background capture and DOM work continue. Operators may switch back to the search page during a task; the automatic page remains input-locked while running and becomes available for manual intervention when paused.
+- Reevaluate when: Electron BrowserView is replaced, the platform provides a stable official API/export, or concurrent same-session pages cause verified platform behavior problems. The manual search workspace must never again be used as the main task runner's navigation target.

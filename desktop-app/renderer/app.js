@@ -155,7 +155,9 @@ function renderTopbar(state) {
       ? '企业邮箱'
       : (tab.role === 'collection'
           ? '采集页'
-          : (tab.role === 'automation' ? '自动采集' : (tab.title || '标签页')));
+          : (tab.role === 'automation'
+              ? '自动采集'
+              : (tab.role === 'pgy-invite' ? '邀约账号' : (tab.title || '标签页'))));
     const tabButton = h('button', {
       class: 'browser-tab-button',
       role: 'tab',
@@ -190,6 +192,16 @@ function renderTopbar(state) {
       }
     }, ['+ 企业邮箱']));
   }
+  if (!tabs.some((tab) => tab.id === 'pgy-invite')) {
+    tabStrip.appendChild(h('button', {
+      class: 'browser-tab-new',
+      title: '使用独立 Cookie 打开第二个蒲公英邀约账号',
+      onclick: async () => {
+        const result = await window.desktopAPI.invites.openAccount();
+        if (!result?.ok) alert(result?.error || '打开邀约账号失败');
+      }
+    }, ['+ 邀约账号']));
+  }
   const activeTab = tabs.find((tab) => tab.id === state.browser?.activeTabId)
     || tabs.find((tab) => tab.active)
     || tabs[0];
@@ -207,6 +219,32 @@ function renderTopbar(state) {
 
   const controls = h('div', { class: 'browser-controls' }, []);
   const activeNavigationLocked = Boolean(activeTab?.navigationLocked);
+  const inviteAddressReadOnly = activeTab?.role === 'pgy-invite';
+  const roleSwitch = h('div', {
+    class: 'browser-role-switch',
+    role: 'tablist',
+    'aria-label': '账号工作区切换'
+  }, []);
+  [
+    { role: 'collection', label: '采集页', title: '切换到采集账号的搜索工作区' },
+    { role: 'pgy-invite', label: '邀约账号', title: '切换到独立 Cookie 的邀约账号' }
+  ].forEach((item) => {
+    const tab = tabs.find((candidate) => candidate.role === item.role);
+    const active = tab?.id === activeTab?.id;
+    const button = h('button', {
+      class: `browser-role-button ${active ? 'active' : ''}`,
+      role: 'tab',
+      title: item.title,
+      'aria-selected': active ? 'true' : 'false',
+      disabled: tab ? null : '',
+      onclick: async () => {
+        if (!tab) return;
+        const result = await window.desktopAPI.browser.activateTab(tab.id);
+        if (!result?.ok) alert(result?.error || '切换账号工作区失败');
+      }
+    }, [item.label]);
+    roleSwitch.appendChild(button);
+  });
   const runNav = async (action) => {
     const result = await window.desktopAPI.browser.nav(action);
     if (!result?.ok) alert(result?.error || '浏览器导航失败');
@@ -231,8 +269,10 @@ function renderTopbar(state) {
   }, ['⟳']);
   const urlInput = h('input', {
     class: 'url-input',
-    placeholder: '输入蒲公英网址，回车打开右侧网页',
-    disabled: activeNavigationLocked ? '' : null
+    placeholder: inviteAddressReadOnly ? '邀约账号只从已采集名单打开达人' : '输入蒲公英网址，回车打开右侧网页',
+    disabled: activeNavigationLocked ? '' : null,
+    readonly: inviteAddressReadOnly ? '' : null,
+    title: inviteAddressReadOnly ? '为防止账号角色混用，邀约标签不接受手工网址' : ''
   }, []);
   urlInput.value = state.browser?.url || '';
   urlInput.addEventListener('keydown', async (e) => {
@@ -245,7 +285,7 @@ function renderTopbar(state) {
   const goBtn = h('button', {
     class: 'tb-btn primary',
     title: '打开',
-    disabled: activeNavigationLocked ? '' : null,
+    disabled: activeNavigationLocked || inviteAddressReadOnly ? '' : null,
     onclick: async () => {
     const v = urlInput.value.trim();
     if (!v) return;
@@ -253,6 +293,7 @@ function renderTopbar(state) {
     if (!res?.ok) alert(`打开失败：${res?.error || 'unknown error'}`);
   }}, ['打开']);
 
+  controls.appendChild(roleSwitch);
   controls.appendChild(navBack);
   controls.appendChild(navForward);
   controls.appendChild(navReload);

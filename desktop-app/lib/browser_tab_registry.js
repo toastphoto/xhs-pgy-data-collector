@@ -2,6 +2,7 @@ const COLLECTION_TAB_ID = 'collection';
 const AUTOMATION_TAB_ID = 'automation';
 const MAIL_TAB_ID = 'mail';
 const XHS_TAB_ID = 'xhs-profile';
+const PGY_INVITE_TAB_ID = 'pgy-invite';
 
 class BrowserTabRegistry {
   constructor() {
@@ -76,5 +77,6 @@ module.exports = {
   COLLECTION_TAB_ID,
   AUTOMATION_TAB_ID,
   MAIL_TAB_ID,
-  XHS_TAB_ID
+  XHS_TAB_ID,
+  PGY_INVITE_TAB_ID
 };

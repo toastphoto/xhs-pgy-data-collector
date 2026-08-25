@@ -24,6 +24,10 @@ assert.match(
 );
 assert.match(mainSource, /mainWindow\.addBrowserView\(view\)/);
 assert.match(mainSource, /mainWindow\.setTopBrowserView\(activeView\)/);
+assert.match(
+  mainSource,
+  /await detailView\.webContents\.loadURL\(url\);\s*activateBrowserTab\(XHS_TAB_ID, \{ force: true \}\)/
+);
 assert.doesNotMatch(mainSource, /mainWindow\?\.setBrowserView\(view\)/);
 assert.doesNotMatch(
   mainSource,

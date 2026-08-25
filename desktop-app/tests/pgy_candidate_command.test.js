@@ -5,6 +5,7 @@ const {
   buildCandidatePageIdentityScript,
   buildCandidateSearchLayoutScript,
   buildSearchCandidateExtractionScript,
+  buildSearchPaginationRevealScript,
   buildSearchPaginationScript,
   hasCompleteCandidateSearchCalibration,
   parseCandidateInstruction,
@@ -65,8 +66,10 @@ assert.ok(script.includes('/solar/pre-trade/blogger-detail/'));
 assert.doesNotThrow(() => new Function(script));
 const nextPageScript = buildSearchPaginationScript('next');
 const gotoPageScript = buildSearchPaginationScript('goto', 2);
+const revealPaginationScript = buildSearchPaginationRevealScript();
 assert.doesNotThrow(() => new Function(nextPageScript));
 assert.doesNotThrow(() => new Function(gotoPageScript));
+assert.doesNotThrow(() => new Function(revealPaginationScript));
 assert.ok(nextPageScript.includes('currentPageKnown'));
 assert.ok(gotoPageScript.includes('const targetPage = 2'));
 assert.ok(gotoPageScript.includes("method: 'jump-input'"));
@@ -176,6 +179,78 @@ const inspectedPgyPagination = Function(
 assert.strictEqual(inspectedPgyPagination.currentPage, 1);
 assert.deepStrictEqual(inspectedPgyPagination.pageNumbers, [1, 2]);
 assert.strictEqual(inspectedPgyPagination.selector, '.d-pagination.hide-pagination-page-size');
+
+let revealedPagination = false;
+pgyPaginatorRoot.scrollIntoView = () => { revealedPagination = true; };
+const revealedExistingPagination = Function(
+  'document',
+  'getComputedStyle',
+  'Event',
+  `return (${buildSearchPaginationRevealScript({ paginationSelector: '.d-pagination.hide-pagination-page-size' })});`
+)(
+  pgyPaginationDocument,
+  () => ({ display: 'block', visibility: 'visible', opacity: '1', overflowY: 'visible' }),
+  class {}
+);
+assert.strictEqual(revealedExistingPagination.found, true);
+assert.strictEqual(revealedPagination, true);
+
+const lazyScrollContainer = paginatorElement({ className: 'result-scroll' });
+lazyScrollContainer.clientWidth = 900;
+lazyScrollContainer.clientHeight = 500;
+lazyScrollContainer.scrollHeight = 5000;
+lazyScrollContainer.scrollTop = 0;
+lazyScrollContainer.scrollTo = ({ top }) => { lazyScrollContainer.scrollTop = top; };
+lazyScrollContainer.dispatchEvent = () => {};
+lazyScrollContainer.getBoundingClientRect = () => ({
+  left: 0, right: 900, top: 0, bottom: 500, width: 900, height: 500
+});
+const unrelatedPaginationRoot = paginatorElement({ className: 'pagination-summary' });
+const unrelatedSinglePage = paginatorElement({ text: '1', className: 'page' });
+unrelatedPaginationRoot.querySelectorAll = () => [unrelatedSinglePage];
+let unrelatedPaginationRevealed = false;
+unrelatedPaginationRoot.scrollIntoView = () => { unrelatedPaginationRevealed = true; };
+const lazyPaginationDocument = {
+  documentElement: { clientWidth: 1200, clientHeight: 800 },
+  scrollingElement: lazyScrollContainer,
+  querySelectorAll: (selector) => {
+    if (selector === 'body *') return [lazyScrollContainer];
+    if (selector.includes('pagination')) return [unrelatedPaginationRoot];
+    return [];
+  }
+};
+const revealedLazyPagination = Function(
+  'document',
+  'getComputedStyle',
+  'Event',
+  `return (${buildSearchPaginationRevealScript()});`
+)(
+  lazyPaginationDocument,
+  () => ({ display: 'block', visibility: 'visible', opacity: '1', overflowY: 'auto' }),
+  class {}
+);
+assert.strictEqual(revealedLazyPagination.found, false);
+assert.strictEqual(revealedLazyPagination.scrolled, 1);
+assert.strictEqual(lazyScrollContainer.scrollTop, 4500);
+assert.strictEqual(unrelatedPaginationRevealed, false);
+
+let directPageTwoClicks = 0;
+pgyPageTwo.click = () => { directPageTwoClicks += 1; };
+const gotoPgyPageTwo = Function(
+  'document',
+  'getComputedStyle',
+  'Event',
+  'KeyboardEvent',
+  `return (${buildSearchPaginationScript('goto', 2, { paginationSelector: '.d-pagination.hide-pagination-page-size' })});`
+)(
+  pgyPaginationDocument,
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  class {},
+  class {}
+);
+assert.strictEqual(gotoPgyPageTwo.clicked, true);
+assert.strictEqual(gotoPgyPageTwo.method, 'page-control');
+assert.strictEqual(directPageTwoClicks, 1);
 
 const identityItems = [
   { creator_name: '达人甲' },
@@ -377,6 +452,97 @@ const nestedLayout = Function(
 );
 assert.strictEqual(nestedLayout.candidates[0].href, 'https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/parent-link-id');
 assert.strictEqual(nestedLayout.rowsWithLink, 2);
+const nativeFallbackNameElements = [];
+for (const name of ['原生表格达人甲', '原生表格达人乙']) {
+  const nameElement = visibleElement({
+    innerText: name,
+    textContent: name,
+    getAttribute: () => '',
+    matches: (selector) => selector === '.candidate-name',
+    querySelectorAll: () => []
+  });
+  const nativeRow = visibleElement({
+    matches: () => false,
+    querySelectorAll: (selector) => selector === '.candidate-name' ? [nameElement] : []
+  });
+  nameElement.closest = (selector) => selector === 'tr,[role="row"]' ? nativeRow : null;
+  nameElement.parentElement = nativeRow;
+  nativeFallbackNameElements.push(nameElement);
+}
+const nativeFallbackLayout = Function(
+  'document',
+  'getComputedStyle',
+  'location',
+  'URL',
+  `return (${buildCandidateSearchLayoutScript({
+    rowSelector: '.stale-candidate-row',
+    nameSelector: '.candidate-name'
+  })});`
+)(
+  {
+    querySelectorAll: (selector) => selector === '.candidate-name' ? nativeFallbackNameElements : []
+  },
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  { href: 'https://pgy.xiaohongshu.com/solar/pre-trade/kol-selection' },
+  URL
+);
+assert.strictEqual(nativeFallbackLayout.bindingMode, 'native-row-fallback');
+assert.strictEqual(nativeFallbackLayout.rowCount, 2);
+assert.strictEqual(nativeFallbackLayout.nameCount, 2);
+assert.strictEqual(nativeFallbackLayout.rowsWithLink, 0);
+const fallbackNames = ['结构变化达人甲', '结构变化达人乙'];
+const fallbackNameElements = [];
+for (const [index, name] of fallbackNames.entries()) {
+  const detailLink = visibleElement({
+    href: `/solar/pre-trade/blogger-detail/fallback-${index}`,
+    getAttribute: (key) => key === 'href' ? `/solar/pre-trade/blogger-detail/fallback-${index}` : '',
+    matches: (selector) => selector === 'a[href]',
+    querySelectorAll: () => []
+  });
+  const nameElement = visibleElement({
+    innerText: name,
+    textContent: name,
+    getAttribute: () => '',
+    matches: (selector) => selector === '.candidate-name',
+    querySelectorAll: () => []
+  });
+  nameElement.closest = () => null;
+  const currentRow = visibleElement({
+    parentElement: null,
+    matches: () => false,
+    querySelectorAll: (selector) => {
+      if (selector === '.candidate-name') return [nameElement];
+      if (selector === 'a[href]') return [detailLink];
+      return [];
+    }
+  });
+  nameElement.parentElement = currentRow;
+  detailLink.parentElement = currentRow;
+  fallbackNameElements.push(nameElement);
+}
+const fallbackLayout = Function(
+  'document',
+  'getComputedStyle',
+  'location',
+  'URL',
+  `return (${buildCandidateSearchLayoutScript({
+    rowSelector: '.stale-candidate-row',
+    nameSelector: '.candidate-name'
+  })});`
+)(
+  {
+    querySelectorAll: (selector) => selector === '.candidate-name' ? fallbackNameElements : []
+  },
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  { href: 'https://pgy.xiaohongshu.com/solar/pre-trade/kol-selection' },
+  URL
+);
+assert.strictEqual(fallbackLayout.bindingMode, 'name-link-fallback');
+assert.strictEqual(fallbackLayout.calibratedRowCount, 0);
+assert.strictEqual(fallbackLayout.rowCount, 2);
+assert.strictEqual(fallbackLayout.nameCount, 2);
+assert.strictEqual(fallbackLayout.rowsWithLink, 2);
+assert.deepStrictEqual(fallbackLayout.names, fallbackNames);
 const calibratedPagination = executePagination(buildSearchPaginationScript(
   'inspect',
   1,

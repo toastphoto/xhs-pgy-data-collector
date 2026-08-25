@@ -24,7 +24,10 @@ let _xiaomifengApprovalCheck = null;
 let _contactChannelStrategy = '自动分流';
 let _contactEmailSubject = '';
 let _contactEmailBody = '';
+let _contactPgyCooperationGoal = '笔记合作';
+let _contactPgyCooperationMode = '定制合作';
 let _contactPgyCooperationType = '图文';
+let _contactPgyContactChannel = '微信';
 let _contactPgyBrandName = '';
 let _contactPgyProductName = '';
 let _contactPgyContactWay = '';
@@ -77,6 +80,8 @@ let _emailHandoffState = {
   missingNames: [],
   message: ''
 };
+let _pgyInviteAccountState = { status: 'unknown', message: '邀约账号尚未检测。' };
+const _pgyInviteDraftStates = new Map();
 
 const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
 const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
@@ -490,7 +495,10 @@ function getContactSettings() {
     contactChannel: _contactChannelStrategy,
     emailSubject: _contactEmailSubject,
     emailBody: _contactEmailBody,
+    pgyCooperationGoal: _contactPgyCooperationGoal,
+    pgyCooperationMode: _contactPgyCooperationMode,
     pgyCooperationType: _contactPgyCooperationType,
+    pgyContactChannel: _contactPgyContactChannel,
     pgyBrandName: _contactPgyBrandName,
     pgyProductName: _contactPgyProductName,
     pgyContactWay: _contactPgyContactWay,
@@ -502,7 +510,10 @@ function getContactSettings() {
 
 function getPgyInviteSettings() {
   return {
+    cooperationGoal: _contactPgyCooperationGoal,
+    cooperationMode: _contactPgyCooperationMode,
     cooperationType: _contactPgyCooperationType,
+    contactChannel: _contactPgyContactChannel,
     brandName: _contactPgyBrandName,
     productName: _contactPgyProductName,
     contactWay: _contactPgyContactWay,
@@ -510,6 +521,119 @@ function getPgyInviteSettings() {
     publishStart: _contactPgyPublishStart,
     publishEnd: _contactPgyPublishEnd
   };
+}
+
+function invalidatePgyInviteDrafts() {
+  _pgyInviteDraftStates.clear();
+  document.querySelectorAll('.pgy-invite-row-status, .contact-pgy-action.send').forEach((node) => node.remove());
+}
+
+function getPgyInviteTemplateErrors() {
+  const template = getPgyInviteSettings();
+  const missing = [
+    ['报备品牌', template.brandName],
+    ['联系方式', template.contactWay],
+    ['产品名称', template.productName],
+    ['合作内容介绍', template.intro],
+    ['开始日期', template.publishStart],
+    ['结束日期', template.publishEnd]
+  ].filter((entry) => !String(entry[1] || '').trim()).map((entry) => entry[0]);
+  const errors = missing.length ? [`请先填写：${missing.join('、')}`] : [];
+  if (String(template.productName || '').length > 20) errors.push('产品名称最多 20 个字符');
+  if (template.publishStart && !/^\d{4}-\d{2}-\d{2}$/.test(template.publishStart)) errors.push('开始日期格式不正确');
+  if (template.publishEnd && !/^\d{4}-\d{2}-\d{2}$/.test(template.publishEnd)) errors.push('结束日期格式不正确');
+  if (template.publishStart && template.publishEnd && template.publishStart > template.publishEnd) errors.push('结束日期不能早于开始日期');
+  return errors;
+}
+
+function getPgyInviteDraftKey(rowId) {
+  return `${String(_selectedRunDir || '')}::${String(rowId || '')}`;
+}
+
+function setPgyInviteDraftState(rowId, value) {
+  const key = getPgyInviteDraftKey(rowId);
+  if (value) _pgyInviteDraftStates.set(key, value);
+  else _pgyInviteDraftStates.delete(key);
+  store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+}
+
+function getPgyInviteDraftState(rowId) {
+  return _pgyInviteDraftStates.get(getPgyInviteDraftKey(rowId)) || null;
+}
+
+async function preparePgyInviteForRow(row, rowId) {
+  const templateErrors = getPgyInviteTemplateErrors();
+  if (templateErrors.length) {
+    const message = `固定邀约模板不完整：${templateErrors.join('；')}`;
+    setPgyInviteDraftState(rowId, { status: 'error', message });
+    setMsg(message);
+    return;
+  }
+  setPgyInviteDraftState(rowId, { status: 'preparing', message: '正在打开达人、进入详细邀约表单并逐项填写...' });
+  const opened = await window.desktopAPI.invites.openCreator({ runDir: _selectedRunDir, rowId });
+  if (!opened?.ok) {
+    const message = `邀约账号打开达人失败：${opened?.error || 'unknown error'}`;
+    setPgyInviteDraftState(rowId, { status: 'error', message });
+    setMsg(message);
+    return;
+  }
+  const prepared = await window.desktopAPI.invites.prepare({
+    runDir: _selectedRunDir,
+    rowId,
+    template: getPgyInviteSettings()
+  });
+  if (!prepared?.ok) {
+    const message = `邀约准备失败：${prepared?.error || 'unknown error'}`;
+    setPgyInviteDraftState(rowId, { status: 'error', message });
+    setMsg(message);
+    return;
+  }
+  const message = `邀约已准备：${prepared.creatorName || row.creatorName || '该达人'}；报备品牌、联系方式、产品、合作内容和发布时间均已填写并回读一致。请核对右侧后再确认发送。`;
+  setPgyInviteDraftState(rowId, { status: 'ready', message, prepared });
+  setMsg(message);
+}
+
+async function sendPreparedPgyInviteForRow(row, rowId) {
+  const state = getPgyInviteDraftState(rowId);
+  const prepared = state?.prepared;
+  if (state?.status !== 'ready' || !prepared?.token || !prepared?.fingerprint) {
+    setMsg('请先点击“准备邀约”，并等待模板校验通过。');
+    return;
+  }
+  const template = prepared.template || {};
+  const confirmed = window.confirm(
+    `确认向“${prepared.creatorName || row.creatorName || '该达人'}”发起真实蒲公英邀约？\n\n`
+    + `合作诉求：${template.cooperationGoal || '-'}\n`
+    + `合作模式：${template.cooperationMode || '-'}\n`
+    + `建联方式：${template.contactMethod || '-'}\n`
+    + `代理商：${template.agency || '由蒲公英账号带入'}\n`
+    + `报备品牌：${template.brandName || '-'}\n`
+    + `披露方式：${template.contactChannel || '-'}\n`
+    + `联系方式：${template.contactWay || '-'}\n`
+    + `产品名称：${template.productName || '-'}\n`
+    + `发布时间：${template.publishStart || '-'} 至 ${template.publishEnd || '-'}\n`
+    + `合作内容：${template.intro || '-'}\n\n确认后软件只会点击一次详细表单底部的“发起邀约”按钮。`
+  );
+  if (!confirmed) return;
+  setPgyInviteDraftState(rowId, { ...state, status: 'sending', message: '正在执行已确认的邀约...' });
+  const sent = await window.desktopAPI.invites.sendPrepared({
+    runDir: _selectedRunDir,
+    rowId,
+    token: prepared.token,
+    fingerprint: prepared.fingerprint
+  });
+  if (!sent?.ok) {
+    const message = `邀约发送失败：${sent?.error || 'unknown error'}`;
+    setPgyInviteDraftState(rowId, { status: 'error', message });
+    setMsg(message);
+    return;
+  }
+  const confirmedSuccess = sent.outcome === 'success-confirmed';
+  const message = confirmedSuccess
+    ? `蒲公英已明确返回邀约成功：${sent.creatorName || row.creatorName || '该达人'}。`
+    : `已按确认点击一次“发起邀约”：${sent.creatorName || row.creatorName || '该达人'}。平台未返回可识别的成功文案，请查看右侧页面确认最终状态。`;
+  setPgyInviteDraftState(rowId, { status: confirmedSuccess ? 'sent' : 'submitted', message });
+  setMsg(message);
 }
 
 function getEmailTemplateSettings() {
@@ -666,7 +790,10 @@ async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) 
     if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
     if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
     if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
+    if (r.settings?.pgyCooperationGoal) _contactPgyCooperationGoal = r.settings.pgyCooperationGoal;
+    if (r.settings?.pgyCooperationMode) _contactPgyCooperationMode = r.settings.pgyCooperationMode;
     if (r.settings?.pgyCooperationType) _contactPgyCooperationType = r.settings.pgyCooperationType;
+    if (r.settings?.pgyContactChannel) _contactPgyContactChannel = r.settings.pgyContactChannel;
     if (r.settings?.pgyBrandName !== undefined) _contactPgyBrandName = r.settings.pgyBrandName;
     if (r.settings?.pgyProductName !== undefined) _contactPgyProductName = r.settings.pgyProductName;
     if (r.settings?.pgyContactWay !== undefined) _contactPgyContactWay = r.settings.pgyContactWay;
@@ -1274,24 +1401,66 @@ export function renderExports(state) {
 
   const pgyGrid = document.createElement('div');
   pgyGrid.className = 'contact-strategy-grid';
+  const appendPgySelect = (label, value, options, setter) => {
+    const wrap = document.createElement('label');
+    wrap.className = 'field-label compact';
+    wrap.textContent = label;
+    const select = document.createElement('select');
+    select.className = 'tpl-input';
+    options.forEach((optionValue) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionValue;
+      option.selected = optionValue === value;
+      select.appendChild(option);
+    });
+    select.addEventListener('change', () => {
+      setter(select.value);
+      invalidatePgyInviteDrafts();
+      scheduleContactReviewSave();
+    });
+    wrap.appendChild(select);
+    pgyGrid.appendChild(wrap);
+  };
+  appendPgySelect('蒲公英合作诉求', _contactPgyCooperationGoal, ['笔记合作', '直播合作'], (value) => {
+    _contactPgyCooperationGoal = value;
+  });
+  appendPgySelect('蒲公英合作模式', _contactPgyCooperationMode, ['定制合作', '种收联动'], (value) => {
+    _contactPgyCooperationMode = value;
+  });
+  appendPgySelect('联系方式披露方式', _contactPgyContactChannel, ['微信', '手机号'], (value) => {
+    _contactPgyContactChannel = value;
+  });
+  const agencyWrap = document.createElement('label');
+  agencyWrap.className = 'field-label compact';
+  agencyWrap.textContent = '代理商';
+  const agencyInput = document.createElement('input');
+  agencyInput.className = 'tpl-input';
+  agencyInput.value = '由邀约账号自动带入';
+  agencyInput.readOnly = true;
+  agencyWrap.appendChild(agencyInput);
+  pgyGrid.appendChild(agencyWrap);
   const pgyFields = [
-    ['合作类型', _contactPgyCooperationType, (v) => { _contactPgyCooperationType = v; }, '图文 / 视频'],
-    ['品牌名', _contactPgyBrandName, (v) => { _contactPgyBrandName = v; }, '例如 多芬'],
-    ['产品名称', _contactPgyProductName, (v) => { _contactPgyProductName = v; }, '例如 沐浴露'],
-    ['联系方式', _contactPgyContactWay, (v) => { _contactPgyContactWay = v; }, '微信 / 邮箱'],
-    ['开始时间', _contactPgyPublishStart, (v) => { _contactPgyPublishStart = v; }, 'YYYY-MM-DD'],
-    ['结束时间', _contactPgyPublishEnd, (v) => { _contactPgyPublishEnd = v; }, 'YYYY-MM-DD']
+    ['内容形式（仅导出）', _contactPgyCooperationType, (v) => { _contactPgyCooperationType = v; }, '图文 / 视频', 'text'],
+    ['报备品牌', _contactPgyBrandName, (v) => { _contactPgyBrandName = v; }, '必须与蒲公英品牌下拉完全一致', 'text'],
+    ['产品名称', _contactPgyProductName, (v) => { _contactPgyProductName = v; }, '最多 20 个字符', 'text'],
+    ['联系方式账号/号码', _contactPgyContactWay, (v) => { _contactPgyContactWay = v; }, '填写微信号或手机号', 'text'],
+    ['开始日期', _contactPgyPublishStart, (v) => { _contactPgyPublishStart = v; }, 'YYYY-MM-DD', 'date'],
+    ['结束日期', _contactPgyPublishEnd, (v) => { _contactPgyPublishEnd = v; }, 'YYYY-MM-DD', 'date']
   ];
-  pgyFields.forEach(([label, value, setter, placeholder]) => {
+  pgyFields.forEach(([label, value, setter, placeholder, type]) => {
     const wrap = document.createElement('label');
     wrap.className = 'field-label compact';
     wrap.textContent = label;
     const input = document.createElement('input');
     input.className = 'tpl-input';
+    input.type = type;
     input.placeholder = placeholder;
+    if (label === '产品名称') input.maxLength = 20;
     input.value = value;
     input.addEventListener('input', () => {
       setter(input.value);
+      invalidatePgyInviteDrafts();
       scheduleContactReviewSave();
     });
     wrap.appendChild(input);
@@ -1299,13 +1468,14 @@ export function renderExports(state) {
   });
   const pgyIntroWrap = document.createElement('label');
   pgyIntroWrap.className = 'field-label compact wide';
-  pgyIntroWrap.textContent = '蒲公英邀约内容';
+  pgyIntroWrap.textContent = '合作内容介绍';
   const pgyIntroInput = document.createElement('textarea');
   pgyIntroInput.className = 'tpl-input';
-  pgyIntroInput.placeholder = '导出到蒲公英邀约表，人工复制或后续交给 RPA。';
+  pgyIntroInput.placeholder = '填写产品介绍、使用场景、亮点优势，以及笔记风格和呈现要求。';
   pgyIntroInput.value = _contactPgyIntro;
   pgyIntroInput.addEventListener('input', () => {
     _contactPgyIntro = pgyIntroInput.value;
+    invalidatePgyInviteDrafts();
     scheduleContactReviewSave();
   });
   pgyIntroWrap.appendChild(pgyIntroInput);
@@ -1622,6 +1792,39 @@ export function renderExports(state) {
     }
   });
   reviewTop.appendChild(btnTencentEmail);
+  const btnOpenPgyInvite = document.createElement('button');
+  btnOpenPgyInvite.className = 'btn primary';
+  btnOpenPgyInvite.style.height = '34px';
+  btnOpenPgyInvite.textContent = '打开邀约账号';
+  btnOpenPgyInvite.title = '使用与采集账号完全独立的 Cookie 打开蒲公英；不会发送邀约';
+  btnOpenPgyInvite.addEventListener('click', async () => {
+    const result = await window.desktopAPI.invites.openAccount();
+    _pgyInviteAccountState = result?.ok
+      ? { status: 'opened', message: '邀约账号标签已打开。请在右侧登录第二个蒲公英账号。' }
+      : { status: 'error', message: `邀约账号打开失败：${result?.error || 'unknown error'}` };
+    setMsg(_pgyInviteAccountState.message);
+  });
+  reviewTop.appendChild(btnOpenPgyInvite);
+  const btnCheckPgyInvite = document.createElement('button');
+  btnCheckPgyInvite.className = 'btn ghost';
+  btnCheckPgyInvite.style.height = '34px';
+  btnCheckPgyInvite.textContent = '检测邀约账号';
+  btnCheckPgyInvite.addEventListener('click', async () => {
+    const result = await window.desktopAPI.invites.checkLogin();
+    const ready = Boolean(result?.ok && result?.loggedIn && !result?.riskDetected);
+    _pgyInviteAccountState = ready
+      ? { status: 'ready', message: '邀约账号已登录，可以从名单打开达人链接。' }
+      : (result?.riskDetected
+          ? { status: 'risk', message: `邀约账号需要人工处理安全验证：${result?.riskText || '请查看右侧页面'}` }
+          : { status: result?.ok ? 'waiting' : 'error', message: result?.error || '邀约账号尚未登录，请在右侧完成登录。' });
+    setMsg(_pgyInviteAccountState.message);
+  });
+  reviewTop.appendChild(btnCheckPgyInvite);
+  const pgyInviteAccountStatus = document.createElement('span');
+  pgyInviteAccountStatus.className = 'muted-line';
+  pgyInviteAccountStatus.setAttribute('role', 'status');
+  pgyInviteAccountStatus.textContent = _pgyInviteAccountState.message;
+  reviewTop.appendChild(pgyInviteAccountStatus);
   const btnOpenLastContact = document.createElement('button');
   btnOpenLastContact.className = 'btn ghost';
   btnOpenLastContact.style.height = '34px';
@@ -2045,7 +2248,7 @@ export function renderExports(state) {
         const pgyLink = document.createElement('a');
         pgyLink.className = 'contact-pgy-link';
         pgyLink.href = normalizeContactUrl(row.creatorUrl);
-        pgyLink.textContent = '打开蒲公英主页';
+        pgyLink.textContent = '采集账号查看';
         pgyLink.title = row.creatorUrl;
         pgyLink.addEventListener('click', async (event) => {
           event.preventDefault();
@@ -2054,6 +2257,57 @@ export function renderExports(state) {
           if (!result?.ok) setMsg(`打开蒲公英主页失败：${result?.error || 'unknown error'}`);
         });
         creatorBlock.appendChild(pgyLink);
+        const pgyInviteLink = document.createElement('a');
+        pgyInviteLink.className = 'contact-pgy-link';
+        pgyInviteLink.href = normalizeContactUrl(row.creatorUrl);
+        pgyInviteLink.textContent = '邀约账号打开';
+        pgyInviteLink.title = '在独立邀约账号标签打开该达人；不会填写或发送';
+        pgyInviteLink.addEventListener('click', async (event) => {
+          event.preventDefault();
+          _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+          setPgyInviteDraftState(rowId, null);
+          const result = await window.desktopAPI.invites.openCreator({
+            runDir: _selectedRunDir,
+            rowId
+          });
+          if (!result?.ok) setMsg(`邀约账号打开达人失败：${result?.error || 'unknown error'}`);
+          else setMsg(`已在邀约账号打开 ${row.creatorName || '该达人'}。当前仅打开页面，不会填写或发送邀约。`);
+        });
+        creatorBlock.appendChild(pgyInviteLink);
+
+        const inviteDraftState = getPgyInviteDraftState(rowId);
+        const prepareInviteButton = document.createElement('button');
+        prepareInviteButton.type = 'button';
+        prepareInviteButton.className = 'contact-pgy-link contact-pgy-action';
+        prepareInviteButton.textContent = inviteDraftState?.status === 'preparing' ? '正在准备...' : '准备邀约';
+        prepareInviteButton.title = '打开该达人，进入详细邀约表单，填写固定模板并逐项回读；不会发送';
+        prepareInviteButton.disabled = inviteDraftState?.status === 'preparing' || inviteDraftState?.status === 'sending';
+        prepareInviteButton.addEventListener('click', async () => {
+          _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+          await preparePgyInviteForRow(row, rowId);
+        });
+        creatorBlock.appendChild(prepareInviteButton);
+
+        if (inviteDraftState?.status === 'ready') {
+          const sendInviteButton = document.createElement('button');
+          sendInviteButton.type = 'button';
+          sendInviteButton.className = 'contact-pgy-link contact-pgy-action send';
+          sendInviteButton.textContent = '确认发送';
+          sendInviteButton.title = '先展示达人和实际选项；确认后只点击一次平台的“发起邀约”';
+          sendInviteButton.addEventListener('click', async () => {
+            _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+            await sendPreparedPgyInviteForRow(row, rowId);
+          });
+          creatorBlock.appendChild(sendInviteButton);
+        }
+
+        if (inviteDraftState?.message) {
+          const inviteStatus = document.createElement('div');
+          inviteStatus.className = `pgy-invite-row-status ${inviteDraftState.status || ''}`.trim();
+          inviteStatus.setAttribute('role', 'status');
+          inviteStatus.textContent = inviteDraftState.message;
+          creatorBlock.appendChild(inviteStatus);
+        }
       }
 
       const reason = document.createElement('div');

@@ -343,6 +343,107 @@ function buildSearchCandidateExtractionScript(requestedCount = MAX_CANDIDATE_COU
   `;
 }
 
+function buildSearchPaginationRevealScript(options = {}) {
+  const paginationSelector = String(options?.paginationSelector || '').trim().slice(0, 500);
+  return `
+    (function(){
+      const paginationSelector = ${JSON.stringify(paginationSelector)};
+      const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const visible = (element) => {
+        if (!element || element.nodeType !== 1) return false;
+        const rect = element.getBoundingClientRect?.();
+        if (!rect || rect.width < 8 || rect.height < 8) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) >= 0.05;
+      };
+      const numericPage = (element) => {
+        const parts = clean(element?.innerText || element?.textContent).split(/\\s+/).filter(Boolean);
+        if (!parts.length || parts.some((part) => !/^\\d+$/.test(part))) return null;
+        if (new Set(parts).size !== 1) return null;
+        const value = Number(parts[0]);
+        return Number.isInteger(value) && value >= 1 ? value : null;
+      };
+      const paginationSequenceSize = (element) => new Set(Array.from(element?.querySelectorAll?.(
+        'button,a,[role="button"],[tabindex],[class*="page" i]'
+      ) || []).filter(visible).map(numericPage).filter((value) => value != null)).size;
+      const reveal = (element) => {
+        if (!element) return false;
+        try {
+          element.scrollIntoView({ block: 'end', inline: 'nearest' });
+          return true;
+        } catch (_) {
+          return false;
+        }
+      };
+      let paginationRoot = null;
+      if (paginationSelector) {
+        try {
+          paginationRoot = Array.from(document.querySelectorAll(paginationSelector))
+            .filter((element) => visible(element) && paginationSequenceSize(element) >= 2)
+            .sort((left, right) => paginationSequenceSize(right) - paginationSequenceSize(left))[0] || null;
+        } catch (_) {}
+      }
+      if (!paginationRoot) {
+        try {
+          paginationRoot = Array.from(document.querySelectorAll('[class*="pagination" i],[class*="pager" i]'))
+            .filter((element) => visible(element) && paginationSequenceSize(element) >= 2)
+            .sort((left, right) => paginationSequenceSize(right) - paginationSequenceSize(left))[0] || null;
+        } catch (_) {}
+      }
+      if (paginationRoot && reveal(paginationRoot)) {
+        return { ok: true, found: true, scrolled: 0, method: 'pagination-root' };
+      }
+
+      const documentElement = document.documentElement || null;
+      const viewportWidth = Math.max(Number(documentElement?.clientWidth || 0), 320);
+      const viewportHeight = Math.max(Number(documentElement?.clientHeight || 0), 240);
+      let elements = [];
+      try { elements = Array.from(document.querySelectorAll('body *')).slice(0, 6000); } catch (_) {}
+      const scrollable = elements
+        .filter((element) => {
+          if (!visible(element)) return false;
+          const rect = element.getBoundingClientRect?.();
+          const style = getComputedStyle(element);
+          const overflowY = String(style.overflowY || style.overflow || '').toLowerCase();
+          return /auto|scroll|overlay/.test(overflowY)
+            && Number(element.scrollHeight || 0) > Number(element.clientHeight || 0) + 80
+            && Number(element.clientHeight || 0) >= Math.min(240, viewportHeight * 0.3)
+            && Number(rect?.width || 0) >= Math.min(420, viewportWidth * 0.45);
+        })
+        .sort((left, right) => {
+          const leftOverflow = Number(left.scrollHeight || 0) - Number(left.clientHeight || 0);
+          const rightOverflow = Number(right.scrollHeight || 0) - Number(right.clientHeight || 0);
+          return rightOverflow - leftOverflow;
+        })
+        .slice(0, 6);
+      const targets = [document.scrollingElement, ...scrollable].filter((element, index, all) => (
+        element && all.indexOf(element) === index
+      ));
+      let scrolled = 0;
+      let maxDelta = 0;
+      for (const element of targets) {
+        const before = Number(element.scrollTop || 0);
+        const bottom = Math.max(0, Number(element.scrollHeight || 0) - Number(element.clientHeight || 0));
+        if (bottom <= before + 4) continue;
+        try {
+          if (typeof element.scrollTo === 'function') element.scrollTo({ top: bottom, behavior: 'auto' });
+          else element.scrollTop = bottom;
+          element.dispatchEvent?.(new Event('scroll'));
+          scrolled += 1;
+          maxDelta = Math.max(maxDelta, bottom - before);
+        } catch (_) {}
+      }
+      return {
+        ok: true,
+        found: false,
+        scrolled,
+        maxDelta,
+        method: scrolled ? 'scroll-containers' : 'no-scroll-target'
+      };
+    })()
+  `;
+}
+
 function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options = {}) {
   const safeAction = ['inspect', 'next', 'goto'].includes(action) ? action : 'inspect';
   const safeTargetPage = Math.max(1, Number(targetPage || 1));
@@ -376,8 +477,13 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
       let calibratedRoot = null;
       if (paginationSelector) {
         try {
-          const selected = document.querySelector(paginationSelector);
-          if (visible(selected)) calibratedRoot = selected;
+          calibratedRoot = Array.from(document.querySelectorAll(paginationSelector))
+            .filter(visible)
+            .sort((left, right) => paginationSequenceSize(right) - paginationSequenceSize(left))[0] || null;
+          if (!calibratedRoot) {
+            const selected = document.querySelector(paginationSelector);
+            if (visible(selected)) calibratedRoot = selected;
+          }
         } catch (_) {}
       }
       const inputScope = calibratedRoot || document;
@@ -486,6 +592,17 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
       const controls = allControls.filter((element) => !isDisabled(element));
       const pageControls = allControls.filter((element) => numericPage(element) != null);
       const pageNumbers = Array.from(new Set(pageControls.map(numericPage)));
+      const activateControl = (element) => {
+        if (!element) return false;
+        try { element.scrollIntoView?.({ block: 'center', inline: 'center' }); } catch (_) {}
+        try { element.focus?.({ preventScroll: true }); } catch (_) {}
+        try {
+          element.click();
+          return true;
+        } catch (_) {
+          return false;
+        }
+      };
       const current = pageControls.find((element) => (
         element.getAttribute?.('aria-current') === 'page'
         || /active|current|selected|--color-bg-primary-light|\\bbold\\b/.test(String(element.className || '').toLowerCase())
@@ -519,8 +636,9 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
           ? 'previous-disabled'
           : 'unknown';
       if (action === 'inspect') {
+        const ready = Boolean(rootSelector && firstPageKnown && pageNumbers.length >= 2);
         return {
-          ok: true,
+          ok: ready,
           clicked: false,
           currentPage,
           currentPageKnown,
@@ -531,7 +649,8 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
           controlCount: allControls.length,
           pageNumbers,
           selector: rootSelector,
-          calibrated: Boolean(calibratedRoot)
+          calibrated: Boolean(calibratedRoot),
+          error: ready ? '' : '分页区域尚未完整加载或无法确认当前页'
         };
       }
       if (action === 'goto') {
@@ -551,10 +670,12 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
         }
         const pageControl = controls.find((element) => numericPage(element) === targetPage);
         if (pageControl) {
-          pageControl.click();
-          return { ok: true, clicked: true, currentPage, currentPageKnown, targetPage, method: 'page-control' };
+          const clicked = activateControl(pageControl);
+          return { ok: clicked, clicked, currentPage, currentPageKnown, targetPage, method: 'page-control' };
         }
         if (jumpInput) {
+          try { jumpInput.scrollIntoView?.({ block: 'center', inline: 'center' }); } catch (_) {}
+          try { jumpInput.focus?.({ preventScroll: true }); } catch (_) {}
           const prototype = Object.getPrototypeOf(jumpInput);
           const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'value');
           if (descriptor?.set) descriptor.set.call(jumpInput, String(targetPage));
@@ -588,10 +709,10 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
       if (!nextControl) {
         return { ok: false, clicked: false, currentPage, currentPageKnown, error: '未找到下一页按钮' };
       }
-      nextControl.click();
+      const clicked = activateControl(nextControl);
       return {
-        ok: true,
-        clicked: true,
+        ok: clicked,
+        clicked,
         currentPage,
         currentPageKnown,
         targetPage: currentPageKnown ? currentPage + 1 : null
@@ -780,7 +901,7 @@ function buildCandidateSearchLayoutScript(options = {}) {
         if (!selector) return [];
         try { return Array.from(document.querySelectorAll(selector)).filter(visible); } catch (_) { return []; }
       };
-      const rows = queryVisible(rowSelector);
+      const calibratedRows = queryVisible(rowSelector);
       const globalNameElements = queryVisible(nameSelector);
       const candidateHref = (element) => {
         if (!element) return '';
@@ -812,7 +933,11 @@ function buildCandidateSearchLayoutScript(options = {}) {
         }
         return '';
       };
-      const rowCandidates = rows.map((row) => {
+      const candidateFromNameElement = (nameElement) => ({
+        name: clean(nameElement?.innerText || nameElement?.textContent || nameElement?.getAttribute?.('aria-label') || '', 80),
+        href: clean(resolveRowLink(nameElement), 500)
+      });
+      const calibratedCandidates = calibratedRows.map((row) => {
         let nameElement = null;
         try {
           if (nameSelector && row.matches?.(nameSelector)) nameElement = row;
@@ -823,23 +948,71 @@ function buildCandidateSearchLayoutScript(options = {}) {
           href: clean(resolveRowLink(row), 500)
         };
       });
-      const rowNames = rowCandidates.map((candidate) => candidate.name).filter(Boolean);
-      const names = (rows.length >= 2 ? rowNames : globalNameElements
-        .map((element) => clean(element.innerText || element.textContent || element.getAttribute?.('aria-label') || '', 80))
-        .filter(Boolean))
-        .slice(0, 80);
+      const calibratedComplete = calibratedRows.length >= 2
+        && calibratedCandidates.every((candidate) => candidate.name);
+      const nameAnchoredRaw = globalNameElements.map(candidateFromNameElement);
+      const nativeRowCandidates = [];
+      const nativeRows = new Set();
+      let allVisibleNamesBoundToNativeRows = globalNameElements.length >= 2;
+      for (const nameElement of globalNameElements) {
+        let nativeRow = null;
+        try { nativeRow = nameElement.closest?.('tr,[role="row"]') || null; } catch (_) {}
+        let rowNameElements = [];
+        try {
+          rowNameElements = nativeRow && nameSelector
+            ? Array.from(nativeRow.querySelectorAll(nameSelector)).filter(visible)
+            : [];
+        } catch (_) {}
+        if (!visible(nativeRow) || rowNameElements.length !== 1 || rowNameElements[0] !== nameElement) {
+          allVisibleNamesBoundToNativeRows = false;
+          break;
+        }
+        if (nativeRows.has(nativeRow)) continue;
+        nativeRows.add(nativeRow);
+        nativeRowCandidates.push({
+          name: clean(nameElement.innerText || nameElement.textContent || nameElement.getAttribute?.('aria-label') || '', 80),
+          href: clean(resolveRowLink(nativeRow), 500)
+        });
+      }
+      const allVisibleNamesAnchored = nameAnchoredRaw.length >= 2
+        && nameAnchoredRaw.every((candidate) => candidate.name && candidate.href);
+      const nameAnchoredCandidates = [];
+      const anchoredHrefs = new Set();
+      if (allVisibleNamesAnchored) {
+        for (const candidate of nameAnchoredRaw) {
+          if (anchoredHrefs.has(candidate.href)) continue;
+          anchoredHrefs.add(candidate.href);
+          nameAnchoredCandidates.push(candidate);
+        }
+      }
+      const useNativeRowFallback = !calibratedComplete
+        && allVisibleNamesBoundToNativeRows
+        && nativeRowCandidates.length >= 2
+        && nativeRowCandidates.every((candidate) => candidate.name);
+      const useNameAnchoredFallback = !calibratedComplete
+        && !useNativeRowFallback
+        && nameAnchoredCandidates.length >= 2;
+      const rowCandidates = useNativeRowFallback
+        ? nativeRowCandidates
+        : (useNameAnchoredFallback ? nameAnchoredCandidates : calibratedCandidates);
+      const names = rowCandidates.map((candidate) => candidate.name).filter(Boolean).slice(0, 80);
       return {
         ok: true,
         url: location.href,
-        rowCount: rows.length,
+        rowCount: rowCandidates.length,
         nameCount: names.length,
         rowsWithName: rowCandidates.filter((candidate) => candidate.name).length,
         rowsWithLink: rowCandidates.filter((candidate) => candidate.href).length,
         names,
         candidates: rowCandidates.filter((candidate) => candidate.name).slice(0, 80),
-        rowSamples: rows.slice(0, 5).map((element) => clean(element.innerText || element.textContent || '', 180)),
+        rowSamples: calibratedRows.slice(0, 5).map((element) => clean(element.innerText || element.textContent || '', 180)),
         selectors: { rowSelector, nameSelector },
-        calibrated: Boolean(rowSelector || nameSelector)
+        calibrated: Boolean(rowSelector || nameSelector),
+        calibratedRowCount: calibratedRows.length,
+        visibleNameElementCount: globalNameElements.length,
+        bindingMode: useNativeRowFallback
+          ? 'native-row-fallback'
+          : (useNameAnchoredFallback ? 'name-link-fallback' : 'calibrated-row')
       };
     })()
   `;
@@ -863,6 +1036,7 @@ module.exports = {
   buildCandidatePageIdentityScript,
   buildCandidateSearchLayoutScript,
   buildSearchCandidateExtractionScript,
+  buildSearchPaginationRevealScript,
   buildSearchPaginationScript,
   hasCompleteCandidateSearchCalibration,
   parseCandidateInstruction,

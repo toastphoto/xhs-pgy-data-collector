@@ -50,6 +50,17 @@ const {
   TENCENT_MAIL_HOME_URL,
   isAllowedTencentMailUrl
 } = require('./lib/tencent_email_compose');
+const {
+  buildPgyInviteEntryInspectScript,
+  buildPgyInviteOutcomeScript,
+  buildPgyInvitePrepareScript,
+  buildPgyInviteSendScript,
+  isAllowedPgyInviteNavigationUrl,
+  normalizePgyInviteFormUrl,
+  normalizePgyInviteCreatorUrl,
+  resolveInviteTargetFromRows,
+  validatePgyInviteTemplate
+} = require('./lib/pgy_invite');
 const { openDb, initDb, dbGet, dbAll } = require('./lib/db/sqlite');
 const { syncRunsToDb } = require('./lib/db/import_runs');
 const { chatDeepSeek, chatOpenAICompat, listModelsOpenAICompat } = require('./lib/ai/providers');
@@ -63,6 +74,7 @@ const {
   buildCandidatePageIdentityScript,
   buildCandidateSearchLayoutScript,
   buildSearchCandidateExtractionScript,
+  buildSearchPaginationRevealScript,
   buildSearchPaginationScript,
   hasCompleteCandidateSearchCalibration,
   parseCandidateInstruction
@@ -85,7 +97,8 @@ const {
   COLLECTION_TAB_ID,
   AUTOMATION_TAB_ID,
   MAIL_TAB_ID,
-  XHS_TAB_ID
+  XHS_TAB_ID,
+  PGY_INVITE_TAB_ID
 } = require('./lib/browser_tab_registry');
 
 installProcessStdioGuards(process);
@@ -97,6 +110,8 @@ let browserView = null;
 let taskBrowserView = null;
 let mailBrowserView = null;
 let xhsBrowserView = null;
+let pgyInviteBrowserView = null;
+let pgyInvitePreparedDraft = null;
 let applyBrowserBounds = () => {};
 let collectionInteractionLockState = '';
 let taskInteractionLockState = '';
@@ -359,6 +374,13 @@ function configureBrowserTabView(view, tabId) {
   webContents.setWindowOpenHandler((details) => {
     try {
       const url = String(details?.url || '');
+      if (tabId === PGY_INVITE_TAB_ID) {
+        if (isAllowedPgyInviteNavigationUrl(url)) {
+          webContents.loadURL(url);
+          if (browserTabRegistry.activeId === tabId) sendActiveBrowserUrl();
+        }
+        return { action: 'deny' };
+      }
       if (tabId === COLLECTION_TAB_ID && normalizeXhsProfileUrl(url)) {
         const detailView = ensureXhsBrowserTab();
         activateBrowserTab(XHS_TAB_ID, { force: true });
@@ -374,11 +396,18 @@ function configureBrowserTabView(view, tabId) {
   });
 
   webContents.on('will-navigate', (event, url) => {
+    if (tabId === PGY_INVITE_TAB_ID && !isAllowedPgyInviteNavigationUrl(url)) {
+      event.preventDefault();
+      return;
+    }
     if (tabId !== COLLECTION_TAB_ID || !normalizeXhsProfileUrl(url)) return;
     event.preventDefault();
     const detailView = ensureXhsBrowserTab();
     activateBrowserTab(XHS_TAB_ID, { force: true });
     detailView.webContents.loadURL(url);
+  });
+  webContents.on('will-redirect', (event, url) => {
+    if (tabId === PGY_INVITE_TAB_ID && !isAllowedPgyInviteNavigationUrl(url)) event.preventDefault();
   });
 
   const onNavigation = (_event, url) => {
@@ -495,6 +524,30 @@ function ensureXhsBrowserTab() {
   return xhsBrowserView;
 }
 
+function ensurePgyInviteBrowserTab() {
+  if (pgyInviteBrowserView && !pgyInviteBrowserView.webContents.isDestroyed()) return pgyInviteBrowserView;
+  pgyInviteBrowserView = new BrowserView({
+    webPreferences: {
+      // The invitation operator uses a different PGY account. Never share this
+      // partition with collection or automatic extraction.
+      partition: 'persist:pgy_invite',
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  browserTabRegistry.add({
+    id: PGY_INVITE_TAB_ID,
+    role: 'pgy-invite',
+    title: '邀约账号',
+    closable: true
+  });
+  browserTabViews.set(PGY_INVITE_TAB_ID, pgyInviteBrowserView);
+  configureBrowserTabView(pgyInviteBrowserView, PGY_INVITE_TAB_ID);
+  pgyInviteBrowserView.webContents.loadURL('about:blank');
+  sendBrowserTabsSnapshot();
+  return pgyInviteBrowserView;
+}
+
 function closeBrowserTab(tabId) {
   const safeId = String(tabId || '');
   if (safeId === COLLECTION_TAB_ID || safeId === AUTOMATION_TAB_ID) {
@@ -517,6 +570,10 @@ function closeBrowserTab(tabId) {
     if (!view.webContents.isDestroyed()) view.webContents.destroy();
     if (safeId === MAIL_TAB_ID) mailBrowserView = null;
     if (safeId === XHS_TAB_ID) xhsBrowserView = null;
+    if (safeId === PGY_INVITE_TAB_ID) {
+      pgyInviteBrowserView = null;
+      pgyInvitePreparedDraft = null;
+    }
     activateBrowserTab(browserTabRegistry.activeId, { force: true });
     return { ok: true, activeTabId: browserTabRegistry.activeId };
   } catch (err) {
@@ -2626,6 +2683,9 @@ ipcMain.handle('browser:closeTab', async (_e, tabId) => closeBrowserTab(tabId));
 ipcMain.handle('browser:open', async (_e, url) => {
   const activeView = getActiveBrowserView();
   if (!activeView) return { ok: false, error: 'browserView 未初始化' };
+  if (browserTabRegistry.activeId === PGY_INVITE_TAB_ID) {
+    return { ok: false, code: 'PGY_INVITE_ADDRESS_READ_ONLY', error: '邀约账号地址栏只读，请从已采集名单打开达人' };
+  }
   const lockReason = browserTabNavigationLockReason(browserTabRegistry.activeId);
   if (lockReason) {
     return { ok: false, code: 'BROWSER_NAV_LOCKED', error: `${lockReason}，暂时不能打开其他网页` };
@@ -2650,6 +2710,7 @@ ipcMain.handle('browser:openCollection', async (_e, url) => {
   try {
     ensureCollectionTabActive();
     await browserView.webContents.loadURL(finalUrl);
+    ensureCollectionTabActive();
     sendActiveBrowserUrl();
     return { ok: true, tabId: COLLECTION_TAB_ID, url: finalUrl };
   } catch (err) {
@@ -3415,6 +3476,7 @@ ipcMain.handle('contacts:openPgyCreator', async (_e, creatorUrl) => {
     const detailView = ensureXhsBrowserTab();
     activateBrowserTab(XHS_TAB_ID, { force: true });
     await detailView.webContents.loadURL(url);
+    activateBrowserTab(XHS_TAB_ID, { force: true });
     sendActiveBrowserUrl();
     return { ok: true, tabId: XHS_TAB_ID, url };
   } catch (err) {
@@ -3450,6 +3512,408 @@ ipcMain.handle('contacts:openTencentEmail', async () => {
     tabId: MAIL_TAB_ID,
     url: mailBrowserView?.webContents?.getURL?.() || TENCENT_MAIL_HOME_URL
   };
+});
+
+function resolvePgyInviteTargetPayload(payload = {}) {
+  const runDir = resolveInsideRuns(payload?.runDir || '');
+  if (!runDir) return { ok: false, code: 'PGY_INVITE_RUN_REQUIRED', error: '请选择有效的采集结果' };
+  const preview = getContactPreview(runDir);
+  const target = resolveInviteTargetFromRows(preview?.rows, payload?.rowId);
+  if (!target) {
+    return { ok: false, code: 'PGY_INVITE_ROW_REQUIRED', error: '该达人不在当前采集结果中，已拒绝执行邀约动作' };
+  }
+  return { ok: true, runDir, target };
+}
+
+function sendTrustedPgyInviteClick(webContents, point) {
+  const x = Math.round(Number(point?.x));
+  const y = Math.round(Number(point?.y));
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
+    return { ok: false, code: 'PGY_INVITE_CLICK_TARGET_INVALID', error: '邀约页面返回了无效的控件位置' };
+  }
+  webContents.sendInputEvent({ type: 'mouseMove', x, y });
+  webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  return { ok: true };
+}
+
+async function focusPgyInviteFieldAtPoint(webContents, point) {
+  const x = Math.round(Number(point?.x));
+  const y = Math.round(Number(point?.y));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return { ok: false, code: 'PGY_INVITE_FOCUS_TARGET_INVALID', error: '邀约页面返回了无效的输入框位置' };
+  }
+  const result = await webContents.executeJavaScript(`(() => {
+    let node = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+    let field = node?.matches?.('input, textarea, [contenteditable="true"]') ? node : null;
+    for (let depth = 0; !field && node && depth < 6; depth += 1) {
+      field = node.querySelector?.('input, textarea, [contenteditable="true"]') || null;
+      node = node.parentElement;
+    }
+    if (!field) return { ok: false };
+    if ('value' in field && field.value) {
+      const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (setter) setter.call(field, '');
+      else field.value = '';
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    field.focus({ preventScroll: true });
+    return { ok: document.activeElement === field, readOnly: Boolean(field.readOnly), disabled: Boolean(field.disabled) };
+  })()`, true);
+  if (!result?.ok || result?.disabled || result?.readOnly) {
+    return { ok: false, code: 'PGY_INVITE_BRAND_FOCUS_FAILED', error: '报备品牌选择框已打开，但搜索输入框没有获得焦点' };
+  }
+  return { ok: true };
+}
+
+async function sendTrustedPgyInviteText(webContents, value) {
+  const text = String(value || '').trim();
+  if (!text) return { ok: false, code: 'PGY_INVITE_TEXT_REQUIRED', error: '邀约页面返回了空的输入内容' };
+  try {
+    await Promise.resolve(webContents.insertText(text));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, code: 'PGY_INVITE_TEXT_INPUT_FAILED', error: `邀约页面输入失败：${String(err?.message || err)}` };
+  }
+}
+
+async function drivePgyInviteToDetailForm(inviteView, template) {
+  const deadline = Date.now() + 25000;
+  const retryableEntryCodes = new Set([
+    'PGY_INVITE_BUTTON_NOT_FOUND',
+    'PGY_INVITE_ENTRY_ACTION_NOT_FOUND',
+    'PGY_INVITE_ENTRY_ACTION_DISABLED'
+  ]);
+  let lastResult = null;
+  let actionCount = 0;
+  while (Date.now() < deadline && actionCount < 12) {
+    const formUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
+    if (formUrl) return { ok: true, formUrl };
+    lastResult = await inviteView.webContents.executeJavaScript(buildPgyInviteEntryInspectScript(template), true);
+    if (!lastResult?.ok) {
+      if (retryableEntryCodes.has(lastResult?.code)) {
+        await sleep(250);
+        continue;
+      }
+      return lastResult || { ok: false, code: 'PGY_INVITE_ENTRY_FAILED', error: '没有识别到邀约入口' };
+    }
+    if (!lastResult?.action?.point) {
+      await sleep(180);
+      continue;
+    }
+    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, lastResult.action.point);
+    if (!clicked.ok) return clicked;
+    actionCount += 1;
+    await sleep(lastResult.action.type === 'open-detail-form' ? 700 : 320);
+  }
+  return {
+    ok: false,
+    code: 'PGY_INVITE_DETAIL_FORM_TIMEOUT',
+    error: '已操作邀约入口，但详细邀约表单没有在限定时间内打开',
+    lastResult
+  };
+}
+
+async function preparePgyInviteDetailForm(inviteView, template) {
+  const deadline = Date.now() + 18000;
+  const retryablePrepareCodes = new Set([
+    'PGY_INVITE_DETAIL_FORM_NOT_FOUND'
+  ]);
+  let lastResult = null;
+  let actionCount = 0;
+  while (Date.now() < deadline && actionCount < 10) {
+    lastResult = await inviteView.webContents.executeJavaScript(buildPgyInvitePrepareScript(template), true);
+    if (!lastResult?.ok) {
+      if (retryablePrepareCodes.has(lastResult?.code)) {
+        await sleep(250);
+        continue;
+      }
+      return lastResult;
+    }
+    if (lastResult?.readyToSend) return lastResult;
+    if (Array.isArray(lastResult?.missingFields) && lastResult.missingFields.length === 0 && lastResult?.finalAction?.found) {
+      await sleep(350);
+      continue;
+    }
+    if (!lastResult?.action?.point) return lastResult;
+    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, lastResult.action.point);
+    if (!clicked.ok) return clicked;
+    actionCount += 1;
+    if (lastResult.action.type === 'open-brand-picker') {
+      await sleep(500);
+      const focused = await focusPgyInviteFieldAtPoint(inviteView.webContents, lastResult.action.point);
+      if (!focused.ok) return focused;
+      const typed = await sendTrustedPgyInviteText(inviteView.webContents, lastResult.action.value || lastResult.action.label);
+      if (!typed.ok) return typed;
+      await sleep(700);
+    } else {
+      await sleep(lastResult.action.type === 'select-brand' ? 600 : 280);
+    }
+  }
+  if (lastResult?.action?.point) {
+    return {
+      ...lastResult,
+      ok: false,
+      code: 'PGY_INVITE_FORM_PREPARE_TIMEOUT',
+      error: `详细邀约表单填写超时，停在动作：${lastResult.action.type || lastResult.action.label || 'unknown'}`,
+      lastResult
+    };
+  }
+  return lastResult || { ok: false, code: 'PGY_INVITE_FORM_PREPARE_TIMEOUT', error: '详细邀约表单填写超时' };
+}
+
+ipcMain.handle('invites:openAccount', async () => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换到邀约账号` };
+  }
+  try {
+    const inviteView = ensurePgyInviteBrowserTab();
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    if (!activated?.ok) return activated;
+    const currentUrl = String(inviteView.webContents.getURL() || '');
+    if (!isAllowedTaskUrl(currentUrl)) await inviteView.webContents.loadURL(PGY_CANDIDATE_RESULTS_URL);
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    sendActiveBrowserUrl();
+    return {
+      ok: true,
+      tabId: PGY_INVITE_TAB_ID,
+      url: inviteView.webContents.getURL() || PGY_CANDIDATE_RESULTS_URL,
+      accountProfile: 'invite'
+    };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('invites:checkLogin', async () => {
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能检测邀约账号` };
+  }
+  try {
+    const inviteView = ensurePgyInviteBrowserTab();
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    if (!activated?.ok) return activated;
+    const currentUrl = String(inviteView.webContents.getURL() || '');
+    if (!isAllowedTaskUrl(currentUrl)) await inviteView.webContents.loadURL(PGY_CANDIDATE_RESULTS_URL);
+    const result = await pgyCheckLogin(inviteView.webContents);
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    sendActiveBrowserUrl();
+    return { ...result, tabId: PGY_INVITE_TAB_ID, accountProfile: 'invite' };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('invites:openCreator', async (_e, payload = {}) => {
+  if (!browserView) return { ok: false, error: 'browserView 未初始化' };
+  if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_ACTIVE', error: '请先完成或结束当前候选读取' };
+  }
+  if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
+  if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
+  const resolved = resolvePgyInviteTargetPayload(payload);
+  if (!resolved.ok) return resolved;
+  const { target } = resolved;
+  const url = target.creatorUrl;
+  const successResult = () => ({
+    ok: true,
+    tabId: PGY_INVITE_TAB_ID,
+    url,
+    rowId: target.rowId,
+    creatorName: target.creatorName,
+    accountProfile: 'invite'
+  });
+  try {
+    pgyInvitePreparedDraft = null;
+    const inviteView = ensurePgyInviteBrowserTab();
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    if (!activated?.ok) return activated;
+    const currentCreatorUrl = normalizePgyInviteCreatorUrl(inviteView.webContents.getURL());
+    if (currentCreatorUrl !== url) await inviteView.webContents.loadURL(url);
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    sendActiveBrowserUrl();
+    return successResult();
+  } catch (err) {
+    const settleDeadline = Date.now() + 3000;
+    while (Date.now() < settleDeadline) {
+      if (normalizePgyInviteCreatorUrl(ensurePgyInviteBrowserTab().webContents.getURL()) === url) {
+        activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+        sendActiveBrowserUrl();
+        return successResult();
+      }
+      await sleep(160);
+    }
+    return { ok: false, error: String(err?.message || err) };
+  }
+});
+
+ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能准备邀约` };
+  }
+  const resolved = resolvePgyInviteTargetPayload(payload);
+  if (!resolved.ok) return resolved;
+  const { runDir, target } = resolved;
+  const templateValidation = validatePgyInviteTemplate(payload?.template || {});
+  if (!templateValidation.ok) {
+    return {
+      ok: false,
+      code: 'PGY_INVITE_TEMPLATE_INCOMPLETE',
+      error: templateValidation.errors.join('；')
+    };
+  }
+  const template = templateValidation.template;
+  const inviteView = ensurePgyInviteBrowserTab();
+  let currentUrl = '';
+  const targetUrlDeadline = Date.now() + 8000;
+  while (Date.now() < targetUrlDeadline) {
+    currentUrl = normalizePgyInviteCreatorUrl(inviteView.webContents.getURL());
+    if (currentUrl === target.creatorUrl) break;
+    await sleep(160);
+  }
+  if (!currentUrl || currentUrl !== target.creatorUrl) {
+    pgyInvitePreparedDraft = null;
+    return {
+      ok: false,
+      code: 'PGY_INVITE_TARGET_MISMATCH',
+      error: '邀约账号未能稳定切换到所选达人，请重新点击“准备邀约”',
+      currentUrl,
+      expectedUrl: target.creatorUrl
+    };
+  }
+  try {
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    const entry = await drivePgyInviteToDetailForm(inviteView, template);
+    if (!entry?.ok) {
+      pgyInvitePreparedDraft = null;
+      activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+      sendActiveBrowserUrl();
+      return {
+        ...entry,
+        ok: false,
+        creatorName: target.creatorName,
+        rowId: target.rowId
+      };
+    }
+    const prepared = await preparePgyInviteDetailForm(inviteView, template);
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    sendActiveBrowserUrl();
+    if (!prepared?.ok || !prepared?.readyToSend) {
+      pgyInvitePreparedDraft = null;
+      return {
+        ...prepared,
+        ok: false,
+        code: prepared?.code || 'PGY_INVITE_NOT_READY',
+        error: prepared?.error || `邀约表单校验未通过${prepared?.missingOptions?.length ? `：${prepared.missingOptions.join('、')}` : ''}`,
+        creatorName: target.creatorName,
+        rowId: target.rowId
+      };
+    }
+    const formUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
+    if (!formUrl || formUrl !== normalizePgyInviteFormUrl(prepared?.formUrl)) {
+      pgyInvitePreparedDraft = null;
+      return { ok: false, code: 'PGY_INVITE_FORM_URL_MISMATCH', error: '详细邀约表单地址发生变化，请重新准备邀约' };
+    }
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      runDir,
+      rowId: target.rowId,
+      creatorUrl: target.creatorUrl,
+      formUrl,
+      template
+    })).digest('hex');
+    const token = crypto.randomUUID();
+    const expiresAt = Date.now() + (10 * 60 * 1000);
+    pgyInvitePreparedDraft = {
+      token,
+      fingerprint,
+      expiresAt,
+      runDir,
+      rowId: target.rowId,
+      creatorName: target.creatorName,
+      creatorUrl: target.creatorUrl,
+      formUrl,
+      template
+    };
+    return {
+      ...prepared,
+      ok: true,
+      creatorName: target.creatorName,
+      rowId: target.rowId,
+      token,
+      fingerprint,
+      expiresAt,
+      template: {
+        cooperationGoal: template.cooperationGoal,
+        cooperationMode: template.cooperationMode,
+        contactMethod: template.contactMethod,
+        contactChannel: template.contactChannel,
+        brandName: template.brandName,
+        productName: template.productName,
+        contactWay: template.contactWay,
+        intro: template.intro,
+        publishStart: template.publishStart,
+        publishEnd: template.publishEnd,
+        agency: prepared?.agency || ''
+      }
+    };
+  } catch (err) {
+    pgyInvitePreparedDraft = null;
+    return { ok: false, code: 'PGY_INVITE_PREPARE_FAILED', error: `准备邀约失败：${String(err?.message || err)}` };
+  }
+});
+
+ipcMain.handle('invites:sendPrepared', async (_e, payload = {}) => {
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能发送邀约` };
+  }
+  const resolved = resolvePgyInviteTargetPayload(payload);
+  if (!resolved.ok) return resolved;
+  const { runDir, target } = resolved;
+  const draft = pgyInvitePreparedDraft;
+  if (!draft || draft.token !== String(payload?.token || '') || draft.fingerprint !== String(payload?.fingerprint || '')) {
+    return { ok: false, code: 'PGY_INVITE_CONFIRMATION_REQUIRED', error: '发送凭证无效，请重新准备并确认邀约' };
+  }
+  if (Date.now() > draft.expiresAt) {
+    pgyInvitePreparedDraft = null;
+    return { ok: false, code: 'PGY_INVITE_CONFIRMATION_EXPIRED', error: '发送确认已过期，请重新准备邀约' };
+  }
+  if (draft.runDir !== runDir || draft.rowId !== target.rowId || draft.creatorUrl !== target.creatorUrl) {
+    pgyInvitePreparedDraft = null;
+    return { ok: false, code: 'PGY_INVITE_TARGET_CHANGED', error: '发送目标已变化，请重新准备邀约' };
+  }
+  const inviteView = ensurePgyInviteBrowserTab();
+  const currentUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
+  if (!currentUrl || currentUrl !== draft.formUrl) {
+    pgyInvitePreparedDraft = null;
+    return { ok: false, code: 'PGY_INVITE_TARGET_MISMATCH', error: '发送前发现详细邀约表单已切换，已停止发送' };
+  }
+  pgyInvitePreparedDraft = null;
+  try {
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    const verified = await inviteView.webContents.executeJavaScript(buildPgyInviteSendScript(draft.template), true);
+    if (!verified?.ok || !verified?.ready || !verified?.finalAction?.point) return verified;
+    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, verified.finalAction.point);
+    if (!clicked.ok) return clicked;
+    await sleep(1800);
+    const outcome = await inviteView.webContents.executeJavaScript(buildPgyInviteOutcomeScript(), true);
+    activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    sendActiveBrowserUrl();
+    return {
+      ...outcome,
+      clicked: true,
+      creatorName: target.creatorName,
+      rowId: target.rowId,
+      accountProfile: 'invite'
+    };
+  } catch (err) {
+    return { ok: false, code: 'PGY_INVITE_SEND_FAILED', error: `邀约按钮点击失败：${String(err?.message || err)}` };
+  }
 });
 
 ipcMain.handle('contacts:checkXhsLogin', async () => {
@@ -3630,6 +4094,43 @@ ipcMain.handle('pgy:checkLogin', async () => {
   return await pgyCheckLogin();
 });
 
+function candidatePaginationReady(pagination = {}) {
+  const pageNumbers = Array.isArray(pagination?.pageNumbers) ? pagination.pageNumbers : [];
+  return Boolean(
+    pagination?.ok
+    && String(pagination?.selector || '').trim()
+    && (pagination?.currentPageKnown || pagination?.firstPageKnown)
+    && pageNumbers.length >= 2
+  );
+}
+
+async function inspectCandidateSearchPageWithReveal(webContents, calibration = {}) {
+  const inspect = async (candidateCalibration) => {
+    const [layout, pagination] = await Promise.all([
+      webContents.executeJavaScript(buildCandidateSearchLayoutScript(candidateCalibration), true),
+      webContents.executeJavaScript(buildSearchPaginationScript('inspect', 1, candidateCalibration), true)
+    ]);
+    return { layout: layout || {}, pagination: pagination || {} };
+  };
+
+  let snapshot = await inspect(calibration);
+  if (candidatePaginationReady(snapshot.pagination)) return { ...snapshot, reveal: null, attempts: 1 };
+
+  const reveal = await webContents.executeJavaScript(
+    buildSearchPaginationRevealScript(calibration),
+    true
+  );
+  const discoveryCalibration = { ...calibration, paginationSelector: '' };
+  let attempts = 1;
+  for (const waitMs of [500, 1000, 1800]) {
+    await sleep(waitMs);
+    attempts += 1;
+    snapshot = await inspect(discoveryCalibration);
+    if (candidatePaginationReady(snapshot.pagination)) break;
+  }
+  return { ...snapshot, reveal: reveal || null, attempts };
+}
+
 ipcMain.handle('pgy:inspectCandidateSearchLayout', async (_e, templatePath) => {
   if (!browserView) return { ok: false, error: 'browserView 未初始化' };
   const rejected = rejectNonPgyCurrentPageForBrowserAutomation('检查搜索结果布局');
@@ -3638,19 +4139,12 @@ ipcMain.handle('pgy:inspectCandidateSearchLayout', async (_e, templatePath) => {
   if (!loaded.ok) return loaded;
   const calibration = loaded.calibration || {};
   try {
-    const [layout, pagination] = await Promise.all([
-      browserView.webContents.executeJavaScript(
-        buildCandidateSearchLayoutScript(calibration),
-        true
-      ),
-      browserView.webContents.executeJavaScript(
-        buildSearchPaginationScript('inspect', 1, calibration),
-        true
-      )
-    ]);
+    const inspected = await inspectCandidateSearchPageWithReveal(browserView.webContents, calibration);
+    const layout = inspected.layout || {};
+    const pagination = inspected.pagination || {};
     return {
       ok: true,
-      ...(layout || {}),
+      ...layout,
       pagination: {
         ok: Boolean(pagination?.ok),
         currentPage: pagination?.currentPage || (pagination?.atFirstPage ? 1 : null),
@@ -3659,7 +4153,10 @@ ipcMain.handle('pgy:inspectCandidateSearchLayout', async (_e, templatePath) => {
         controlCount: Number(pagination?.controlCount || 0),
         selector: String(pagination?.selector || ''),
         calibrated: Boolean(pagination?.calibrated),
-        error: pagination?.error || ''
+        error: pagination?.error || '',
+        revealed: Boolean(inspected.reveal?.found || inspected.reveal?.scrolled),
+        revealMethod: String(inspected.reveal?.method || ''),
+        inspectAttempts: Number(inspected.attempts || 1)
       }
     };
   } catch (err) {
@@ -3680,13 +4177,7 @@ ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath)
     return { ok: false, code: 'PGY_CANDIDATE_CALIBRATION_REQUIRED', error: '请先完成达人整行、达人昵称和分页区域三项标定。' };
   }
 
-  const inspectPage = async () => {
-    const [layout, pagination] = await Promise.all([
-      browserView.webContents.executeJavaScript(buildCandidateSearchLayoutScript(calibration), true),
-      browserView.webContents.executeJavaScript(buildSearchPaginationScript('inspect', 1, calibration), true)
-    ]);
-    return { layout: layout || {}, pagination: pagination || {} };
-  };
+  const inspectPage = async () => inspectCandidateSearchPageWithReveal(browserView.webContents, calibration);
   const waitForPage = async (targetPage, previousNames = []) => {
     const previousFingerprint = previousNames.join('\n');
     const deadline = Date.now() + 15000;
@@ -3747,18 +4238,24 @@ ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath)
     if (!risk?.ok || risk.riskDetected) {
       return { ok: false, code: 'PGY_RISK_STOP', error: '检测到登录或安全提示，未执行跨页验证。' };
     }
-    const next = await browserView.webContents.executeJavaScript(
-      buildSearchPaginationScript('next', 1, calibration),
+    let next = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('goto', 2, calibration),
       true
     );
-    if (!next?.clicked) {
-      return { ok: false, code: 'PGY_PAGINATION_NEXT_NOT_FOUND', error: '分页区内没有找到可用的下一页按钮。' };
+    if (!next?.clicked && !next?.alreadyAtTarget) {
+      next = await browserView.webContents.executeJavaScript(
+        buildSearchPaginationScript('next', 1, calibration),
+        true
+      );
+    }
+    if (!next?.clicked && !next?.alreadyAtTarget) {
+      return { ok: false, code: 'PGY_PAGINATION_NEXT_NOT_FOUND', error: '分页区内没有找到可用的第 2 页或下一页按钮。' };
     }
     await sleep(PGY_MIN_TAB_WAIT_MS);
     const second = await waitForPage(2, firstNames);
     if (!second) {
       await restoreFirstPage();
-      return { ok: false, code: 'PGY_PAGINATION_PAGE_MISMATCH', error: '点击下一页后，未能同时确认第 2 页页码和新的达人顺序。' };
+      return { ok: false, code: 'PGY_PAGINATION_PAGE_MISMATCH', error: '自动进入第 2 页后，未能同时确认页码和新的达人顺序。' };
     }
     const secondNames = Array.isArray(second.layout?.names) ? second.layout.names : [];
     if (

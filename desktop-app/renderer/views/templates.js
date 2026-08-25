@@ -1,6 +1,14 @@
 import { store } from '../state/store.js';
 import { createActionRow, createAdvancedSection, createNotice, createPageIntro, createStepCard } from '../ui/components.js';
-import { chooseCalibrationSelector, isCandidateCalibrationPassed } from '../state/calibration_selector.mjs';
+import {
+  assessCandidateResultsReturn,
+  chooseCalibrationSelector,
+  isCandidateCalibrationPassed,
+  normalizeCandidateValidationRecord,
+  resolveCandidatePaginationFeedback,
+  resolveCandidateCalibrationStepStatus,
+  resolveCandidateCalibrationSummary
+} from '../state/calibration_selector.mjs';
 
 let _loadedOnce = false;
 let _activePath = '';
@@ -16,6 +24,8 @@ let _candidateCalibrationStarted = false;
 let _candidateCalibrationStep = 'candidate_row';
 let _candidateCalibrationResult = null;
 let _candidatePaginationResult = null;
+let _candidatePaginationDiscoveryResult = null;
+let _candidateCalibrationStepStates = {};
 
 const ANNOTATION_FIELDS = [
   { key: 'candidate_row', label: '搜索结果中的一整行达人', candidateSearchKey: 'rowSelector', repeatable: true },
@@ -47,8 +57,8 @@ const CANDIDATE_CALIBRATION_STEPS = [
     key: 'candidate_pagination',
     selectorKey: 'paginationSelector',
     title: '标定分页区域',
-    action: '让系统自动定位页码、上一页和下一页',
-    description: '蒲公英常把分页栏放在内部滚动区深处；系统会直接识别整条分页结构，无需手动寻找。'
+    action: '让系统自动找到整条分页栏',
+    description: '右侧会短暂滚到底部再恢复，只为触发分页栏加载并读取位置；本步骤不会翻页。'
   }
 ];
 
@@ -86,6 +96,9 @@ function sanitizeTemplate(data) {
     const value = String(d.candidate_search[key] || '').trim();
     d.candidate_search[key] = value || null;
   }
+  const lastValidation = normalizeCandidateValidationRecord(d.candidate_search.lastValidation);
+  if (lastValidation) d.candidate_search.lastValidation = lastValidation;
+  else delete d.candidate_search.lastValidation;
 
   const fixRow = (r) => {
     const row = { ...(r || {}) };
@@ -158,6 +171,8 @@ async function loadTemplate(root, filePath) {
     _candidateCalibrationStep = missingStep?.key || 'candidate_row';
     _candidateCalibrationResult = null;
     _candidatePaginationResult = null;
+    _candidatePaginationDiscoveryResult = null;
+    _candidateCalibrationStepStates = {};
     setMsg(root, '');
     store.set({
       templates: { ...store.state.templates, activeTemplatePath: _activePath }
@@ -228,6 +243,7 @@ async function saveAnnotationResult(root, state, field, result, sourceLabel = ''
       ? _draft.candidate_search
       : {};
     _draft.candidate_search[field.candidateSearchKey] = selector;
+    delete _draft.candidate_search.lastValidation;
     _candidateCalibrationResult = null;
     _candidatePaginationResult = null;
   } else {
@@ -262,6 +278,7 @@ async function inspectCandidateSearchLayout(root, state) {
   if (!result?.ok) {
     _candidateCalibrationResult = result || null;
     setMsg(root, `搜索结果校准失败：${result?.error || 'unknown error'}`);
+    store.set({ templates: { ...store.state.templates } });
     return result;
   }
   const page = result.pagination || {};
@@ -283,6 +300,8 @@ async function inspectCandidateSearchLayout(root, state) {
     warnings.push('达人昵称位置与达人整行相同，昵称校准过宽');
   }
   if (!page.currentPageKnown) warnings.push('分页区域没有确认当前页');
+  if (!page.ok || !String(page.selector || '').trim()) warnings.push('分页区域尚未完整定位');
+  if (!Array.isArray(page.pageNumbers) || page.pageNumbers.length < 2) warnings.push('没有识别到至少两个可切换页码');
   setMsg(root, [
     warnings.length ? '校准尚未通过。' : '校准通过，可以按排名跨页累计。',
     `当前页：${pageLabel}；可见页码：${visiblePages}`,
@@ -572,7 +591,13 @@ export function renderTemplates(state) {
     try {
       await inspectCandidateSearchLayout(root, state);
     } catch (error) {
+      _candidateCalibrationResult = {
+        ok: false,
+        passed: false,
+        error: error?.message || String(error)
+      };
       setMsg(root, `搜索结果布局检查异常：${error?.message || String(error)}`);
+      store.set({ templates: { ...store.state.templates } });
     } finally {
       _busy = false;
     }
@@ -685,26 +710,32 @@ export function renderTemplates(state) {
   const summary = document.createElement('div');
   summary.className = 'rule-summary-card';
   const savedCandidateSelectors = _draft?.candidate_search || {};
+  const savedCandidateValidation = normalizeCandidateValidationRecord(savedCandidateSelectors.lastValidation);
   const savedCandidateCount = CANDIDATE_CALIBRATION_STEPS.filter((step) => (
     Boolean(String(savedCandidateSelectors?.[step.selectorKey] || '').trim())
   )).length;
-  const ruleStatus = !_draft
-    ? '未加载'
-    : savedCandidateCount === 0
-      ? '未校准'
-      : savedCandidateCount < CANDIDATE_CALIBRATION_STEPS.length
-        ? `校准中 ${savedCandidateCount}/3`
-        : (_candidatePaginationResult?.passed
-          ? '跨页可用'
-          : (_candidateCalibrationResult?.passed ? '本页已验证' : '待验证'));
+  const calibrationSummary = resolveCandidateCalibrationSummary({
+    hasDraft: Boolean(_draft),
+    savedCount: savedCandidateCount,
+    busy: Object.values(_candidateCalibrationStepStates).includes('running'),
+    calibrationResult: _candidateCalibrationResult,
+    paginationResult: _candidatePaginationResult,
+    previousValidation: savedCandidateValidation
+  });
   summary.innerHTML = `
     <div>
       <div class="rule-summary-title">当前校准记录</div>
       <div class="rule-summary-name">${activeFile ? (activeFile.name || '默认规则') : '尚未选择规则'}</div>
       <div class="rule-summary-meta">${activeFile ? `更新时间：${fmtTime(activeFile.mtime)}` : '点击“刷新规则”后会自动加载默认规则'}</div>
     </div>
-    <div class="rule-summary-status">${ruleStatus}</div>
+    <div class="rule-summary-status ${calibrationSummary.tone}" role="status">${calibrationSummary.label}</div>
   `;
+  const setLiveSummaryStatus = (label, tone = 'running') => {
+    const status = summary.querySelector('.rule-summary-status');
+    if (!status) return;
+    status.className = `rule-summary-status ${tone}`;
+    status.textContent = label;
+  };
   root.appendChild(summary);
 
   const candidateWizard = document.createElement('section');
@@ -720,25 +751,32 @@ export function renderTemplates(state) {
   candidateWizardCopy.appendChild(candidateWizardSubtitle);
   const startCalibrationBtn = document.createElement('button');
   startCalibrationBtn.className = 'btn primary';
-  const calibratedSelectors = _draft?.candidate_search || {};
+  const calibratedSelectors = savedCandidateSelectors;
   const completedCalibrationSteps = CANDIDATE_CALIBRATION_STEPS.filter((step) => (
     Boolean(String(calibratedSelectors?.[step.selectorKey] || '').trim())
   ));
-  startCalibrationBtn.textContent = completedCalibrationSteps.length ? '重新校准' : '开始校准';
+  startCalibrationBtn.textContent = (_candidateCalibrationStarted || completedCalibrationSteps.length)
+    ? '重新开始校准'
+    : '开始校准';
+  startCalibrationBtn.title = completedCalibrationSteps.length
+    ? '开始一次新的校准流程；现有规则只会在新步骤成功后更新'
+    : '开始搜索结果校准';
   startCalibrationBtn.disabled = !_draft;
   startCalibrationBtn.addEventListener('click', async () => {
     const returned = await window.desktopAPI.browser.returnToCollectionResults();
-    if (!returned?.ok) {
-      setMsg(root, `无法开始校准：${returned?.error || '请先结束正在运行的任务'}`);
+    const returnAssessment = assessCandidateResultsReturn(returned);
+    if (!returnAssessment.ok) {
+      setMsg(root, `无法开始校准：${returnAssessment.error}`);
       return;
     }
-    if (returned.warning) setMsg(root, returned.warning);
     _candidateCalibrationStarted = true;
     _candidateCalibrationStep = CANDIDATE_CALIBRATION_STEPS.find((step) => (
       !String(_draft?.candidate_search?.[step.selectorKey] || '').trim()
     ))?.key || 'candidate_row';
     _candidateCalibrationResult = null;
     _candidatePaginationResult = null;
+    _candidatePaginationDiscoveryResult = null;
+    _candidateCalibrationStepStates = {};
     store.set({ templates: { ...store.state.templates } });
   });
   const returnToResultsBtn = document.createElement('button');
@@ -763,11 +801,19 @@ export function renderTemplates(state) {
   const nextActionLabel = document.createElement('b');
   nextActionLabel.textContent = '当前下一步';
   const nextActionText = document.createElement('span');
-  nextActionText.textContent = !_candidateCalibrationStarted
-    ? '先确认右侧是蒲公英筛选结果页，再点击“开始校准”。'
-    : completedCalibrationSteps.length === CANDIDATE_CALIBRATION_STEPS.length
-      ? '三项位置已保存。先验证本页，再验证跨页；两项都通过才用于前 50 位采集。'
-      : `${currentCalibrationStep?.title || '继续校准'}：${currentCalibrationStep?.action || '按当前高亮步骤操作'}`;
+  nextActionText.textContent = calibrationSummary.key === 'success'
+    ? '校准成功。本页和跨页均已验证，可以按排名采集。'
+    : calibrationSummary.key === 'failed'
+      ? '校准失败。查看红色步骤和下方失败原因，重新校准后再验证。'
+      : _candidateCalibrationResult?.passed
+        ? '本页验证成功。继续点击“验证跨页”，通过后才可用于前 50 位采集。'
+      : calibrationSummary.key === 'previous-success' && !_candidateCalibrationStarted
+        ? '已保留上次成功证据。请先确认右侧仍是本次筛选结果，再验证本页和跨页。'
+      : !_candidateCalibrationStarted
+        ? `先确认右侧是蒲公英筛选结果页，再点击“${completedCalibrationSteps.length ? '重新开始校准' : '开始校准'}”。`
+        : completedCalibrationSteps.length === CANDIDATE_CALIBRATION_STEPS.length
+          ? '三项位置已保存。先验证本页，再验证跨页；两项都通过才算校准成功。'
+          : `${currentCalibrationStep?.title || '继续校准'}：${currentCalibrationStep?.action || '按当前高亮步骤操作'}`;
   nextAction.appendChild(nextActionLabel);
   nextAction.appendChild(nextActionText);
   candidateWizard.appendChild(nextAction);
@@ -778,65 +824,188 @@ export function renderTemplates(state) {
     const field = ANNOTATION_FIELDS.find((item) => item.key === step.key);
     const isSaved = Boolean(String(calibratedSelectors?.[step.selectorKey] || '').trim());
     const isCurrent = _candidateCalibrationStarted && _candidateCalibrationStep === step.key;
+    const stepStatus = resolveCandidateCalibrationStepStatus({
+      stepKey: step.key,
+      isSaved,
+      runtimeStatus: _candidateCalibrationStepStates[step.key],
+      calibrationResult: _candidateCalibrationResult,
+      paginationResult: _candidatePaginationResult
+    });
     const row = document.createElement('div');
-    row.className = `candidate-calibration-step${isCurrent ? ' current' : ''}${isSaved ? ' done' : ''}`;
+    row.className = `candidate-calibration-step status-${stepStatus.tone}${isCurrent ? ' current' : ''}`;
     const number = document.createElement('span');
-    number.className = 'candidate-calibration-number';
-    number.textContent = isSaved ? 'OK' : String(index + 1);
+    number.className = `candidate-calibration-number ${stepStatus.tone}`;
+    number.textContent = String(index + 1);
     const copy = document.createElement('div');
     copy.className = 'candidate-calibration-copy';
+    const titleRow = document.createElement('div');
+    titleRow.className = 'candidate-calibration-title-row';
     const title = document.createElement('b');
     title.textContent = step.title;
+    const statusBadge = document.createElement('span');
+    statusBadge.className = `candidate-calibration-status ${stepStatus.tone}`;
+    statusBadge.setAttribute('role', 'status');
+    statusBadge.setAttribute('aria-live', 'polite');
+    const statusDot = document.createElement('i');
+    statusDot.setAttribute('aria-hidden', 'true');
+    const statusText = document.createElement('span');
+    statusText.textContent = stepStatus.label;
+    statusBadge.appendChild(statusDot);
+    statusBadge.appendChild(statusText);
+    titleRow.appendChild(title);
+    titleRow.appendChild(statusBadge);
     const action = document.createElement('span');
     action.textContent = step.action;
     const description = document.createElement('small');
     description.textContent = step.description;
-    copy.appendChild(title);
+    copy.appendChild(titleRow);
     copy.appendChild(action);
     copy.appendChild(description);
     const button = document.createElement('button');
     button.className = isCurrent ? 'btn primary' : 'btn ghost';
-    button.textContent = step.key === 'candidate_pagination'
-      ? (isSaved ? '重新定位' : '自动定位')
-      : (isSaved ? '重新标定' : '开始这一步');
+    button.textContent = isSaved ? '重新校准' : '校准这一步';
     button.disabled = !_draft || !_candidateCalibrationStarted;
+    let paginationFeedback = null;
+    let paginationFeedbackTitle = null;
+    let paginationFeedbackDetail = null;
+    let paginationFeedbackNext = null;
+    const paintPaginationFeedback = () => {
+      if (!paginationFeedback) return;
+      const feedback = resolveCandidatePaginationFeedback({
+        isSaved,
+        discoveryResult: _candidatePaginationDiscoveryResult,
+        paginationResult: _candidatePaginationResult,
+        previousValidation: savedCandidateValidation
+      });
+      paginationFeedback.className = `candidate-pagination-feedback ${feedback.tone}`;
+      paginationFeedback.setAttribute('data-state', feedback.key);
+      paginationFeedbackTitle.textContent = feedback.title;
+      paginationFeedbackDetail.textContent = feedback.detail;
+      paginationFeedbackNext.textContent = feedback.next;
+    };
+    if (step.key === 'candidate_pagination') {
+      paginationFeedback = document.createElement('div');
+      paginationFeedback.className = 'candidate-pagination-feedback pending';
+      paginationFeedback.setAttribute('data-role', 'pagination-feedback');
+      paginationFeedback.setAttribute('role', 'status');
+      paginationFeedback.setAttribute('aria-live', 'polite');
+      paginationFeedbackTitle = document.createElement('b');
+      paginationFeedbackDetail = document.createElement('span');
+      paginationFeedbackNext = document.createElement('small');
+      paginationFeedback.appendChild(paginationFeedbackTitle);
+      paginationFeedback.appendChild(paginationFeedbackDetail);
+      paginationFeedback.appendChild(paginationFeedbackNext);
+      paintPaginationFeedback();
+    }
+    const paintStepState = (runtimeStatus = '') => {
+      if (runtimeStatus) _candidateCalibrationStepStates[step.key] = runtimeStatus;
+      else delete _candidateCalibrationStepStates[step.key];
+      const visual = resolveCandidateCalibrationStepStatus({
+        stepKey: step.key,
+        isSaved: runtimeStatus === 'saved' || isSaved,
+        runtimeStatus,
+        calibrationResult: _candidateCalibrationResult,
+        paginationResult: _candidatePaginationResult
+      });
+      row.classList.remove('status-pending', 'status-running', 'status-saved', 'status-success', 'status-failed');
+      row.classList.add(`status-${visual.tone}`);
+      number.className = `candidate-calibration-number ${visual.tone}`;
+      statusBadge.className = `candidate-calibration-status ${visual.tone}`;
+      statusText.textContent = visual.label;
+      button.disabled = runtimeStatus === 'running' || !_draft || !_candidateCalibrationStarted;
+      button.textContent = runtimeStatus === 'running'
+        ? '校准中...'
+        : ((runtimeStatus === 'saved' || isSaved) ? '重新校准' : '校准这一步');
+      if (runtimeStatus === 'running') setLiveSummaryStatus('校准中', 'running');
+    };
     button.addEventListener('click', async () => {
       if (_busy) return;
       _candidateCalibrationStep = step.key;
       _candidateCalibrationResult = null;
       _candidatePaginationResult = null;
-      let result = null;
       if (step.key === 'candidate_pagination') {
-        const templatePath = _activePath || state.templates.activeTemplatePath;
-        if (!templatePath) return;
-        _busy = true;
-        setMsg(root, '正在自动定位右侧蒲公英分页区域...');
-        try {
-          const inspected = await window.desktopAPI.pgy.inspectCandidateSearchLayout(templatePath);
-          const selector = String(inspected?.pagination?.selector || '').trim();
-          if (!inspected?.ok || !selector) {
-            setMsg(root, `自动定位分页失败：${inspected?.error || inspected?.pagination?.error || '未找到完整分页栏'}`);
-            return;
-          }
-          const saved = await saveAnnotationResult(root, state, field, {
-            ok: true,
-            selector,
-            count: Number(inspected?.pagination?.controlCount || 0),
-            text: Array.isArray(inspected?.pagination?.pageNumbers)
-              ? `页码 ${inspected.pagination.pageNumbers.join('、')}`
-              : '分页区域'
-          }, '自动定位');
-          result = saved?.ok ? { ok: true, selector } : saved;
-        } catch (error) {
-          setMsg(root, `自动定位分页异常：${error?.message || String(error)}`);
-          return;
-        } finally {
-          _busy = false;
-        }
-      } else {
-        result = await pickField(field);
+        _candidatePaginationDiscoveryResult = { status: 'running' };
+        paintPaginationFeedback();
       }
-      if (!result?.ok) return;
+      paintStepState('running');
+      let result = null;
+      const handlesBusyState = step.key === 'candidate_pagination';
+      try {
+        if (step.key === 'candidate_pagination') {
+          const templatePath = _activePath || state.templates.activeTemplatePath;
+          if (!templatePath) {
+            result = { ok: false, error: '尚未选择校准记录' };
+          } else {
+            _busy = true;
+            setMsg(root, '正在自动滚动右侧结果区并定位完整分页栏，请稍候...');
+            const inspected = await window.desktopAPI.pgy.inspectCandidateSearchLayout(templatePath);
+            const pagination = inspected?.pagination || {};
+            const selector = String(pagination.selector || '').trim();
+            const pageNumbers = Array.isArray(pagination.pageNumbers) ? pagination.pageNumbers : [];
+            const paginationReady = Boolean(
+              inspected?.ok
+              && pagination.ok
+              && selector
+              && pagination.currentPageKnown
+              && pageNumbers.length >= 2
+            );
+            if (!paginationReady) {
+              const error = inspected?.error || pagination.error || '已自动滚动到底部，但未找到可确认当前页的完整分页栏';
+              result = { ok: false, error };
+              setMsg(root, `自动定位分页失败：${error}`);
+            } else {
+              const saved = await saveAnnotationResult(root, state, field, {
+                ok: true,
+                selector,
+                count: Number(pagination.controlCount || 0),
+                text: pageNumbers.length
+                  ? `页码 ${pageNumbers.join('、')}`
+                  : '分页区域'
+              }, '自动定位');
+              result = saved?.ok
+                ? {
+                    ok: true,
+                    selector,
+                    pagination: {
+                      currentPage: pagination.currentPage,
+                      pageNumbers,
+                      controlCount: Number(pagination.controlCount || 0),
+                      revealed: Boolean(pagination.revealed),
+                      inspectAttempts: Number(pagination.inspectAttempts || 1)
+                    }
+                  }
+                : saved;
+            }
+          }
+        } else {
+          result = await pickField(field);
+        }
+      } catch (error) {
+        result = { ok: false, error: error?.message || String(error) };
+        setMsg(root, `校准异常：${result.error}`);
+      } finally {
+        if (handlesBusyState) _busy = false;
+      }
+      if (!result?.ok) {
+        if (step.key === 'candidate_pagination' && !result?.canceled) {
+          _candidatePaginationDiscoveryResult = {
+            status: 'failed',
+            error: result?.error || '分页栏定位失败'
+          };
+          paintPaginationFeedback();
+        }
+        paintStepState(result?.canceled ? '' : 'failed');
+        store.set({ templates: { ...store.state.templates } });
+        return;
+      }
+      if (step.key === 'candidate_pagination') {
+        _candidatePaginationDiscoveryResult = {
+          status: 'success',
+          ...(result.pagination || {})
+        };
+        paintPaginationFeedback();
+      }
+      paintStepState('saved');
       const next = CANDIDATE_CALIBRATION_STEPS[index + 1];
       _candidateCalibrationStep = next?.key || step.key;
       if (!next) {
@@ -844,6 +1013,11 @@ export function renderTemplates(state) {
           _busy = true;
           await inspectCandidateSearchLayout(root, state);
         } catch (error) {
+          _candidateCalibrationResult = {
+            ok: false,
+            passed: false,
+            error: error?.message || String(error)
+          };
           setMsg(root, `自动验证异常：${error?.message || String(error)}`);
         } finally {
           _busy = false;
@@ -854,37 +1028,64 @@ export function renderTemplates(state) {
     row.appendChild(number);
     row.appendChild(copy);
     row.appendChild(button);
+    if (paginationFeedback) row.appendChild(paginationFeedback);
     candidateStepList.appendChild(row);
   });
   candidateWizard.appendChild(candidateStepList);
 
+  const currentPageValidated = isCandidateCalibrationPassed(_candidateCalibrationResult);
   const candidateVerifyRow = document.createElement('div');
   candidateVerifyRow.className = 'candidate-calibration-verify';
   const candidateVerifyCopy = document.createElement('div');
-  candidateVerifyCopy.textContent = completedCalibrationSteps.length === CANDIDATE_CALIBRATION_STEPS.length
-    ? '三项已标定。验证通过后，正式采集才有完整的页面顺序和翻页锚点。'
-    : `已完成 ${completedCalibrationSteps.length}/3 项；请按顺序完成后验证。`;
+  candidateVerifyCopy.className = 'candidate-calibration-verify-copy';
+  candidateVerifyCopy.dataset.role = 'cross-page-gate-status';
+  candidateVerifyCopy.textContent = calibrationSummary.key === 'success'
+    ? '校准成功：本页结构和跨页顺序均已确认。'
+    : calibrationSummary.key === 'failed'
+      ? (currentPageValidated ? '跨页验证失败：本页仍有效，可以直接重试跨页验证。' : '跨页验证：等待本页验证通过；请先处理红色提示。')
+      : currentPageValidated
+        ? '跨页验证：可以开始；将短暂进入第 2 页并自动返回第 1 页。'
+        : completedCalibrationSteps.length === CANDIDATE_CALIBRATION_STEPS.length
+          ? '跨页验证：等待本页验证通过；通过后右侧按钮会解锁。'
+          : `跨页验证：等待三项标定和本页验证（已完成 ${completedCalibrationSteps.length}/3 项）。`;
   const verifyCalibrationBtn = document.createElement('button');
   verifyCalibrationBtn.className = 'btn primary';
-  verifyCalibrationBtn.textContent = '验证校准';
+  verifyCalibrationBtn.textContent = _candidateCalibrationResult?.passed ? '重新验证本页' : '验证本页';
   verifyCalibrationBtn.disabled = completedCalibrationSteps.length !== CANDIDATE_CALIBRATION_STEPS.length;
   verifyCalibrationBtn.addEventListener('click', async () => {
     const returned = await window.desktopAPI.browser.returnToCollectionResults();
-    if (!returned?.ok) return setMsg(root, `无法验证校准：${returned?.error || '请先结束正在运行的任务'}`);
-    if (returned.warning) setMsg(root, returned.warning);
+    const returnAssessment = assessCandidateResultsReturn(returned);
+    if (!returnAssessment.ok) {
+      setLiveSummaryStatus('等待确认筛选页', 'saved');
+      return setMsg(root, `本页验证未开始：${returnAssessment.error}`);
+    }
+    setLiveSummaryStatus('验证中', 'running');
     btnInspectCandidateLayout.click();
   });
   const verifyPaginationBtn = document.createElement('button');
   verifyPaginationBtn.className = 'btn ghost';
-  verifyPaginationBtn.textContent = '验证跨页';
-  verifyPaginationBtn.disabled = completedCalibrationSteps.length !== CANDIDATE_CALIBRATION_STEPS.length;
+  verifyPaginationBtn.textContent = _candidatePaginationResult?.status === 'running'
+    ? '跨页验证中...'
+    : '验证跨页';
+  verifyPaginationBtn.title = currentPageValidated
+    ? '进入第 2 页核对达人顺序后自动返回第 1 页'
+    : '请先完成并通过“验证本页”，随后即可验证跨页';
+  verifyPaginationBtn.setAttribute('aria-label', currentPageValidated ? '验证跨页' : '验证跨页，等待本页验证通过');
+  verifyPaginationBtn.disabled = completedCalibrationSteps.length !== CANDIDATE_CALIBRATION_STEPS.length
+    || !currentPageValidated
+    || _candidatePaginationResult?.status === 'running';
   verifyPaginationBtn.addEventListener('click', async () => {
     if (_busy) return;
     const returned = await window.desktopAPI.browser.returnToCollectionResults();
-    if (!returned?.ok) return setMsg(root, `无法验证跨页：${returned?.error || '请先结束正在运行的任务'}`);
+    const returnAssessment = assessCandidateResultsReturn(returned);
+    if (!returnAssessment.ok) {
+      return setMsg(root, `跨页验证未开始：${returnAssessment.error}`);
+    }
     const templatePath = _activePath || state.templates.activeTemplatePath;
     if (!templatePath) return;
     _busy = true;
+    _candidatePaginationResult = { status: 'running' };
+    store.set({ templates: { ...store.state.templates } });
     setMsg(root, '正在验证跨页：将短暂进入第 2 页，核对名单变化后自动返回第 1 页...');
     try {
       const result = await window.desktopAPI.pgy.validateCandidateSearchPagination(templatePath);
@@ -892,17 +1093,34 @@ export function renderTemplates(state) {
       if (!result?.ok) {
         setMsg(root, `跨页验证失败：${result?.error || 'unknown error'}`);
       } else {
+        _draft.candidate_search = _draft.candidate_search && typeof _draft.candidate_search === 'object'
+          ? _draft.candidate_search
+          : {};
+        _draft.candidate_search.lastValidation = normalizeCandidateValidationRecord({
+          verifiedAt: new Date().toISOString(),
+          firstPageCount: result.firstPageCount,
+          secondPageCount: result.secondPageCount,
+          restoredToPage: result.restoredToPage
+        });
+        const saved = await saveDraftTemplate(root, state, '跨页验证记录已保存。');
         setMsg(root, [
           '跨页验证通过，已自动返回第 1 页。',
           `第 1 页 ${result.firstPageCount} 位；第 2 页 ${result.secondPageCount} 位。`,
           `第 1 页样例：${(result.firstNames || []).join(' → ')}`,
           `第 2 页样例：${(result.secondNames || []).join(' → ')}`,
+          saved?.ok ? '本次脱敏验证证据已保存；重启后会显示“上次成功，需复验”。' : `验证已通过，但证据保存失败：${saved?.error || 'unknown error'}`,
           '现在可以执行“前 50 位”；程序会逐页核验、去重，并在第 40 位安全边界暂停。'
         ].join('\n'));
       }
       store.set({ templates: { ...store.state.templates } });
     } catch (error) {
+      _candidatePaginationResult = {
+        ok: false,
+        passed: false,
+        error: error?.message || String(error)
+      };
       setMsg(root, `跨页验证异常：${error?.message || String(error)}`);
+      store.set({ templates: { ...store.state.templates } });
     } finally {
       _busy = false;
     }
@@ -912,17 +1130,32 @@ export function renderTemplates(state) {
   candidateVerifyRow.appendChild(verifyPaginationBtn);
   candidateWizard.appendChild(candidateVerifyRow);
 
-  if (_candidateCalibrationResult?.ok) {
+  if (_candidateCalibrationResult) {
     const result = _candidateCalibrationResult;
     const page = result.pagination || {};
     const passed = isCandidateCalibrationPassed(result);
     const resultPanel = document.createElement('div');
     resultPanel.className = `candidate-calibration-result ${passed ? 'ok' : 'bad'}`;
+    const bindingLabel = result.bindingMode === 'native-row-fallback'
+      ? '；整行定位变化，已用“昵称所在表格行”安全重建顺序'
+      : (result.bindingMode === 'name-link-fallback'
+        ? '；整行定位变化，已用“昵称 + 唯一达人链接”安全重建顺序'
+        : '');
     resultPanel.textContent = passed
-      ? `验证通过：第 ${page.currentPage || '?'} 页识别 ${result.rowCount} 位达人，昵称顺序和分页区均可核验。`
-      : `验证未通过：${Array.isArray(result.warnings) && result.warnings.length
+      ? `本页验证成功：第 ${page.currentPage || '?'} 页识别 ${result.rowCount} 位达人，昵称顺序和分页区均可核验${bindingLabel}。`
+      : `本页验证失败：${Array.isArray(result.warnings) && result.warnings.length
         ? result.warnings.join('；')
-        : `达人行 ${result.rowCount || 0}、昵称 ${result.nameCount || 0}、当前页${page.currentPageKnown ? '已确认' : '未确认'}`}。请重做对应步骤。`;
+        : (result.error || `达人行 ${result.rowCount || 0}、昵称 ${result.nameCount || 0}、当前页${page.currentPageKnown ? '已确认' : '未确认'}`)}。请重做对应步骤。`;
+    candidateWizard.appendChild(resultPanel);
+  }
+
+  if (_candidatePaginationResult && _candidatePaginationResult.status !== 'running') {
+    const passed = _candidatePaginationResult?.passed === true;
+    const resultPanel = document.createElement('div');
+    resultPanel.className = `candidate-calibration-result ${passed ? 'ok' : 'bad'}`;
+    resultPanel.textContent = passed
+      ? `跨页验证成功：第 1 页 ${_candidatePaginationResult.firstPageCount || 0} 位，第 2 页 ${_candidatePaginationResult.secondPageCount || 0} 位，已自动返回第 1 页。`
+      : `跨页验证失败：${_candidatePaginationResult?.error || '未能确认第 2 页和新的达人顺序'}。`;
     candidateWizard.appendChild(resultPanel);
   }
 

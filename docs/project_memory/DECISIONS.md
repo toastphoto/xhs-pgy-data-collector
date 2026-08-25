@@ -7,6 +7,48 @@
 - Impact: New threads should recover context from files, then recheck volatile environment state.
 - Reevaluate when: The repo is split, renamed, or moved to a different maintenance workflow.
 
+## 2026-08-21: Keep Historical Calibration Evidence Without Reusing It As Current Proof
+
+- Decision: persist only a sanitized prior cross-page record: verification time, page-one/page-two counts, and restoration to page 1. After restart, show `上次成功，需复验`; require a fresh current-page pass before enabling cross-page validation. If returning to results falls back to the generic creator plaza, stop validation until the operator rechecks filters and page.
+- Why: `0.1.45` loaded saved selectors but discarded the validated UI state, so the established calibration experience looked reverted. It also allowed cross-page validation to continue after opening a generic fallback page, which could test the wrong result set.
+- Impact: saved selectors remain `已完成`, prior evidence remains visible and auditable, and only current-session page plus cross-page proof becomes `校准成功`. Selector changes invalidate the saved historical evidence.
+- Reevaluate when: PGY exposes a stable query identity that can prove the exact filter set across restarts. Historical success must never silently become current proof.
+
+## 2026-08-20: Treat Invitation Entry And Detailed Form As Separate Contracts
+
+- Decision: Model the creator-page invitation dialog as navigation and option selection only. Treat `/solar/pre-trade/invite-form` as the structured draft contract, and treat only its bottom `发起邀约` control as the final representational action.
+- Why: The two layers reuse the same button label but have different effects. Live inspection of the detailed route proved that brand, contact, product, cooperation introduction, and dates exist only after the first-layer action.
+- Impact: Preparation may traverse the first layer, fill the detailed form, and read every value back. Final send requires an exact recipient, unchanged form URL and values, a short-lived single-use token, and action-time human confirmation.
+- Reevaluate when: PGY changes either route or exposes an approved invitation API. Revalidate both layers independently; never infer the second-layer schema from the first dialog.
+
+## 2026-08-19: Keep Account Role Switching Fixed And Reassert The Foreground View
+
+- Decision: Keep the browser tab strip and a compact `采集页 / 邀约账号` role switch outside the scrolling workbench. After an awaited creator-page load, activate the intended role BrowserView again before reporting success.
+- Why: Live testing showed that a role action could update the row state while the previously visible BrowserView remained in front, and long workbench scrolling could remove the only visible tab controls.
+- Impact: Collection, invitation, detail, mail, and background automation views retain their existing partitions and attachment rules. This change affects foreground presentation only; it does not copy cookies, retarget automation, or add an invitation send path.
+- Reevaluate when: Electron replaces `BrowserView`, the app adopts a different window/tab host, or background capture no longer depends on attached full-size views.
+
+## 2026-08-19: Invitation Work Uses A Separate Account Partition And A Human Send Gate
+
+- Decision: use a dedicated `persist:pgy_invite` BrowserView for the invitation account. Creator pages may be opened only by passing a selected run and row id to the main process, which re-resolves the stored creator URL. The invitation address bar is read-only and role navigation is limited to the PGY HTTPS host. Automatic assistance ends at verified draft filling; the operator performs the final send.
+- Why: another tab in `persist:pgy_default` would share cookies with collection, and a renderer-supplied URL would not prove that the creator came from the selected collected result. Automatic sending would also cross the existing human approval boundary before the real form contract is known.
+- Impact: collection and invitation identities remain separate; fabricated URLs and arbitrary invitation-tab navigation fail closed; no `invites:send` IPC is allowed. Invitation calibration must target the fixed invitation BrowserView and must not reuse collection selectors as proof.
+- Reevaluate when: PGY supplies an approved invitation API, the account model changes, or a separately reviewed structured approval contract explicitly includes every live invitation field and recipient.
+
+## 2026-08-18: Separate Calibration Progress From Validation Success
+
+- Decision: calibration actions use a consistent `开始校准` / `重新开始校准` and `校准这一步` / `重新校准` vocabulary. Each step keeps its stable number and separately displays its state. A saved selector is `已完成`; only successful current-page plus cross-page validation yields overall `校准成功`.
+- Why: the former `OK` marker and mixed button labels conflated saved configuration with verified behavior, so operators could not tell whether calibration had started, completed, failed, or actually passed.
+- Impact: the calibration view has explicit neutral, running, saved, success, and failure tones; failed validation remains visible with a readable reason. State resolvers and a renderer source contract protect the vocabulary and success boundary.
+- Reevaluate when: calibration becomes a fully automatic single action. Even then, the UI must preserve distinct running, success, and failure evidence.
+
+## 2026-08-18: Separate Paginator Discovery From Cross-Page Proof
+
+- Decision: step 3 reports two distinct operations. Paginator discovery may briefly scroll the result pane to trigger lazy mounting, but it never clicks a page; it reports and saves current-page, visible-page, and control-count evidence. Cross-page validation separately reports its running state, enters page 2, confirms a changed creator order, returns to page 1, and reports both page counts.
+- Why: the previous `重新校准` interaction caused unexplained visible movement and then showed only `已完成`, which did not prove whether the paginator was merely found or actually usable.
+- Impact: the pagination step has persistent pending, locating, located, verifying, verified, and failed feedback. The cross-page button is disabled and labeled `验证中...` during the check.
+- Reevaluate when: PGY provides a stable approved pagination API. The operator-visible distinction between discovery and behavioral proof must remain.
+
 ## Main product line is the Electron desktop app
 
 - Decision: Treat `desktop-app/` as the main product path.
@@ -555,3 +597,31 @@ Update on 2026-08-12: exact navigation-context equality was too strict after a v
 - Why: an unbounded 100-plus-card queue forced operators to wheel through the entire task page and made the browser-style drag handle hard to find. Faster wheel scrolling does not solve direct positioning.
 - Impact: operators can drag directly to any depth without moving the surrounding workflow; candidate edits and status rerenders retain the current queue position. Search/status filter changes intentionally reset the queue to the top because they create a different result set.
 - Reevaluate when: candidate counts grow enough to require virtualization. Any virtualized replacement must preserve direct drag positioning, stable rank identity, keyboard access, and rerender restoration.
+
+## 2026-08-18: Reveal Lazy Pagination Before Declaring Calibration Failure
+
+- Decision: when pagination inspection is incomplete, first perform a bounded read-only reveal of the document and large internal scroll containers, wait for PGY to mount the paginator, then rediscover it without trusting the saved selector. Save step 3 only with a proven current page and at least two numeric page controls. Cross-page validation prefers the explicit page-2 control and uses the next arrow only as a fallback.
+- Why: the field page contained a valid paginator, but PGY did not always mount it until the result container reached the bottom or a page control was used. The old one-shot DOM query misclassified timing as a broken page structure.
+- Impact: first-use calibration no longer requires a hidden manual page click, while stale selectors, single-page results, unknown current pages, and incomplete paginator structures still fail closed.
+- Reevaluate when: PGY stops lazy-mounting the paginator, exposes a stable result API, or changes the list to a virtualization model where scrolling to the bottom unloads required nickname evidence. Do not replace this with blind page clicks.
+
+## 2026-08-19: Prepare Invitations With Readback And A Single-Use Send Gate
+
+- Decision: resolve the creator from persisted run data, prepare only the structured PGY fields in the isolated invitation partition, read every selection back, and issue a short-lived single-use token before exposing `确认发送`. Revalidate the row, URL, token, fingerprint, form state, and final button immediately before one click.
+- Why: opening the correct creator and dialog does not prove that the template was accepted or that the account may send. A renderer-only confirmation could also be replayed against a changed row or form.
+- Impact: final invitation sending remains impossible until preparation has proven the exact recipient and structured fields and the operator confirms at action time. A failed preparation cannot be promoted to send-ready state.
+- Reevaluate when: PGY provides an official invitation API or materially changes the invitation schema. Recipient and action-time confirmation remain mandatory.
+
+## 2026-08-19: Treat PGY Invitation Copy As Structured Fields, Not Free Text
+
+- Decision: map the fixed in-app template only to live PGY controls that exist: cooperation goal, cooperation mode, contact method, and future explicitly detected labeled fields. Keep the free-text invitation message export-only while the live first dialog has no matching input.
+- Why: claiming that a saved paragraph was copied into a form with no text field would be false. Live dialogs also vary by creator and account; live invitations may require an e-commerce shop.
+- Impact: unsupported fields are reported instead of silently discarded. `permission denied`, unavailable cooperation types, missing shop requirements, and DOM-selection failures are separate outcomes.
+- Reevaluate when: a live PGY dialog exposes a stable labeled message field, shop selection is added to the fixed template, or an official schema becomes available.
+
+## 2026-08-25: Keep Cross-Page Identity Stable And Bind Fallback Names To Semantic Rows
+
+- Decision: always label the workflow action `验证跨页`; when current-page evidence is missing, disable it and show the exact prerequisite beside it. If a saved row selector no longer repeats, rebuild visible order from the calibrated nickname selector only when every visible nickname maps one-to-one to a native table row, or every visible nickname maps to one unique allowlisted PGY creator-detail URL.
+- Why: relabeling the locked action as `先验证本页` made a delivered capability appear removed. Separately, treating a stale CSS row selector as the only row proof caused false failures even when visible nicknames still belonged to distinct semantic table rows. Real PGY rows do not always expose detail links, so URL-only fallback is insufficient.
+- Impact: operators can always see where cross-page verification lives and why it is locked. PGY wrapper-class changes no longer force immediate manual recalibration, while missing, ambiguous, or duplicate creator links still reject the page and prevent ranked pagination.
+- Reevaluate when: PGY removes visible creator-detail URLs, virtualizes only a partial nickname set, or provides an official ordered export. Do not weaken the complete visible-order requirement.

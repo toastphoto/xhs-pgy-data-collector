@@ -2,6 +2,72 @@
 
 Record the mistake, the correct practice, and the reusable impact. Do not include secrets, private data, or long chat excerpts.
 
+## 2026-08-21: A Saved Selector And A Remembered Success Are Different States
+
+- Pitfall: a later release kept the selector values but reset the visible calibration session, changed `重新开始校准` back to `开始校准`, and allowed cross-page verification after the app had fallen back to the generic creator plaza. The engine could work while the operator was guided through the wrong page state.
+- Correct practice: preserve sanitized historical evidence as `上次成功，需复验`, require a fresh current-page pass before cross-page, and stop when the original filtered result page was not restored. Verify the installed UI before and after restart, not only helper text and unit functions.
+- Reusable impact: persistent configuration, historical evidence, and current-session proof need separate state models. A release is not accepted when tests cover labels but not restart hydration and action gating.
+
+## 2026-08-20: Reused Button Text Does Not Mean Reused Semantics
+
+- Pitfall: live inspection stopped at the creator-page dialog and treated its `发起邀约` button as final send. That led to the false conclusion that PGY had no brand, product, contact, cooperation-introduction, or publication-date form.
+- Correct practice: trace the authorized workflow one transition further without sending, record the resulting route and field structure, and classify each same-named control by its actual effect. The first control opens the detailed form; only the detailed form's bottom control sends.
+- Reusable impact: for multi-step third-party workflows, a visible modal is not proof of the full contract. Acceptance must follow route transitions up to, but not through, the final external side effect.
+
+## 2026-08-19: A Tab That Scrolls Away Is Not An Available Control
+
+- Pitfall: the browser tabs existed and were accessible at the top of the document, but the whole renderer scrolled on the long contact-review page, so the operator lost the only obvious account switch while working through creator rows.
+- Correct practice: constrain the app grid, pin the top bar, give the workbench content its own scroll owner, and keep a visible role switch in the fixed browser controls.
+- Reusable impact: navigation availability must be verified at the deepest realistic scroll position, not only on the first screen.
+
+## 2026-08-19: Opening The Right URL Does Not Prove The Right Account Is Foreground
+
+- Pitfall: a row action could resolve and load the correct creator URL while the previously active BrowserView remained visually on top, making the action look like an account/session failure.
+- Correct practice: after awaited navigation, reassert the target BrowserView and verify both creator identity and sanitized account role in the installed app.
+- Reusable impact: multi-session desktop acceptance needs a three-part proof: target provenance, visible creator identity, and visible account role.
+
+## 2026-08-19: A Successful Bridge Does Not Validate Historical Metrics
+
+- Pitfall: exact creator navigation and invitation-form access can succeed while an older saved run still contains a follower count that disagrees with the current creator page.
+- Correct practice: report bridge acceptance and extraction accuracy separately, then run a fresh current-version extraction sample before declaring metrics correct.
+- Reusable impact: navigation identity, session identity, and extracted field accuracy are distinct contracts and need distinct evidence.
+
+## 2026-08-19: Session Preservation Needs A Live Pre-And-Post Upgrade Gate
+
+- Pitfall: partition strings and static tests proved that the new invitation tab used separate storage, but they did not prove that the existing collection account remained accepted by PGY after install and restart. Seeing a login page was initially ambiguous between a wrong tab, deleted local data, and server rejection.
+- Correct practice: before and after every account-partition release, record only sanitized evidence for the collection role: partition presence, login check, app restart, invitation-tab open, return to collection, and a second login check. Distinguish local storage loss from platform-side session rejection; never inspect, copy, export, or fabricate cookie values as a repair.
+- Reusable impact: storage isolation is necessary but not sufficient for account-session acceptance. A release that changes browser roles remains unverified until both role sessions survive the exact operator workflow.
+
+## 2026-08-19: A New Tab Is Not A Separate Account
+
+- Pitfall: treating a second BrowserView that shares `persist:pgy_default` as a second-account workflow would silently reuse collection cookies. Accepting a raw creator URL from the renderer would also make “from the collected list” unenforced.
+- Correct practice: assign each account role its own persistent partition, resolve targets in the main process from `runDir + rowId`, use an exact host and route policy, and make role-specific address bars and popup navigation fail closed.
+- Reusable impact: role separation requires independent storage, trusted provenance, and constrained navigation together. A visual tab label proves none of those by itself.
+
+## 2026-08-19: Export Columns Are Not A Live Form Contract
+
+- Pitfall: the existing cooperation, brand, product, contact, introduction, and date columns look like an invitation schema, but they have not been checked against the current PGY dialog or its required controls.
+- Correct practice: inspect several real invitation states with the dedicated account, save only a sanitized structural calibration, verify each filled value by reading it back, and stop at `已填写，待人工核对` without clicking submit.
+- Reusable impact: data prepared for export is only a hypothesis about a third-party form. Automation starts only after the live UI contract and failure states are demonstrated.
+
+## 2026-08-18: Visible Page Movement Needs An Explanation And Evidence
+
+- Pitfall: pagination recalibration briefly scrolled the PGY result pane to reveal its lazy paginator, but the UI only ended at `已完成`. Operators could not tell whether the movement was expected, whether a page was clicked, what was found, or whether cross-page behavior had actually passed.
+- Correct practice: explain the movement before it happens, distinguish read-only paginator discovery from active `1 -> 2 -> 1` validation, and persist the exact evidence beside the step: current page, visible page numbers, control count, page-one/page-two row counts, restore outcome, or failure reason.
+- Reusable impact: automation feedback must state action, scope, evidence, and next gate. A visual movement plus a generic success badge is not an auditable result.
+
+## 2026-08-18: A Saved Selector Is Not A Successful Calibration
+
+- Pitfall: replacing a step number with `OK` as soon as a selector was saved made an unverified rule look successful, while mixed actions such as `自动定位`, `重新定位`, and `重新标定` made the workflow harder to scan.
+- Correct practice: keep action labels separate from state labels. Use one step-action vocabulary and show explicit `未校准`, `校准中`, `已完成`, `校准成功`, or `校准失败` states with consistent visual tones.
+- Reusable impact: configuration presence is only an intermediate state. Report overall success only after the required current-page and cross-page validations pass, and keep failure visible with its reason.
+
+## 2026-08-18: A Page-Wide Busy Flag Is Not A Calibration State
+
+- Pitfall: the first installed `0.1.16` visual check showed `校准中` while the page was only loading saved rules. The calibration summary had reused a generic page `_busy` flag.
+- Correct practice: derive `校准中` only from an active calibration step or verification action. Ordinary list refresh, template load, and unrelated page work must not affect the calibration status model.
+- Reusable impact: UI state indicators must be bound to the operation they describe; broad shared loading flags create confident but false status text.
+
 ## 2026-07-27: Treat The Local Repository As The Codex Project
 
 - Pitfall: acknowledging a delegated chat thread did not establish durable repository-level context.
@@ -244,3 +310,45 @@ Record the mistake, the correct practice, and the reusable impact. Do not includ
 - Pitfall: rendering more than 100 candidate cards into the task page's outer scroller made direct navigation effectively unavailable; operators had to repeat wheel gestures and state rerenders could disorient them.
 - Correct approach: constrain the list itself, expose a visible draggable native scrollbar plus top/bottom controls, and restore the list scroll position for the same filter key.
 - Guardrail: test with at least 100 rows, verify one-action bottom navigation, then trigger a real rerender and assert that the scroll position remains unchanged.
+
+## 2026-08-18: A Missing Paginator Can Be An Unmounted Paginator
+
+- Pitfall: the automatic calibration queried the current DOM once and treated a missing or incomplete pagination root as a permanent page-structure failure. The operator could make the same calibration succeed only by manually reaching and clicking the page controls first.
+- Correct approach: distinguish discovery timing from selector validity. Reveal likely deep scroll containers, wait for lazy content to mount, rediscover without a stale selector, and save only after current-page plus multiple-page evidence is complete.
+- Guardrail: keep a regression where pagination is absent initially and appears only after the result scroll owner reaches the bottom; also prove that cross-page validation chooses the explicit second page before the arrow fallback.
+
+## 2026-08-19: An Open Invitation Dialog Does Not Prove Send Permission
+
+- Pitfall: treating a correctly opened creator dialog as evidence that the account could apply the fixed template and eventually send. Two real rows opened correctly, but PGY returned `permission denied` when the invitation account tried to switch cooperation type.
+- Correct approach: read selected/disabled state back after every structured choice, capture platform permission messages, and require an enabled final button before creating a send token.
+- Guardrail: live acceptance needs at least one permission-compatible creator/account combination. DOM reachability alone is not a positive invitation result.
+
+## 2026-08-19: Do Not Invent A Text Field That The Platform Does Not Expose
+
+- Pitfall: assuming the app's saved invitation paragraph could be copied into the first PGY invitation dialog because the business workflow calls it a template.
+- Correct approach: distinguish a business template from the platform form schema. Automate only visible labeled controls; keep unsupported text export-only and say so in the UI.
+- Guardrail: any newly supported invitation field requires live DOM evidence, value readback, and a no-send installed-app test before it becomes part of the automatic path.
+
+## 2026-08-20: A Custom Select Needs Real Focus, Not Only DOM Events
+
+- Pitfall: programmatic `input` and `change` events, plus repeated clicks near a label, did not reliably focus PGY's report-brand search. The flow looped at `open-brand-picker`, and a global `Ctrl+A` selected the desktop UI instead of the embedded field.
+- Correct approach: click the visible input geometry, resolve the editable field at that point, focus it in the page, and insert text through Electron. Read the selected brand back before continuing.
+- Guardrail: accept a custom select only after an installed-app test proves popup opening, exact option selection, and final value readback; remove keyboard shortcuts whose focus owner is ambiguous.
+
+## 2026-08-20: Navigation Promise Failure Is Not Final Navigation State
+
+- Pitfall: PGY sometimes rejected `loadURL` with `ERR_FAILED (-2)` while the BrowserView still settled on the exact requested creator page, causing a false failure and a second-click workaround.
+- Correct approach: after a navigation exception, wait briefly and compare the normalized final URL with the exact authorized target. Continue only on equality; otherwise preserve the failure.
+- Guardrail: never ignore navigation errors broadly. Recovery must be bounded and tied to an allowlisted exact destination.
+
+## 2026-08-20: Offscreen Does Not Mean Missing Or Disabled
+
+- Pitfall: the final PGY `发起邀约` button was below the viewport, so visibility-filtered lookup reported it unavailable even though all fields were filled and the button became enabled after scrolling.
+- Correct approach: locate the exact button in the full document, scroll it into view without clicking, wait for platform validation, then recheck enabled state before issuing the local confirmation token.
+- Guardrail: distinguish DOM absence, offscreen presence, disabled state, and enabled state in status messages and tests.
+
+## 2026-08-25: A Locked Gate Must Keep Its Real Action Name
+
+- Pitfall: the cross-page action was relabeled `先验证本页` while disabled. The safety dependency still existed, but the UI made the previously delivered cross-page feature look deleted and gave no stable place to read its status.
+- Correct approach: keep `验证跨页` visible at all times, disable it until current-page evidence passes, and state the exact unlock condition beside it. A prerequisite belongs in status copy, not in the action's identity.
+- Guardrail: UI contract tests must reject prerequisite text replacing a workflow action label. When a calibrated row selector goes stale, accept a fallback only if every visible calibrated nickname binds one-to-one to its native table row, or every nickname binds to a unique allowlisted creator-detail link in the same order.

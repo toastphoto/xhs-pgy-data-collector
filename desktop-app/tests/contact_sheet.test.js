@@ -277,7 +277,8 @@ const routedExported = exportContactRowsWorkbook(runDir, [
   emailSubject: '合作沟通',
   emailBody: '您好，想沟通一下合作。',
   pgyBrandName: '品牌A',
-  pgyProductName: '产品A'
+  pgyProductName: '产品A',
+  pgyContactChannel: '手机号'
 });
 assert.strictEqual(routedExported.emailContactRows, 2);
 assert.strictEqual(routedExported.pgyInviteRows, 2);
@@ -292,6 +293,7 @@ assert.strictEqual(routedEmailRows[1]['邮箱'], 'pgy-and-email@example.com');
 const routedInviteRows = XLSX.utils.sheet_to_json(routedWb.Sheets['蒲公英邀约表']);
 assert.strictEqual(routedInviteRows[0]['达人昵称'], '无联系方式达人');
 assert.strictEqual(routedInviteRows[0]['品牌名'], '品牌A');
+assert.strictEqual(routedInviteRows[0]['联系方式类型'], '微信');
 assert.strictEqual(routedInviteRows[1]['达人昵称'], '蒲公英兼邮件达人');
 
 const filteredExported = exportContactRowsWorkbook(runDir, [

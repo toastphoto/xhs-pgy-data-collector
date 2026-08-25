@@ -108,6 +108,13 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     openTencentEmail: () => ipcRenderer.invoke('contacts:openTencentEmail'),
     onXhsProgress: (cb) => ipcRenderer.on('contacts:xhsProgress', (_e, payload) => cb(payload))
   },
+  invites: {
+    openAccount: () => ipcRenderer.invoke('invites:openAccount'),
+    checkLogin: () => ipcRenderer.invoke('invites:checkLogin'),
+    openCreator: (payload) => ipcRenderer.invoke('invites:openCreator', payload),
+    prepare: (payload) => ipcRenderer.invoke('invites:prepare', payload),
+    sendPrepared: (payload) => ipcRenderer.invoke('invites:sendPrepared', payload)
+  },
   db: {
     stats: () => ipcRenderer.invoke('db:stats'),
     syncRuns: () => ipcRenderer.invoke('db:syncRuns')

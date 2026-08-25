@@ -43,7 +43,7 @@ assert.deepStrictEqual(loaded.reviewRows, []);
 
 const saved = saveContactReview(tmp, runDir, {
   reviewRows: normalized,
-  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '', xiaomifengSmartRemark: '{YYMMDD}-{昵称}', xiaomifengTaskWechat: '运营微信A', selectionPolicy: 'manual_opt_in_v1' }
+  settings: { defaultGroupTag: 'FILA', defaultGreeting: 'hello', contactChannel: '', xiaomifengSmartRemark: '{YYMMDD}-{昵称}', xiaomifengTaskWechat: '运营微信A', selectionPolicy: 'manual_opt_in_v1', pgyCooperationGoal: '直播合作', pgyCooperationMode: '种收联动', pgyContactChannel: '手机号' }
 });
 assert.ok(saved.updatedAt);
 assert.strictEqual(saved.settings.defaultGroupTag, 'FILA');
@@ -51,6 +51,9 @@ assert.strictEqual(saved.settings.contactChannel, '微信建联');
 assert.strictEqual(saved.settings.xiaomifengSmartRemark, '{YYMMDD}-{昵称}');
 assert.strictEqual(saved.settings.xiaomifengTaskWechat, '运营微信A');
 assert.strictEqual(saved.settings.selectionPolicy, 'manual_opt_in_v1');
+assert.strictEqual(saved.settings.pgyCooperationGoal, '直播合作');
+assert.strictEqual(saved.settings.pgyCooperationMode, '种收联动');
+assert.strictEqual(saved.settings.pgyContactChannel, '手机号');
 
 loaded = loadContactReview(tmp, runDir);
 assert.strictEqual(loaded.reviewRows.length, 1);

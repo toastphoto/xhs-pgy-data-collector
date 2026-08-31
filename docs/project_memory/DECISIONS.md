@@ -1,5 +1,12 @@
 # Decisions
 
+## 2026-08-26: Calibration Success Requires Data Readiness, Not Only DOM Structure
+
+- Decision: keep paginator and creator-row calibration as structural evidence, but report overall success only after both page 2 and the restored page 1 expose complete ID-bearing creator snapshots. Candidate-like response scopes may coexist until one snapshot matches the full visible nickname order; only then is that scope locked. A missing snapshot may trigger one current-page control click, never a full page reload or blind page turn.
+- Why: the same calibrated selectors could pass on one computer while response timing selected an unrelated recommendation endpoint on another. DOM success did not prove that the DevTools response body was captured, parsed, and matched to the visible list.
+- Impact: operators see `数据未就绪` without being told to recalibrate working selectors, and diagnostics distinguish debugger, loading, body, JSON, schema, and cache failures. Cross-page verification cannot turn green on structure alone.
+- Reevaluate when: PGY provides a stable approved list API or response schema. Any replacement must still bind data to visible page identity and ordered creator evidence before collection.
+
 ## 2026-06-29: Repository-local memory is authoritative for handoff
 
 - Decision: Use `AGENTS.md` plus `docs/project_memory/` as the first-read context for future helper threads.

@@ -445,7 +445,7 @@ function buildSearchPaginationRevealScript(options = {}) {
 }
 
 function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options = {}) {
-  const safeAction = ['inspect', 'next', 'goto'].includes(action) ? action : 'inspect';
+  const safeAction = ['inspect', 'next', 'goto', 'refresh'].includes(action) ? action : 'inspect';
   const safeTargetPage = Math.max(1, Number(targetPage || 1));
   const paginationSelector = String(options?.paginationSelector || '').trim().slice(0, 500);
   return `
@@ -651,6 +651,27 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
           selector: rootSelector,
           calibrated: Boolean(calibratedRoot),
           error: ready ? '' : '分页区域尚未完整加载或无法确认当前页'
+        };
+      }
+      if (action === 'refresh') {
+        if (!currentPageKnown || currentPage !== targetPage || !current) {
+          return {
+            ok: false,
+            clicked: false,
+            currentPage,
+            currentPageKnown,
+            targetPage,
+            error: '无法确认当前页码控件'
+          };
+        }
+        const clicked = activateControl(current);
+        return {
+          ok: clicked,
+          clicked,
+          currentPage,
+          currentPageKnown,
+          targetPage,
+          method: 'current-page-control'
         };
       }
       if (action === 'goto') {

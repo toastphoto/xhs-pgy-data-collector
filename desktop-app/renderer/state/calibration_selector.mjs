@@ -91,7 +91,15 @@ export function resolveCandidateCalibrationSummary({
     return { ...STATUS_META.running, label: '跨页验证中' };
   }
   if (paginationResult?.passed === true) {
-    return { ...STATUS_META.success, detail: '本页与跨页验证均已通过' };
+    return { ...STATUS_META.success, detail: '本页、跨页与达人数据读取均已通过' };
+  }
+  if (paginationResult?.structurePassed === true) {
+    return {
+      key: 'data-not-ready',
+      label: '数据未就绪',
+      tone: 'failed',
+      detail: '本页结构和跨页顺序已通过，无需重新校准位置'
+    };
   }
   if (resultFailed(paginationResult) || resultFailed(calibrationResult)) {
     return { ...STATUS_META.failed, detail: '请查看失败步骤并重新校准' };
@@ -129,6 +137,7 @@ function failedStepKeys(calibrationResult, paginationResult) {
     }
   }
   if (resultFailed(paginationResult)) {
+    if (paginationResult?.structurePassed) return failed;
     const text = resultFailureText(paginationResult);
     failed.add('candidate_pagination');
     if (/达人整行|昵称|一一对应/.test(text)) {
@@ -152,6 +161,9 @@ export function resolveCandidateCalibrationStepStatus({
     return { ...STATUS_META.running, label: '跨页验证中' };
   }
   if (paginationResult?.passed === true) return { ...STATUS_META.success };
+  if (paginationResult?.structurePassed === true && calibrationResult?.passed === true) {
+    return { ...STATUS_META.success, label: '结构成功' };
+  }
   if (failedStepKeys(calibrationResult, paginationResult).has(stepKey)) {
     return { ...STATUS_META.failed };
   }
@@ -178,12 +190,21 @@ export function resolveCandidatePaginationFeedback({
     return {
       key: 'verified',
       tone: 'success',
-      title: '跨页验证成功',
-      detail: `第 1 页 ${Number(paginationResult.firstPageCount || 0)} 位，第 2 页 ${Number(paginationResult.secondPageCount || 0)} 位，已自动返回第 1 页。`,
-      next: '已确认能进入第 2 页并回到第 1 页，可以按排名采集。'
+      title: '跨页与数据读取验证成功',
+      detail: `第 1 页 ${Number(paginationResult.firstPageCount || 0)} 位，第 2 页 ${Number(paginationResult.secondPageCount || 0)} 位，已返回第 1 页并取得达人详情 ID。`,
+      next: '页码、达人顺序和数据读取通道均已确认，可以按排名采集。'
     };
   }
   if (resultFailed(paginationResult)) {
+    if (paginationResult?.structurePassed) {
+      return {
+        key: 'data-not-ready',
+        tone: 'failed',
+        title: '页面结构通过，达人数据未就绪',
+        detail: paginationResult?.error || '页码和达人顺序正常，但未取得达人详情 ID。',
+        next: '无需重复标定位置；请按失败提示处理数据监听或账号页面结构问题。'
+      };
+    }
     return {
       key: 'verify-failed',
       tone: 'failed',

@@ -66,9 +66,11 @@ assert.ok(script.includes('/solar/pre-trade/blogger-detail/'));
 assert.doesNotThrow(() => new Function(script));
 const nextPageScript = buildSearchPaginationScript('next');
 const gotoPageScript = buildSearchPaginationScript('goto', 2);
+const refreshPageScript = buildSearchPaginationScript('refresh', 1);
 const revealPaginationScript = buildSearchPaginationRevealScript();
 assert.doesNotThrow(() => new Function(nextPageScript));
 assert.doesNotThrow(() => new Function(gotoPageScript));
+assert.doesNotThrow(() => new Function(refreshPageScript));
 assert.doesNotThrow(() => new Function(revealPaginationScript));
 assert.ok(nextPageScript.includes('currentPageKnown'));
 assert.ok(gotoPageScript.includes('const targetPage = 2'));
@@ -123,6 +125,14 @@ assert.strictEqual(inspectedFirstPage.previousDisabled, true);
 const gotoVisibleFirstPage = executePagination(buildSearchPaginationScript('goto', 1));
 assert.strictEqual(gotoVisibleFirstPage.alreadyAtTarget, true);
 assert.strictEqual(gotoVisibleFirstPage.clicked, false);
+let currentPageClickCount = 0;
+pageOne.click = () => { currentPageClickCount += 1; };
+pageOne.scrollIntoView = () => {};
+pageOne.focus = () => {};
+const refreshedVisibleFirstPage = executePagination(buildSearchPaginationScript('refresh', 1));
+assert.strictEqual(refreshedVisibleFirstPage.clicked, true);
+assert.strictEqual(refreshedVisibleFirstPage.method, 'current-page-control');
+assert.strictEqual(currentPageClickCount, 1);
 
 const pgyPageOne = paginatorElement({
   text: '1 1',

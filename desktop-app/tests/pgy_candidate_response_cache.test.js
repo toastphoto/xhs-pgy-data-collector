@@ -296,6 +296,14 @@ const scopedCapture = cache.capture(payload, {
   commandWindow
 });
 assert.strictEqual(scopedCapture.captured, 2);
+assert.deepStrictEqual(cache.lockVerifiedSnapshot(commandWindow, {
+  pageNumber: 1,
+  sequence: scopedCapture.sequence,
+  fingerprint: scopedCapture.fingerprint
+}), {
+  locked: true,
+  requestScope: 'https://pgy.xiaohongshu.com/api/creator/list'
+});
 assert.deepStrictEqual(
   cache.latest(1, { now: 2200, commandWindow, expectedPage: 1 }).items.map((row) => row.creator_name),
   ['达人A']
@@ -349,6 +357,40 @@ assert.strictEqual(cache.capture({
   requestUrl: 'https://pgy.xiaohongshu.com/api/creator/list?page=2',
   commandWindow
 }).code, 'PGY_RESPONSE_PAGE_CONFLICT');
+
+const racingScopeCache = new PgyCandidateResponseCache({ maxAgeMs: 5000 });
+const racingScopeWindow = racingScopeCache.beginCommandWindow({ startedAt: 4000 });
+const recommendationCapture = racingScopeCache.capture({
+  data: { list: [creator('creator0301', '推荐甲'), creator('creator0302', '推荐乙')] }
+}, {
+  capturedAt: 4100,
+  requestUrl: 'https://pgy.xiaohongshu.com/api/recommendation/list?page=1',
+  commandWindow: racingScopeWindow
+});
+const realListCapture = racingScopeCache.capture(payload, {
+  capturedAt: 4200,
+  requestUrl: 'https://pgy.xiaohongshu.com/api/creator/list?page=1',
+  commandWindow: racingScopeWindow
+});
+assert.strictEqual(recommendationCapture.captured, 2);
+assert.strictEqual(realListCapture.captured, 2);
+assert.ok(racingScopeCache.latestCandidates(10, {
+  now: 4300,
+  commandWindow: racingScopeWindow,
+  expectedPage: 1
+}).some((snapshot) => snapshot.fingerprint === realListCapture.fingerprint));
+assert.strictEqual(racingScopeCache.lockVerifiedSnapshot(racingScopeWindow, {
+  pageNumber: 1,
+  sequence: realListCapture.sequence,
+  fingerprint: realListCapture.fingerprint
+}).locked, true);
+assert.strictEqual(racingScopeCache.capture({
+  data: { list: [creator('creator0303', '推荐丙')] }
+}, {
+  capturedAt: 4400,
+  requestUrl: 'https://pgy.xiaohongshu.com/api/recommendation/list?page=1',
+  commandWindow: racingScopeWindow
+}).code, 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH');
 
 const pageOneRows = sources[0].rows;
 const pageTwoPayload = {

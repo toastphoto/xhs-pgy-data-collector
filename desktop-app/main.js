@@ -124,6 +124,16 @@ let dbInitPromise = null;
 let aiLastSqlResult = null; // { sql, rows } for optional export
 let kbCache = { loaded: false, index: null, meta: null };
 let pgyCandidateDebuggerAttached = false;
+let pgyCandidateResponseCaptureBoundId = null;
+let pgyCandidateResponseCaptureState = {
+  ready: false,
+  errorCode: 'PGY_RESPONSE_CAPTURE_NOT_STARTED',
+  lastDataResponseAt: 0,
+  lastCandidateAt: 0,
+  lastCandidateCount: 0,
+  lastFailureAt: 0,
+  lastFailureCode: ''
+};
 const pgyCandidateResponseCache = new PgyCandidateResponseCache();
 let pgyCandidateCheckpointSession = null;
 let pgyCandidateCheckpointSequence = 0;
@@ -1202,15 +1212,75 @@ async function resolveNoteUrlsByClick(webContents, notes, noteCardSelector, { ti
   return { resolved, baseUrl, lastClipboardSample };
 }
 
+async function ensurePgyCandidateResponseCapture(webContents) {
+  if (!webContents || webContents.isDestroyed?.()) {
+    pgyCandidateDebuggerAttached = false;
+    pgyCandidateResponseCaptureState.ready = false;
+    pgyCandidateResponseCaptureState.errorCode = 'PGY_RESPONSE_CAPTURE_WEB_CONTENTS_MISSING';
+    return { ok: false, code: pgyCandidateResponseCaptureState.errorCode };
+  }
+  try {
+    if (!webContents.debugger.isAttached()) webContents.debugger.attach('1.3');
+    await webContents.debugger.sendCommand('Network.enable');
+    pgyCandidateDebuggerAttached = true;
+    pgyCandidateResponseCaptureState.ready = true;
+    pgyCandidateResponseCaptureState.errorCode = '';
+    return { ok: true };
+  } catch (_) {
+    pgyCandidateDebuggerAttached = false;
+    pgyCandidateResponseCaptureState.ready = false;
+    pgyCandidateResponseCaptureState.errorCode = 'PGY_RESPONSE_CAPTURE_ATTACH_FAILED';
+    return { ok: false, code: pgyCandidateResponseCaptureState.errorCode };
+  }
+}
+
+function recordCandidateResponseCaptureFailure(code) {
+  pgyCandidateResponseCaptureState.lastFailureAt = Date.now();
+  pgyCandidateResponseCaptureState.lastFailureCode = String(code || 'PGY_RESPONSE_CAPTURE_FAILED');
+}
+
+function candidateResponseCaptureDiagnostics() {
+  const now = Date.now();
+  const age = (value) => value > 0 ? Math.max(0, now - value) : null;
+  return {
+    ready: Boolean(pgyCandidateResponseCaptureState.ready),
+    errorCode: String(pgyCandidateResponseCaptureState.errorCode || ''),
+    lastDataResponseAgeMs: age(Number(pgyCandidateResponseCaptureState.lastDataResponseAt || 0)),
+    lastCandidateAgeMs: age(Number(pgyCandidateResponseCaptureState.lastCandidateAt || 0)),
+    lastCandidateCount: Number(pgyCandidateResponseCaptureState.lastCandidateCount || 0),
+    lastFailureAgeMs: age(Number(pgyCandidateResponseCaptureState.lastFailureAt || 0)),
+    lastFailureCode: String(pgyCandidateResponseCaptureState.lastFailureCode || '')
+  };
+}
+
+function candidateDataReadinessFailureMessage(code) {
+  const messages = {
+    PGY_CANDIDATE_CAPTURE_UNAVAILABLE: '页面结构校准有效，但本机未能建立达人数据监听通道。请关闭蒲公英页面的开发者工具或其他调试程序，重启软件后重试。',
+    PGY_VISIBLE_PAGE_REFRESH_NOT_TRIGGERED: '页面结构校准有效，但当前页码控件未能触发数据重读。请确认右侧分页栏仍可操作。',
+    PGY_RESPONSE_NOT_TRIGGERED: '页面结构校准有效，系统点击当前页后没有观察到新的达人数据请求。筛选结果不会被改动，请稍后重试。',
+    PGY_RESPONSE_LOADING_FAILED: '页面结构校准有效，但当前页达人数据请求在加载时失败。请检查网络后重试。',
+    PGY_RESPONSE_BODY_FAILED: '页面结构校准有效，也收到了数据响应，但读取响应内容失败。请重启软件后重试。',
+    PGY_RESPONSE_BODY_EMPTY: '页面结构校准有效，但收到的当前页数据响应为空。请稍后重试。',
+    PGY_RESPONSE_BODY_TOO_LARGE: '页面结构校准有效，但当前页数据响应超过安全读取上限，未继续处理。',
+    PGY_RESPONSE_NOT_JSON: '页面结构校准有效，但当前页数据响应不是可识别的 JSON。当前账号页面可能使用了不同数据格式。',
+    PGY_RESPONSE_REQUEST_SCOPE_MISMATCH: '页面结构校准有效，但跨页时达人数据来自不同接口，无法证明排名连续性，因此已停止。',
+    PGY_RESPONSE_PAGE_CONFLICT: '页面结构校准有效，但数据响应中的页码与当前页冲突，因此已停止。',
+    PGY_CANDIDATE_SCHEMA_UNRECOGNIZED: '页面结构校准有效，也收到了疑似达人列表响应，但其中的达人 ID 字段尚未被识别。无需重复校准位置。'
+  };
+  return messages[String(code || '')]
+    || '页面结构校准有效，系统也已自动重新触发当前页，但仍未取得带详情 ID 的达人数据。无需重复校准位置。';
+}
+
 function attachPgyCandidateResponseCapture(webContents) {
-  if (!webContents || pgyCandidateDebuggerAttached) return;
+  if (!webContents) return;
+  if (pgyCandidateResponseCaptureBoundId === webContents.id) {
+    ensurePgyCandidateResponseCapture(webContents).catch(() => {});
+    return;
+  }
+  pgyCandidateResponseCaptureBoundId = webContents.id;
   const pendingResponses = new Map();
   const sourceContext = () => `web-contents:${webContents.id}:navigation:${pgyCandidateCaptureEpoch}`;
   try {
-    if (!webContents.debugger.isAttached()) webContents.debugger.attach('1.3');
-    webContents.debugger.sendCommand('Network.enable').then(() => {
-      pgyCandidateDebuggerAttached = true;
-    }).catch(() => {});
     webContents.debugger.on('message', (_event, method, params = {}) => {
       if (method === 'Network.responseReceived') {
         try {
@@ -1221,6 +1291,7 @@ function attachPgyCandidateResponseCapture(webContents) {
             || responseUrl.hostname.endsWith('.xiaohongshu.com');
           const isDataRequest = params.type === 'XHR' || params.type === 'Fetch';
           if (isPgyPage && isXhsRequest && isDataRequest && params.requestId) {
+            pgyCandidateResponseCaptureState.lastDataResponseAt = Date.now();
             pendingResponses.set(params.requestId, {
               requestUrl: params.response?.url || '',
               commandWindow: pgyCandidateCommandWindow,
@@ -1231,7 +1302,9 @@ function attachPgyCandidateResponseCapture(webContents) {
         return;
       }
       if (method === 'Network.loadingFailed') {
-        pendingResponses.delete(params.requestId);
+        if (pendingResponses.delete(params.requestId)) {
+          recordCandidateResponseCaptureFailure('PGY_RESPONSE_LOADING_FAILED');
+        }
         return;
       }
       if (method !== 'Network.loadingFinished' || !pendingResponses.has(params.requestId)) return;
@@ -1241,19 +1314,46 @@ function attachPgyCandidateResponseCapture(webContents) {
         .then((response) => {
           let body = String(response?.body || '');
           if (response?.base64Encoded) body = Buffer.from(body, 'base64').toString('utf8');
-          if (!body || body.length > 8 * 1024 * 1024) return;
+          if (!body) {
+            recordCandidateResponseCaptureFailure('PGY_RESPONSE_BODY_EMPTY');
+            return;
+          }
+          if (body.length > 8 * 1024 * 1024) {
+            recordCandidateResponseCaptureFailure('PGY_RESPONSE_BODY_TOO_LARGE');
+            return;
+          }
           let payload = null;
-          try { payload = JSON.parse(body); } catch (_) { return; }
-          pgyCandidateResponseCache.capture(payload, {
+          try { payload = JSON.parse(body); } catch (_) {
+            recordCandidateResponseCaptureFailure('PGY_RESPONSE_NOT_JSON');
+            return;
+          }
+          const captured = pgyCandidateResponseCache.capture(payload, {
             requestUrl: pending.requestUrl,
             commandWindow: pending.commandWindow,
             sourceContext: pending.sourceContext
           });
+          if (Number(captured?.captured || 0) > 0) {
+            pgyCandidateResponseCaptureState.lastCandidateAt = Date.now();
+            pgyCandidateResponseCaptureState.lastCandidateCount = Number(captured.captured);
+          } else if (captured?.code) {
+            recordCandidateResponseCaptureFailure(captured.code);
+          } else if (/kol|blogger|creator|search|recommend|list/i.test(String(pending.requestUrl || ''))) {
+            recordCandidateResponseCaptureFailure('PGY_CANDIDATE_SCHEMA_UNRECOGNIZED');
+          }
         })
-        .catch(() => {});
+        .catch(() => recordCandidateResponseCaptureFailure('PGY_RESPONSE_BODY_FAILED'));
     });
+    webContents.debugger.on('detach', () => {
+      pendingResponses.clear();
+      pgyCandidateDebuggerAttached = false;
+      pgyCandidateResponseCaptureState.ready = false;
+      pgyCandidateResponseCaptureState.errorCode = 'PGY_RESPONSE_CAPTURE_DETACHED';
+    });
+    ensurePgyCandidateResponseCapture(webContents).catch(() => {});
   } catch (_) {
     pgyCandidateDebuggerAttached = false;
+    pgyCandidateResponseCaptureState.ready = false;
+    pgyCandidateResponseCaptureState.errorCode = 'PGY_RESPONSE_CAPTURE_LISTENER_FAILED';
   }
 }
 
@@ -1454,6 +1554,12 @@ async function resolveCandidateSnapshotForVisiblePage({
       calibration
     );
     if (!confirmation.ok) continue;
+    const locked = pgyCandidateResponseCache.lockVerifiedSnapshot(commandWindow, {
+      pageNumber: expectedPage,
+      sequence: snapshot.sequence,
+      fingerprint: snapshot.fingerprint
+    });
+    if (!locked?.locked) continue;
     return {
       ...snapshot,
       responsePageNumber: snapshot.pageNumber,
@@ -1468,6 +1574,117 @@ async function resolveCandidateSnapshotForVisiblePage({
     && runtimePage.fingerprint !== String(previousFingerprint || '')
   ) return runtimePage;
   return null;
+}
+
+async function retriggerCandidateSnapshotForVisiblePage({
+  commandWindow,
+  expectedPage,
+  previousFingerprint = '',
+  calibration = {},
+  allowPassiveSeed = false
+} = {}) {
+  if (!browserView?.webContents || !commandWindow || !expectedPage) {
+    return { ok: false, code: 'PGY_VISIBLE_PAGE_REFRESH_INVALID' };
+  }
+  const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+  if (!risk?.ok || risk.riskDetected) {
+    return { ok: false, code: 'PGY_RISK_STOP', riskText: String(risk?.riskText || '') };
+  }
+  const refreshStartedAt = Date.now();
+  let triggered = null;
+  try {
+    triggered = await browserView.webContents.executeJavaScript(
+      buildSearchPaginationScript('refresh', expectedPage, calibration),
+      true
+    );
+  } catch (_) {}
+  if (!triggered?.clicked) {
+    return {
+      ok: false,
+      code: 'PGY_VISIBLE_PAGE_REFRESH_NOT_TRIGGERED',
+      method: String(triggered?.method || '')
+    };
+  }
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (allowPassiveSeed) {
+      await seedCandidateCommandFromVisiblePage(commandWindow, calibration);
+    }
+    const snapshot = await resolveCandidateSnapshotForVisiblePage({
+      commandWindow,
+      expectedPage,
+      previousFingerprint,
+      calibration
+    });
+    if (snapshot?.items?.length) {
+      return {
+        ok: true,
+        snapshot,
+        method: String(triggered.method || 'current-page-control')
+      };
+    }
+    await sleep(450);
+  }
+  const capture = candidateResponseCaptureDiagnostics();
+  const refreshAgeMs = Math.max(0, Date.now() - refreshStartedAt) + 1000;
+  let failureCode = 'PGY_CANDIDATE_SCHEMA_UNRECOGNIZED';
+  if (!capture.ready) failureCode = 'PGY_CANDIDATE_CAPTURE_UNAVAILABLE';
+  else if (
+    capture.lastFailureCode
+    && capture.lastFailureAgeMs != null
+    && capture.lastFailureAgeMs <= refreshAgeMs
+  ) failureCode = capture.lastFailureCode;
+  else if (
+    capture.lastDataResponseAgeMs == null
+    || capture.lastDataResponseAgeMs > refreshAgeMs
+  ) failureCode = 'PGY_RESPONSE_NOT_TRIGGERED';
+  return {
+    ok: false,
+    code: failureCode,
+    method: String(triggered.method || 'current-page-control'),
+    capture
+  };
+}
+
+async function validateCandidateDataReadiness(expectedPage, calibration = {}) {
+  const commandWindow = pgyCandidateResponseCache.beginCommandWindow({
+    sourceContext: currentCandidateSourceContext()
+  });
+  try {
+    await seedCandidateCommandFromVisiblePage(commandWindow, calibration);
+    let snapshot = await resolveCandidateSnapshotForVisiblePage({
+      commandWindow,
+      expectedPage,
+      calibration
+    });
+    let refreshTriggered = false;
+    let refreshMethod = '';
+    let failureCode = '';
+    if (!snapshot?.items?.length) {
+      const refreshed = await retriggerCandidateSnapshotForVisiblePage({
+        commandWindow,
+        expectedPage,
+        calibration,
+        allowPassiveSeed: true
+      });
+      refreshTriggered = Boolean(refreshed?.method);
+      refreshMethod = String(refreshed?.method || '');
+      failureCode = String(refreshed?.code || '');
+      snapshot = refreshed?.snapshot || null;
+    }
+    return {
+      ok: Boolean(snapshot?.items?.length >= 2),
+      itemCount: Number(snapshot?.items?.length || 0),
+      source: String(snapshot?.pageIdentityEvidence || snapshot?.stats?.source || ''),
+      refreshTriggered,
+      refreshMethod,
+      failureCode,
+      capture: candidateResponseCaptureDiagnostics()
+    };
+  } finally {
+    pgyCandidateResponseCache.endCommandWindow(commandWindow);
+  }
 }
 
 async function preserveVisibleCandidateSnapshot(commandWindow, calibration = {}) {
@@ -1623,6 +1840,9 @@ async function readPgyCandidatesFromResponsePages({
   let stoppedForRisk = false;
   let waitedCheckpoints = [];
   let currentPageEvidence = null;
+  let currentPageRefreshAttempted = false;
+  let currentPageRefreshMethod = '';
+  let currentPageRefreshFailureCode = '';
 
   const restoreStartPage = async () => {
     if (currentPage === startPage || stoppedForRisk) return;
@@ -1649,7 +1869,11 @@ async function readPgyCandidatesFromResponsePages({
         extracted: 0,
         source: 'pgy-list-response',
         pagesRead,
-        stoppedForRisk
+        stoppedForRisk,
+        currentPageRefreshAttempted,
+        currentPageRefreshMethod,
+        currentPageRefreshFailureCode,
+        capture: candidateResponseCaptureDiagnostics()
       }
     };
   };
@@ -1760,10 +1984,40 @@ async function readPgyCandidatesFromResponsePages({
       '检测到登录或安全提示，已停止翻页。本次部分结果不会自动加入候选。'
     );
   }
+  if (
+    pagesRead === 0
+    && !resumeSession
+    && hasCompleteCandidateSearchCalibration(calibration)
+    && activeCommandWindow
+  ) {
+    currentPageRefreshAttempted = true;
+    const refreshed = await retriggerCandidateSnapshotForVisiblePage({
+      commandWindow: activeCommandWindow,
+      expectedPage: currentPage,
+      calibration
+    });
+    currentPageRefreshMethod = String(refreshed?.method || '');
+    currentPageRefreshFailureCode = String(refreshed?.code || '');
+    if (refreshed?.code === 'PGY_RISK_STOP') {
+      stoppedForRisk = true;
+      return failIncomplete(
+        'PGY_RISK_STOP',
+        `检测到登录或安全提示，未重新触发当前页：${refreshed?.riskText || '请查看右侧页面'}。本次结果不会加入候选。`
+      );
+    }
+    if (refreshed?.snapshot?.items?.length) {
+      append(refreshed.snapshot.items);
+      currentPageEvidence = refreshed.snapshot;
+      pagesRead = 1;
+    }
+  }
   if (pagesRead === 0) {
+    const capture = candidateResponseCaptureDiagnostics();
+    const failureCode = currentPageRefreshFailureCode
+      || (capture.ready ? 'PGY_PAGINATION_RESPONSE_MISSING' : 'PGY_CANDIDATE_CAPTURE_UNAVAILABLE');
     return failIncomplete(
-      'PGY_PAGINATION_RESPONSE_MISSING',
-      '已确认当前是搜索结果第 1 页，但还没有拿到可验证的首页达人顺序，因此未冒然翻到第 2 页拼接排名。请等待列表显示稳定后重试；若仍失败，再手动刷新一次蒲公英页面。'
+      failureCode,
+      candidateDataReadinessFailureMessage(failureCode)
     );
   }
 
@@ -2265,6 +2519,16 @@ function createMainWindow() {
     taskInteractionLockState = '';
     taskRunner = null;
     pgyCandidateDebuggerAttached = false;
+    pgyCandidateResponseCaptureBoundId = null;
+    pgyCandidateResponseCaptureState = {
+      ready: false,
+      errorCode: 'PGY_RESPONSE_CAPTURE_NOT_STARTED',
+      lastDataResponseAt: 0,
+      lastCandidateAt: 0,
+      lastCandidateCount: 0,
+      lastFailureAt: 0,
+      lastFailureCode: ''
+    };
     pgyCandidateResponseCache.clear();
     pgyCandidateCommandWindow = null;
     pgyCandidateCheckpointSession = null;
@@ -2551,6 +2815,20 @@ ipcMain.handle('app:info', async () => ({
   ok: true,
   version: app.getVersion()
 }));
+
+ipcMain.handle('app:focusRenderer', async (event) => {
+  const rendererContents = mainWindow?.webContents;
+  if (
+    !rendererContents
+    || rendererContents.isDestroyed()
+    || event.sender.id !== rendererContents.id
+  ) {
+    return { ok: false, error: '工作台窗口不可用' };
+  }
+  mainWindow.focus();
+  rendererContents.focus();
+  return { ok: true };
+});
 
 ipcMain.handle('backend:info', async () => {
   const host = process.env.API_HOST || DEFAULT_API_HOST;
@@ -4213,6 +4491,7 @@ ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath)
   sendBrowserTabsSnapshot();
   await syncCollectionInteractionLock({ force: true });
   try {
+    await ensurePgyCandidateResponseCapture(browserView.webContents);
     let first = await inspectPage();
     if (Number(first.pagination?.currentPage || 0) !== 1) {
       const gotoFirst = await browserView.webContents.executeJavaScript(
@@ -4266,10 +4545,53 @@ ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath)
       await restoreFirstPage();
       return { ok: false, code: 'PGY_CANDIDATE_CALIBRATION_INVALID', error: '第 2 页的达人整行与行内昵称不能一一对应。' };
     }
+    const secondPageDataReadiness = await validateCandidateDataReadiness(2, calibration);
+    if (!secondPageDataReadiness.ok) {
+      const restored = await restoreFirstPage();
+      const failureCode = secondPageDataReadiness.failureCode
+        || (secondPageDataReadiness.capture?.ready
+          ? 'PGY_CANDIDATE_SCHEMA_UNRECOGNIZED'
+          : 'PGY_CANDIDATE_CAPTURE_UNAVAILABLE');
+      return {
+        ok: false,
+        code: failureCode,
+        error: `第 2 页：${candidateDataReadinessFailureMessage(failureCode)}`,
+        structurePassed: true,
+        firstPageCount: firstNames.length,
+        secondPageCount: secondNames.length,
+        restoredToPage: restored ? 1 : null,
+        failedDataPage: 2,
+        dataReadiness: secondPageDataReadiness
+      };
+    }
     const restored = await restoreFirstPage();
     if (!restored) {
       return { ok: false, code: 'PGY_PAGINATION_RESTORE_FAILED', error: '第 2 页验证成功，但未能自动返回第 1 页。请手动回到第 1 页后再采集。' };
     }
+    const firstPageDataReadiness = await validateCandidateDataReadiness(1, calibration);
+    if (!firstPageDataReadiness.ok) {
+      const failureCode = firstPageDataReadiness.failureCode
+        || (firstPageDataReadiness.capture?.ready
+          ? 'PGY_CANDIDATE_SCHEMA_UNRECOGNIZED'
+          : 'PGY_CANDIDATE_CAPTURE_UNAVAILABLE');
+      return {
+        ok: false,
+        code: failureCode,
+        error: candidateDataReadinessFailureMessage(failureCode),
+        structurePassed: true,
+        firstPageCount: firstNames.length,
+        secondPageCount: secondNames.length,
+        restoredToPage: 1,
+        failedDataPage: 1,
+        dataReadiness: firstPageDataReadiness
+      };
+    }
+    const dataReadiness = {
+      ok: true,
+      itemCount: firstPageDataReadiness.itemCount,
+      firstPage: firstPageDataReadiness,
+      secondPage: secondPageDataReadiness
+    };
     return {
       ok: true,
       passed: true,
@@ -4277,7 +4599,8 @@ ipcMain.handle('pgy:validateCandidateSearchPagination', async (_e, templatePath)
       secondPageCount: secondNames.length,
       firstNames: firstNames.slice(0, 8),
       secondNames: secondNames.slice(0, 8),
-      restoredToPage: 1
+      restoredToPage: 1,
+      dataReadiness
     };
   } catch (error) {
     await restoreFirstPage();
@@ -5297,6 +5620,7 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   const busy = rejectBrowserAutomationStart('读取蒲公英候选');
   if (busy) return busy;
   ensureCollectionTabActive();
+  await ensurePgyCandidateResponseCapture(browserView?.webContents);
   await closeCandidateCommandWindow();
   const commandWindow = pgyCandidateResponseCache.beginCommandWindow({
     sourceContext: currentCandidateSourceContext()

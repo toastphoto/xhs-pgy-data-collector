@@ -40,6 +40,9 @@ assert.doesNotMatch(
 );
 assert.match(templatesSource, /本页验证失败/);
 assert.match(templatesSource, /跨页验证失败/);
+assert.match(templatesSource, /页面结构和跨页顺序已通过，但达人数据读取未就绪/);
+assert.match(templatesSource, /页面结构通过，但达人数据读取失败/);
+assert.match(templatesSource, /跨页与达人数据读取验证通过/);
 assert.match(templatesSource, /右侧会短暂滚到底部再恢复，只为触发分页栏加载并读取位置；本步骤不会翻页/);
 assert.match(templatesSource, /data-role', 'pagination-feedback'/);
 assert.match(templatesSource, /currentPage:\s*pagination\.currentPage/);

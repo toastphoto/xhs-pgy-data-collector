@@ -1040,7 +1040,9 @@ export function renderTemplates(state) {
   candidateVerifyCopy.className = 'candidate-calibration-verify-copy';
   candidateVerifyCopy.dataset.role = 'cross-page-gate-status';
   candidateVerifyCopy.textContent = calibrationSummary.key === 'success'
-    ? '校准成功：本页结构和跨页顺序均已确认。'
+    ? '校准成功：本页结构、跨页顺序和达人数据读取均已确认。'
+    : calibrationSummary.key === 'data-not-ready'
+      ? '页面结构和跨页顺序已通过，但达人数据读取未就绪；无需重新标定位置。'
     : calibrationSummary.key === 'failed'
       ? (currentPageValidated ? '跨页验证失败：本页仍有效，可以直接重试跨页验证。' : '跨页验证：等待本页验证通过；请先处理红色提示。')
       : currentPageValidated
@@ -1091,7 +1093,7 @@ export function renderTemplates(state) {
       const result = await window.desktopAPI.pgy.validateCandidateSearchPagination(templatePath);
       _candidatePaginationResult = result || null;
       if (!result?.ok) {
-        setMsg(root, `跨页验证失败：${result?.error || 'unknown error'}`);
+        setMsg(root, `${result?.structurePassed ? '页面结构通过，但达人数据读取失败' : '跨页验证失败'}：${result?.error || 'unknown error'}`);
       } else {
         _draft.candidate_search = _draft.candidate_search && typeof _draft.candidate_search === 'object'
           ? _draft.candidate_search
@@ -1104,8 +1106,9 @@ export function renderTemplates(state) {
         });
         const saved = await saveDraftTemplate(root, state, '跨页验证记录已保存。');
         setMsg(root, [
-          '跨页验证通过，已自动返回第 1 页。',
+          '跨页与达人数据读取验证通过，已自动返回第 1 页。',
           `第 1 页 ${result.firstPageCount} 位；第 2 页 ${result.secondPageCount} 位。`,
+          `已取得 ${Number(result.dataReadiness?.itemCount || 0)} 条带详情 ID 的达人数据。`,
           `第 1 页样例：${(result.firstNames || []).join(' → ')}`,
           `第 2 页样例：${(result.secondNames || []).join(' → ')}`,
           saved?.ok ? '本次脱敏验证证据已保存；重启后会显示“上次成功，需复验”。' : `验证已通过，但证据保存失败：${saved?.error || 'unknown error'}`,

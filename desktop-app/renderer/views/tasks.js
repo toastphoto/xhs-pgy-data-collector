@@ -40,6 +40,7 @@ let _candidateInstructionStatus = '';
 let _candidateReadRunning = false;
 let _candidateCheckpoint = null;
 let _candidateCheckpointTimer = null;
+let _candidateCommandFocusRequestPending = false;
 let _autoContactRunDir = '';
 const _forwardedContactRuns = new Set();
 let _candidateDirty = false;
@@ -48,6 +49,21 @@ let _searchAdvancedOpen = false;
 let _candidateBulkOpen = false;
 let _candidateListScrollTop = 0;
 let _candidateListViewportKey = '';
+
+function requestRendererKeyboardFocus(element) {
+  if (_candidateCommandFocusRequestPending) return;
+  _candidateCommandFocusRequestPending = true;
+  Promise.resolve(window.desktopAPI.app.focusRenderer())
+    .then((result) => {
+      if (result?.ok && element?.isConnected && !element.disabled) {
+        element.focus({ preventScroll: true });
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      _candidateCommandFocusRequestPending = false;
+    });
+}
 
 function persistCandidateDraft() {
   try {
@@ -1071,7 +1087,12 @@ export function renderTasks(state) {
   const readSearchBtn = document.createElement('button');
   readSearchBtn.className = 'btn primary';
   readSearchBtn.textContent = '执行指令';
-  readSearchBtn.disabled = !!state.tasks?.running || _candidateReadRunning || Boolean(_candidateCheckpoint);
+  const collectionTaskRunning = !!state.tasks?.running;
+  const candidateCommandLocked = _candidateReadRunning || Boolean(_candidateCheckpoint);
+  readSearchBtn.disabled = collectionTaskRunning || candidateCommandLocked;
+  readSearchBtn.title = collectionTaskRunning
+    ? '当前采集任务正在运行；停止或完成后再执行新指令'
+    : (candidateCommandLocked ? '当前读取尚未结束' : '读取右侧当前蒲公英结果');
   readSearchBtn.addEventListener('click', async () => {
     try {
       _candidateReadRunning = true;
@@ -1111,7 +1132,9 @@ export function renderTasks(state) {
   commandInput.className = 'tpl-input candidate-command-input';
   commandInput.placeholder = '例如：前30位，或第42位到第50位达人加入候选';
   commandInput.value = _candidateInstruction;
-  commandInput.disabled = !!state.tasks?.running || _candidateReadRunning || Boolean(_candidateCheckpoint);
+  commandInput.disabled = candidateCommandLocked;
+  commandInput.addEventListener('pointerdown', () => requestRendererKeyboardFocus(commandInput));
+  commandInput.addEventListener('focus', () => requestRendererKeyboardFocus(commandInput));
   commandInput.addEventListener('input', () => {
     _candidateInstruction = commandInput.value;
     _candidateInstructionStatus = '';
@@ -1128,6 +1151,7 @@ export function renderTasks(state) {
   const commandStatus = document.createElement('div');
   commandStatus.className = 'muted-line candidate-command-status';
   commandStatus.textContent = _candidateInstructionStatus
+    || (collectionTaskRunning ? '当前采集任务正在运行；可以先编辑指令，停止或完成后再执行。' : '')
     || `支持前 N 位或第 A-B 位；单次最多 ${SAFE_BATCH_LIMIT} 位，可定位到第 ${MAX_CANDIDATE_RANK} 位`;
   commandWrap.appendChild(commandStatus);
   if (_candidateCheckpoint) {

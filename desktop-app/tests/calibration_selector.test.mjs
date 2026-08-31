@@ -76,7 +76,7 @@ assert.deepEqual(resolveCandidateCalibrationSummary({
   key: 'success',
   label: '校准成功',
   tone: 'success',
-  detail: '本页与跨页验证均已通过'
+  detail: '本页、跨页与达人数据读取均已通过'
 });
 assert.equal(resolveCandidateCalibrationSummary({
   hasDraft: true,
@@ -88,6 +88,17 @@ assert.equal(resolveCandidateCalibrationSummary({
   savedCount: 3,
   paginationResult: { status: 'running' }
 }).label, '跨页验证中');
+assert.deepEqual(resolveCandidateCalibrationSummary({
+  hasDraft: true,
+  savedCount: 3,
+  calibrationResult: { ok: true, passed: true },
+  paginationResult: { ok: false, structurePassed: true, error: '未取得达人详情 ID' }
+}), {
+  key: 'data-not-ready',
+  label: '数据未就绪',
+  tone: 'failed',
+  detail: '本页结构和跨页顺序已通过，无需重新校准位置'
+});
 assert.deepEqual(resolveCandidateCalibrationSummary({
   hasDraft: true,
   savedCount: 3,
@@ -126,6 +137,14 @@ assert.equal(resolveCandidateCalibrationStepStatus({
   stepKey: 'candidate_pagination',
   paginationResult: { status: 'running' }
 }).label, '跨页验证中');
+for (const stepKey of ['candidate_row', 'candidate_name', 'candidate_pagination']) {
+  assert.equal(resolveCandidateCalibrationStepStatus({
+    stepKey,
+    isSaved: true,
+    calibrationResult: { ok: true, passed: true },
+    paginationResult: { ok: false, structurePassed: true, error: '未取得达人详情 ID' }
+  }).label, '结构成功');
+}
 
 assert.deepEqual(resolveCandidatePaginationFeedback(), {
   key: 'pending',
@@ -173,12 +192,25 @@ assert.deepEqual(resolveCandidatePaginationFeedback({
 }), {
   key: 'verified',
   tone: 'success',
-  title: '跨页验证成功',
-  detail: '第 1 页 20 位，第 2 页 20 位，已自动返回第 1 页。',
-  next: '已确认能进入第 2 页并回到第 1 页，可以按排名采集。'
+  title: '跨页与数据读取验证成功',
+  detail: '第 1 页 20 位，第 2 页 20 位，已返回第 1 页并取得达人详情 ID。',
+  next: '页码、达人顺序和数据读取通道均已确认，可以按排名采集。'
 });
 assert.equal(resolveCandidatePaginationFeedback({
   paginationResult: { ok: false, error: '无法返回第 1 页' }
 }).title, '跨页验证失败');
+assert.deepEqual(resolveCandidatePaginationFeedback({
+  paginationResult: {
+    ok: false,
+    structurePassed: true,
+    error: '未取得达人详情 ID'
+  }
+}), {
+  key: 'data-not-ready',
+  tone: 'failed',
+  title: '页面结构通过，达人数据未就绪',
+  detail: '未取得达人详情 ID',
+  next: '无需重复标定位置；请按失败提示处理数据监听或账号页面结构问题。'
+});
 
 console.log('calibration_selector.test.mjs OK');

@@ -377,11 +377,13 @@ class PgyCandidateResponseCache {
       ? Math.max(1000, Math.min(this.maxAgeMs, requestedMaxAgeMs))
       : this.maxAgeMs;
     const handle = Object.freeze({ type: 'pgy-candidate-command-window' });
+    const initialRequestScope = normalizePgyRequestScope(options.requestUrl);
     this.commandWindows.set(handle, {
       startedAt,
       expiresAt: startedAt + maxAgeMs,
       sequenceFloor: this.captureSequence,
-      requestScope: normalizePgyRequestScope(options.requestUrl),
+      requestScope: initialRequestScope,
+      requestScopeLocked: Boolean(initialRequestScope),
       sourceContext: normalizeSourceContext(options.sourceContext)
     });
     return handle;
@@ -431,7 +433,11 @@ class PgyCandidateResponseCache {
       if (capturedAt < windowState.startedAt || capturedAt > windowState.expiresAt) {
         return { captured: 0, code: 'PGY_RESPONSE_OUTSIDE_COMMAND_WINDOW' };
       }
-      if (windowState.requestScope && windowState.requestScope !== requestScope) {
+      if (
+        windowState.requestScopeLocked
+        && windowState.requestScope
+        && windowState.requestScope !== requestScope
+      ) {
         return { captured: 0, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
       }
       if (windowState.sourceContext && sourceContext && windowState.sourceContext !== sourceContext) {
@@ -502,7 +508,11 @@ class PgyCandidateResponseCache {
           || right.sequence - left.sequence;
       })[0];
     if (!passive) return { seeded: 0, code: 'PGY_RESPONSE_PASSIVE_SNAPSHOT_MISSING' };
-    if (windowState.requestScope && windowState.requestScope !== passive.requestScope) {
+    if (
+      windowState.requestScopeLocked
+      && windowState.requestScope
+      && windowState.requestScope !== passive.requestScope
+    ) {
       return { seeded: 0, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
     }
 
@@ -527,9 +537,49 @@ class PgyCandidateResponseCache {
     };
   }
 
+  lockVerifiedSnapshot(commandWindow, options = {}) {
+    const windowState = commandWindow ? this.commandWindows.get(commandWindow) : null;
+    if (!windowState) return { locked: false, code: 'PGY_RESPONSE_COMMAND_WINDOW_INVALID' };
+    const sequence = Number(options.sequence || 0);
+    const fingerprint = String(options.fingerprint || '');
+    const pageNumber = options.pageNumber == null ? null : normalizePageNumber(options.pageNumber);
+    if (!Number.isFinite(sequence) || sequence < 1 || !fingerprint) {
+      return { locked: false, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_INVALID' };
+    }
+    const entry = this.entries.find((candidate) => (
+      candidate.commandWindow === commandWindow
+      && candidate.sequence === sequence
+    ));
+    if (!entry) return { locked: false, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING' };
+    if (
+      windowState.requestScopeLocked
+      && windowState.requestScope
+      && windowState.requestScope !== entry.requestScope
+    ) {
+      return { locked: false, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
+    }
+    const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
+      ? entry.alternatives
+      : [{
+          rows: entry.rows,
+          pageNumber: entry.pageNumber,
+          fingerprint: entry.fingerprint
+        }];
+    const selected = alternatives.find((alternative) => (
+      String(alternative.fingerprint || candidatePageFingerprint(alternative.rows)) === fingerprint
+      && (!pageNumber || !alternative.pageNumber || Number(alternative.pageNumber) === pageNumber)
+    ));
+    if (!selected?.rows?.length) {
+      return { locked: false, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH' };
+    }
+    windowState.requestScope = entry.requestScope;
+    windowState.requestScopeLocked = true;
+    return { locked: true, requestScope: entry.requestScope };
+  }
+
   promoteVerifiedSnapshot(commandWindow, options = {}) {
     const windowState = commandWindow ? this.commandWindows.get(commandWindow) : null;
-    if (!windowState?.requestScope) {
+    if (!windowState) {
       return { promoted: 0, code: 'PGY_RESPONSE_COMMAND_WINDOW_INVALID' };
     }
     const sourceContext = normalizeSourceContext(options.sourceContext) || windowState.sourceContext;
@@ -545,11 +595,17 @@ class PgyCandidateResponseCache {
 
     const entry = this.entries.find((candidate) => (
       candidate.commandWindow === commandWindow
-      && candidate.requestScope === windowState.requestScope
       && candidate.sourceContext === sourceContext
       && candidate.sequence === sequence
     ));
     if (!entry) return { promoted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING' };
+    if (
+      windowState.requestScopeLocked
+      && windowState.requestScope
+      && windowState.requestScope !== entry.requestScope
+    ) {
+      return { promoted: 0, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
+    }
     const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
       ? entry.alternatives
       : [{
@@ -565,6 +621,8 @@ class PgyCandidateResponseCache {
     if (!selected?.rows?.length) {
       return { promoted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH' };
     }
+    windowState.requestScope = entry.requestScope;
+    windowState.requestScopeLocked = true;
 
     const capturedAtValue = Number(options.capturedAt);
     const capturedAt = Number.isFinite(capturedAtValue) ? capturedAtValue : Date.now();
@@ -656,7 +714,11 @@ class PgyCandidateResponseCache {
       && sameSourceOwner(candidate.sourceContext, sourceContext)
     ));
     if (!entry) return { adopted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISSING' };
-    if (windowState.requestScope && windowState.requestScope !== entry.requestScope) {
+    if (
+      windowState.requestScopeLocked
+      && windowState.requestScope
+      && windowState.requestScope !== entry.requestScope
+    ) {
       return { adopted: 0, code: 'PGY_RESPONSE_REQUEST_SCOPE_MISMATCH' };
     }
     const alternatives = Array.isArray(entry.alternatives) && entry.alternatives.length
@@ -675,6 +737,7 @@ class PgyCandidateResponseCache {
       return { adopted: 0, code: 'PGY_RESPONSE_VERIFIED_SNAPSHOT_MISMATCH' };
     }
     windowState.requestScope = entry.requestScope;
+    windowState.requestScopeLocked = true;
     const capturedAtValue = Number(options.capturedAt);
     const capturedAt = Number.isFinite(capturedAtValue) ? capturedAtValue : Date.now();
     const adoptedSequence = ++this.captureSequence;
@@ -751,7 +814,7 @@ class PgyCandidateResponseCache {
     if (!query || typeof query !== 'object') return [];
     const commandWindow = query.commandWindow;
     const windowState = commandWindow ? this.commandWindows.get(commandWindow) : null;
-    if (!windowState?.requestScope) return [];
+    if (!windowState) return [];
 
     const nowValue = Number(query.now);
     const now = Number.isFinite(nowValue) ? nowValue : Date.now();
@@ -775,7 +838,10 @@ class PgyCandidateResponseCache {
     for (const entry of this.entries) {
       if (
         entry.commandWindow !== commandWindow
-        || entry.requestScope !== windowState.requestScope
+        || (
+          windowState.requestScopeLocked
+          && entry.requestScope !== windowState.requestScope
+        )
         || entry.sequence <= afterSequence
         || entry.capturedAt < windowState.startedAt
         || entry.capturedAt > windowState.expiresAt

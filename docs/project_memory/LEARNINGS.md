@@ -2,6 +2,18 @@
 
 Record the mistake, the correct practice, and the reusable impact. Do not include secrets, private data, or long chat excerpts.
 
+## 2026-08-26: A DOM Focus Ring Does Not Prove Native Keyboard Focus
+
+- Pitfall: after using the right Electron BrowserView, the left command input could show its pink focus border while Windows keyboard focus still belonged to the embedded PGY web contents. Mouse feedback looked correct, but physical IME input could go nowhere. The same field was also disabled during collection without explaining why.
+- Correct practice: when moving from a BrowserView back to renderer-owned text input, explicitly focus the trusted main renderer through a sender-checked IPC, then focus the DOM field. Keep drafting editable during unrelated collection work; disable only the conflicting execution action and state its reason.
+- Reusable impact: multi-webContents Electron apps have both DOM focus and native webContents focus. Visual focus, accessibility focus, and actual keyboard/IME routing must be tested after crossing view boundaries.
+
+## 2026-08-26: DOM Calibration And Response Capture Are Separate Contracts
+
+- Pitfall: page controls and creator names could calibrate successfully while the candidate response was missing or the first candidate-shaped endpoint belonged to recommendations. Labeling that state `校准成功` hid the actual data-channel failure and made timing differences look like computer-specific behavior.
+- Correct practice: validate page structure and response readiness independently, require ID-bearing snapshots for page 2 and the restored page 1, lock a response scope only after full visible-name order matches, and expose the exact capture failure. Retry by clicking the confirmed current-page control once; do not reload or navigate blindly.
+- Reusable impact: a UI locator proves where content is rendered, not where its data came from. Any automation that combines DOM and network evidence needs a separate readiness gate and deterministic binding rule.
+
 ## 2026-08-21: A Saved Selector And A Remembered Success Are Different States
 
 - Pitfall: a later release kept the selector values but reset the visible calibration session, changed `重新开始校准` back to `开始校准`, and allowed cross-page verification after the app had fallen back to the generic creator plaza. The engine could work while the operator was guided through the wrong page state.

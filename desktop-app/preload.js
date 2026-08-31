@@ -2,7 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktopAPI', {
   app: {
-    info: () => ipcRenderer.invoke('app:info')
+    info: () => ipcRenderer.invoke('app:info'),
+    focusRenderer: () => ipcRenderer.invoke('app:focusRenderer')
   },
   backend: {
     info: () => ipcRenderer.invoke('backend:info'),

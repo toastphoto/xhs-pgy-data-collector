@@ -603,11 +603,27 @@ function buildSearchPaginationScript(action = 'inspect', targetPage = 1, options
           return false;
         }
       };
-      const current = pageControls.find((element) => (
-        element.getAttribute?.('aria-current') === 'page'
-        || /active|current|selected|--color-bg-primary-light|\\bbold\\b/.test(String(element.className || '').toLowerCase())
-        || /active|current|selected|--color-bg-primary-light|\\bbold\\b/.test(String(element.parentElement?.className || '').toLowerCase())
-      ));
+      const classTokens = (element) => new Set(
+        String(element?.className || '').toLowerCase().split(/\\s+/).filter(Boolean)
+      );
+      const currentMarkerScore = (element) => {
+        const own = classTokens(element);
+        const parent = classTokens(element?.parentElement);
+        let score = 0;
+        if (element.getAttribute?.('aria-current') === 'page') score += 120;
+        if (element.getAttribute?.('aria-selected') === 'true') score += 110;
+        if (['active', 'current', 'selected'].some((token) => own.has(token))) score += 100;
+        if (own.has('--color-primary')) score += 90;
+        if (own.has('bold')) score += 70;
+        if (['active', 'current', 'selected'].some((token) => parent.has(token))) score += 55;
+        if (parent.has('--color-primary')) score += 45;
+        if (parent.has('bold')) score += 35;
+        return score;
+      };
+      const current = pageControls
+        .map((element, index) => ({ element, index, score: currentMarkerScore(element) }))
+        .filter((candidate) => candidate.score > 0)
+        .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.element || null;
       const currentPage = current ? numericPage(current) : null;
       const currentPageKnown = Number.isInteger(currentPage) && currentPage >= 1;
       const previousControl = allControls.find((element) => {
@@ -758,6 +774,13 @@ function buildCandidatePageIdentityScript(items = [], options = {}) {
       const rowSelector = ${JSON.stringify(rowSelector)};
       const nameSelector = ${JSON.stringify(nameSelector)};
       const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const nameMatches = (expected, visibleName) => {
+        const normalizedExpected = clean(expected);
+        const normalizedVisible = clean(visibleName);
+        if (!normalizedExpected || !normalizedVisible) return false;
+        return normalizedVisible === normalizedExpected
+          || normalizedVisible.startsWith(normalizedExpected + ' ');
+      };
       const calibrated = Boolean(rowSelector || nameSelector);
       const required = calibrated ? names.length : Math.min(3, names.length);
       const visible = (element) => {
@@ -818,19 +841,25 @@ function buildCandidatePageIdentityScript(items = [], options = {}) {
         const normalizedNames = names.map(clean);
         const exactMatch = visibleNames.length === normalizedNames.length
           && normalizedNames.every((name, index) => visibleNames[index] === name);
+        const boundedMatch = visibleNames.length === normalizedNames.length
+          && normalizedNames.every((name, index) => nameMatches(name, visibleNames[index]));
         return {
-          ok: exactMatch,
-          orderedMatch: exactMatch,
+          ok: boundedMatch,
+          orderedMatch: boundedMatch,
           required,
-          matchedCount: exactMatch
+          matchedCount: boundedMatch
             ? required
-            : normalizedNames.filter((name, index) => visibleNames[index] === name).length,
+            : normalizedNames.filter((name, index) => nameMatches(name, visibleNames[index])).length,
           candidateNameCount: names.length,
           visibleNameCount: visibleNames.length,
           calibratedRowCount: calibratedRows.length,
-          evidence: calibratedRows.length >= 2
-            ? 'calibrated-row-name-exact-order'
-            : 'calibrated-name-selector-exact-order'
+          evidence: exactMatch
+            ? (calibratedRows.length >= 2
+              ? 'calibrated-row-name-exact-order'
+              : 'calibrated-name-selector-exact-order')
+            : (calibratedRows.length >= 2
+              ? 'calibrated-row-name-bounded-order'
+              : 'calibrated-name-selector-bounded-order')
         };
       }
       if (!calibrated && required >= 2 && visibleNames.length >= required) {

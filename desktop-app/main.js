@@ -501,7 +501,9 @@ function ensureMailBrowserTab() {
     id: MAIL_TAB_ID,
     role: 'mail',
     title: '企业邮箱',
-    closable: true
+    // Keep the same WebContents alive so Tencent Mail can retain its in-page
+    // login/session state while the operator switches between outreach batches.
+    closable: false
   });
   browserTabViews.set(MAIL_TAB_ID, mailBrowserView);
   configureBrowserTabView(mailBrowserView, MAIL_TAB_ID);
@@ -1239,6 +1241,17 @@ function recordCandidateResponseCaptureFailure(code) {
   pgyCandidateResponseCaptureState.lastFailureCode = String(code || 'PGY_RESPONSE_CAPTURE_FAILED');
 }
 
+function isLikelyPgyCandidateListResponse(requestUrl) {
+  try {
+    const url = new URL(String(requestUrl || ''));
+    if (url.hostname !== 'pgy.xiaohongshu.com') return false;
+    return /\/api\/solar\/cooperator\/blogger\/v\d+\/?$/i.test(url.pathname)
+      || /\/api\/[^/]+\/(?:kol|blogger|creator)\/(?:list|search|query)(?:\/|$)/i.test(url.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
 function candidateResponseCaptureDiagnostics() {
   const now = Date.now();
   const age = (value) => value > 0 ? Math.max(0, now - value) : null;
@@ -1265,6 +1278,7 @@ function candidateDataReadinessFailureMessage(code) {
     PGY_RESPONSE_NOT_JSON: '页面结构校准有效，但当前页数据响应不是可识别的 JSON。当前账号页面可能使用了不同数据格式。',
     PGY_RESPONSE_REQUEST_SCOPE_MISMATCH: '页面结构校准有效，但跨页时达人数据来自不同接口，无法证明排名连续性，因此已停止。',
     PGY_RESPONSE_PAGE_CONFLICT: '页面结构校准有效，但数据响应中的页码与当前页冲突，因此已停止。',
+    PGY_VISIBLE_CANDIDATE_CONFIRMATION_FAILED: '已收到带达人 ID 的名单，但未能与当前页码和可见昵称顺序完成核对。请确认右侧页面稳定后重试。',
     PGY_CANDIDATE_SCHEMA_UNRECOGNIZED: '页面结构校准有效，也收到了疑似达人列表响应，但其中的达人 ID 字段尚未被识别。无需重复校准位置。'
   };
   return messages[String(code || '')]
@@ -1335,9 +1349,11 @@ function attachPgyCandidateResponseCapture(webContents) {
           if (Number(captured?.captured || 0) > 0) {
             pgyCandidateResponseCaptureState.lastCandidateAt = Date.now();
             pgyCandidateResponseCaptureState.lastCandidateCount = Number(captured.captured);
+            pgyCandidateResponseCaptureState.lastFailureAt = 0;
+            pgyCandidateResponseCaptureState.lastFailureCode = '';
           } else if (captured?.code) {
             recordCandidateResponseCaptureFailure(captured.code);
-          } else if (/kol|blogger|creator|search|recommend|list/i.test(String(pending.requestUrl || ''))) {
+          } else if (isLikelyPgyCandidateListResponse(pending.requestUrl)) {
             recordCandidateResponseCaptureFailure('PGY_CANDIDATE_SCHEMA_UNRECOGNIZED');
           }
         })
@@ -1630,6 +1646,10 @@ async function retriggerCandidateSnapshotForVisiblePage({
   const refreshAgeMs = Math.max(0, Date.now() - refreshStartedAt) + 1000;
   let failureCode = 'PGY_CANDIDATE_SCHEMA_UNRECOGNIZED';
   if (!capture.ready) failureCode = 'PGY_CANDIDATE_CAPTURE_UNAVAILABLE';
+  else if (
+    capture.lastCandidateAgeMs != null
+    && capture.lastCandidateAgeMs <= refreshAgeMs
+  ) failureCode = 'PGY_VISIBLE_CANDIDATE_CONFIRMATION_FAILED';
   else if (
     capture.lastFailureCode
     && capture.lastFailureAgeMs != null
@@ -2225,7 +2245,6 @@ async function readPgyCandidatesFromResponsePages({
       `最多读取到第 ${items.length} 位，未能完整取得${candidateRangeLabel(startRank, endRank)}。本次部分结果不会自动加入候选。`
     );
   }
-  await restoreStartPage();
   return {
     ok: true,
     items: resultItems,
@@ -3774,10 +3793,13 @@ ipcMain.handle('contacts:openTencentEmail', async () => {
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
   if (recordingEnabled) return { ok: false, code: 'RECORDING_RUNNING', error: '请先停止蒲公英录制排查，再打开企业邮箱' };
+  let reusedExistingPage = false;
   try {
     const mailView = ensureMailBrowserTab();
     activateBrowserTab(MAIL_TAB_ID, { force: true });
-    await mailView.webContents.loadURL(TENCENT_MAIL_HOME_URL);
+    const currentUrl = mailView.webContents.getURL() || '';
+    reusedExistingPage = isAllowedTencentMailUrl(currentUrl);
+    if (!reusedExistingPage) await mailView.webContents.loadURL(TENCENT_MAIL_HOME_URL);
   } catch (err) {
     const currentUrl = mailBrowserView?.webContents?.getURL?.() || '';
     if (!isAllowedTencentMailUrl(currentUrl)) {
@@ -3788,7 +3810,8 @@ ipcMain.handle('contacts:openTencentEmail', async () => {
   return {
     ok: true,
     tabId: MAIL_TAB_ID,
-    url: mailBrowserView?.webContents?.getURL?.() || TENCENT_MAIL_HOME_URL
+    url: mailBrowserView?.webContents?.getURL?.() || TENCENT_MAIL_HOME_URL,
+    reusedExistingPage
   };
 });
 

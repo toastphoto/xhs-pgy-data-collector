@@ -2,6 +2,24 @@
 
 Record the mistake, the correct practice, and the reusable impact. Do not include secrets, private data, or long chat excerpts.
 
+## 2026-09-02: Successful Continuation And Failure Recovery Need Different Page Outcomes
+
+- Pitfall: candidate reading used the same start-page restoration after both successful and incomplete runs. A correct first-30 read ended on page 2 internally but deliberately returned the operator to page 1, hiding the natural continuation point.
+- Correct practice: preserve the last fully verified page after success; restore the known start page after failure or cancellation, and stop in place on risk evidence when further navigation would be unsafe.
+- Reusable impact: workflow cleanup must be outcome-aware. An unconditional reset can destroy valuable operator context even when it looks conservative.
+
+## 2026-09-02: A Persistent Cookie Partition Does Not Preserve A Reloaded Workspace
+
+- Pitfall: Tencent Mail used a persistent partition, but every handoff still loaded the home URL again. The cookies could remain while the active mailbox route, session-storage state, compose context, and login transition were reset.
+- Correct practice: reuse the same allowlisted WebContents and current URL across batches, and prevent accidental tab closure when the product promise is one continuous login workspace. Load the entry URL only for a new or invalid workspace.
+- Reusable impact: session continuity is the combination of durable storage and page-instance lifecycle. Do not claim login preservation from a persistent partition alone.
+
+## 2026-09-01: Weak Style Tokens And Broad Text Selectors Can Corrupt Page Identity
+
+- Pitfall: a light-background class was treated as the selected page even after PGY retained it on page one, and a creator-information selector was assumed to contain only the nickname. The tool reached page two but reported page one, failed restoration, then rejected all valid response rows because each visible block also contained location and tags.
+- Correct practice: inspect the live selected and unselected controls after navigation, require exact strong tokens or ARIA state, and compare response nicknames against the calibrated information block with an explicit whitespace boundary. Validate both positive information-block matches and negative prefix collisions.
+- Reusable impact: DOM selectors describe elements, not semantic field purity; CSS appearance tokens also have different strengths. Cross-page identity needs installed-app evidence after the transition, not only a page-one fixture.
+
 ## 2026-08-26: A DOM Focus Ring Does Not Prove Native Keyboard Focus
 
 - Pitfall: after using the right Electron BrowserView, the left command input could show its pink focus border while Windows keyboard focus still belonged to the embedded PGY web contents. Mouse feedback looked correct, but physical IME input could go nowhere. The same field was also disabled during collection without explaining why.

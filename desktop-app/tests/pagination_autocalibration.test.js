@@ -15,6 +15,9 @@ assert.match(mainSource, /PGY_CANDIDATE_CAPTURE_UNAVAILABLE/);
 assert.match(mainSource, /retriggerCandidateSnapshotForVisiblePage\(\{[\s\S]{0,180}expectedPage: currentPage/);
 assert.match(mainSource, /recordCandidateResponseCaptureFailure\('PGY_RESPONSE_BODY_FAILED'\)/);
 assert.match(mainSource, /PGY_CANDIDATE_SCHEMA_UNRECOGNIZED/);
+assert.match(mainSource, /PGY_VISIBLE_CANDIDATE_CONFIRMATION_FAILED/);
+assert.match(mainSource, /isLikelyPgyCandidateListResponse\(pending\.requestUrl\)/);
+assert.match(mainSource, /lastFailureCode = ''/);
 assert.match(mainSource, /lockVerifiedSnapshot\(commandWindow/);
 
 const validationStart = mainSource.indexOf("ipcMain.handle('pgy:validateCandidateSearchPagination'");

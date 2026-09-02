@@ -1,5 +1,12 @@
 # Decisions
 
+## 2026-09-02: Preserve Successful Batch Position And Reuse The Mail Workspace
+
+- Decision: after a complete ranked candidate read, keep the manual PGY BrowserView on the last confirmed page; restore the start page only for incomplete, canceled, or safety-stopped work. Keep Tencent Mail in one non-closable `persist:mail_default` BrowserView and reuse its current allowlisted URL for later batches, loading the home page only when the workspace is new or outside the approved mail domains.
+- Why: returning every successful read to page 1 makes continuation batches error-prone, and persistent cookies alone do not preserve an authenticated in-page state when the app destroys or reloads the page for every batch.
+- Impact: a first-30 read can continue from page 2, and repeated email handoffs retain the current mailbox page without performing any compose, recipient-fill, or send action. Platform login expiry and risk prompts still require manual handling.
+- Reevaluate when: PGY changes pagination semantics, Tencent changes its authenticated domains or session model, or Electron replaces BrowserView. Outcome-specific recovery and the human send boundary remain mandatory.
+
 ## 2026-08-26: Calibration Success Requires Data Readiness, Not Only DOM Structure
 
 - Decision: keep paginator and creator-row calibration as structural evidence, but report overall success only after both page 2 and the restored page 1 expose complete ID-bearing creator snapshots. Candidate-like response scopes may coexist until one snapshot matches the full visible nickname order; only then is that scope locked. A missing snapshot may trigger one current-page control click, never a full page reload or blind page turn.
@@ -632,3 +639,10 @@ Update on 2026-08-12: exact navigation-context equality was too strict after a v
 - Why: relabeling the locked action as `先验证本页` made a delivered capability appear removed. Separately, treating a stale CSS row selector as the only row proof caused false failures even when visible nicknames still belonged to distinct semantic table rows. Real PGY rows do not always expose detail links, so URL-only fallback is insufficient.
 - Impact: operators can always see where cross-page verification lives and why it is locked. PGY wrapper-class changes no longer force immediate manual recalibration, while missing, ambiguous, or duplicate creator links still reject the page and prevent ranked pagination.
 - Reevaluate when: PGY removes visible creator-detail URLs, virtualizes only a partial nickname set, or provides an official ordered export. Do not weaken the complete visible-order requirement.
+
+## 2026-09-01: Require Strong Page Markers And Bounded Nickname Identity
+
+- Decision: determine the active PGY page only from exact ARIA or strong class tokens, never from a weak background token that may remain after navigation. Bind each response nickname to the complete visible order by exact equality or by a whitespace-bounded prefix of the calibrated creator information block.
+- Why: PGY retained the prior page's light-background token after page two became active, while the saved nickname selector now included location and tags after the nickname. The first defect misreported page two as page one and prevented restoration; the second rejected all valid ID-bearing rows.
+- Impact: page transitions and restoration use the actual selected control, current creator information blocks can authorize sanitized response rows, and unbounded prefix collisions still fail. Successful candidate capture also clears stale response failures; only known list routes may report schema mismatch.
+- Reevaluate when: PGY changes its selected-page tokens, nickname ceases to lead the calibrated information block, virtualizes partial rows, or provides an official ordered export. Complete ordered identity and fail-closed collision handling remain required.

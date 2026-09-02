@@ -136,7 +136,7 @@ assert.strictEqual(currentPageClickCount, 1);
 
 const pgyPageOne = paginatorElement({
   text: '1 1',
-  className: 'd-pagination-page --color-bg-primary-light',
+  className: 'd-pagination-page --color-bg-primary-light --color-primary',
   left: 32
 });
 const pgyPageTwo = paginatorElement({ text: '2 2', className: 'd-pagination-page', left: 64 });
@@ -189,6 +189,50 @@ const inspectedPgyPagination = Function(
 assert.strictEqual(inspectedPgyPagination.currentPage, 1);
 assert.deepStrictEqual(inspectedPgyPagination.pageNumbers, [1, 2]);
 assert.strictEqual(inspectedPgyPagination.selector, '.d-pagination.hide-pagination-page-size');
+
+const stalePageOne = paginatorElement({
+  text: '1 1',
+  className: 'd-pagination-page --color-bg-primary-light',
+  left: 32
+});
+const selectedPageTwo = paginatorElement({
+  text: '2 2',
+  className: 'd-pagination-page --color-bg-primary-light --color-primary',
+  left: 64
+});
+const enabledPrevious = paginatorElement({ className: 'd-pagination-page', left: 0 });
+const pageTwoRoot = paginatorElement({ className: 'd-pagination hide-pagination-page-size' });
+pageTwoRoot.innerText = '1 1 2 2 跳至 页';
+pageTwoRoot.textContent = pageTwoRoot.innerText;
+pageTwoRoot.querySelectorAll = () => [enabledPrevious, stalePageOne, selectedPageTwo, pgyNext];
+for (const element of [enabledPrevious, stalePageOne, selectedPageTwo, pgyNext]) {
+  element.parentElement = pageTwoRoot;
+}
+const pageTwoDocument = {
+  querySelectorAll: (selector) => {
+    if (selector === '.d-pagination.hide-pagination-page-size') return [pageTwoRoot];
+    if (selector === 'input') return [];
+    return [];
+  },
+  querySelector: () => null
+};
+const inspectedPgyPageTwo = Function(
+  'document',
+  'getComputedStyle',
+  'Event',
+  'KeyboardEvent',
+  `return (${buildSearchPaginationScript('inspect', 1, {
+    paginationSelector: '.d-pagination.hide-pagination-page-size'
+  })});`
+)(
+  pageTwoDocument,
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  class {},
+  class {}
+);
+assert.strictEqual(inspectedPgyPageTwo.currentPage, 2);
+assert.strictEqual(inspectedPgyPageTwo.currentPageKnown, true);
+assert.strictEqual(inspectedPgyPageTwo.atFirstPage, false);
 
 let revealedPagination = false;
 pgyPaginatorRoot.scrollIntoView = () => { revealedPagination = true; };
@@ -309,6 +353,29 @@ const calibratedIdentity = Function(
 assert.strictEqual(calibratedIdentity.orderedMatch, true);
 assert.strictEqual(calibratedIdentity.visibleNameCount, 4);
 assert.strictEqual(calibratedIdentity.evidence, 'calibrated-name-selector-exact-order');
+const informationBlockElements = ['达人甲 上海 时尚', '达人乙 北京 美妆', '达人丙 广州 生活', '达人丁 杭州 摄影']
+  .map((text) => ({
+    nodeType: 1,
+    innerText: text,
+    textContent: text,
+    getBoundingClientRect: () => ({ width: 180, height: 40 })
+  }));
+const boundedInformationBlockIdentity = Function(
+  'document',
+  'getComputedStyle',
+  `return (${buildCandidatePageIdentityScript(identityItems, { nameSelector: '.candidate-name' })});`
+)(
+  {
+    body: { innerText: '无关文本' },
+    querySelectorAll: (selector) => selector === '.candidate-name' ? informationBlockElements : []
+  },
+  () => ({ display: 'block', visibility: 'visible', opacity: '1' })
+);
+assert.strictEqual(boundedInformationBlockIdentity.orderedMatch, true);
+assert.strictEqual(
+  boundedInformationBlockIdentity.evidence,
+  'calibrated-name-selector-bounded-order'
+);
 const sameFirstThreeWrongFourth = Function(
   'document',
   'getComputedStyle',

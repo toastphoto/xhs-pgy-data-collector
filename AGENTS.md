@@ -6,7 +6,8 @@ Xiaohongshu Pugongying Data Collector is a conservative desktop data collection 
 
 ## Main Paths
 
-- Current Windows repository root: `C:\Users\feibo\Documents\Codex\2026-06-25\s\projects\xhs-pgy-data-collector`
+- Current repository root: `/Users/jingjing/Documents/Codex/2026-06-03/new-chat/product/xhs-pgy-data-collector`
+- Historical Windows checkout: `C:\Users\feibo\Documents\Codex\2026-06-25\s\projects\xhs-pgy-data-collector` (needs recheck before Windows work)
 - Main product line: `desktop-app/`
 - Compatibility backend/reference crawler: `content-analyzer/`
 - Product/spec notes: `docs/`
@@ -18,7 +19,7 @@ Xiaohongshu Pugongying Data Collector is a conservative desktop data collection 
 - Pugongying live safety validation protocol: `docs/project_memory/PGY_LIVE_VALIDATION_PROTOCOL.md`
 - MVP acceptance plan: `docs/project_memory/MVP_ACCEPTANCE_PLAN.md`
 
-Current checked state on 2026-06-29: branch `main` was synced with `origin/main`, and ports `8010` and `8000` were not listening. Treat this as volatile: recheck at the start of each new thread.
+Checked on 2026-09-04: branch `codex/v0.1.51-workspace-continuity` tracked the matching local `github/` reference before this memory review. The review itself leaves uncommitted memory-file changes. Live remote state, authentication, services, ports, installed artifacts, and external pages all need recheck before use.
 
 ## Run And Verify
 
@@ -110,6 +111,14 @@ python scripts/check_mvp_readiness.py --strict
 - Calibration UX must always show the operator's current step and next verification action. Ranked collection is not calibrated until field/container selectors and a read-only cross-page round trip both pass.
 - Do not treat a listening backend port as process identity. Packaged startup must verify the per-launch instance token and protocol version, and the desktop app must remain single-instance.
 - Do not start Xiaohongshu enrichment as a side effect of opening enterprise mail. Contact enrichment and mail handoff are separate, explicit operator actions.
+- Treat successful continuation and failed recovery as different outcomes: a complete ranked read keeps the last verified page, an incomplete or canceled read restores the known start page, and a risk stop performs no extra navigation.
+- A persistent partition alone does not preserve an authenticated workspace. Reuse the same allowlisted WebContents across batches, load its entry URL only when new or invalid, and leave platform expiry or verification to the operator.
+- Resolve the active PGY page only from exact ARIA state or strong selected-page class tokens. Weak appearance tokens are insufficient; response nicknames may match a calibrated information block only by exact equality or a whitespace-bounded prefix across the complete visible order.
+- Keep DOM calibration, response-data readiness, and historical validation as separate states. A prior successful selector or cross-page record becomes `需复验` after restart and cannot authorize current collection by itself.
+- Crossing from an embedded BrowserView to a renderer-owned input requires both trusted renderer/webContents focus and DOM focus. A focus ring alone does not prove keyboard or IME ownership.
+- Test Electron features across the complete renderer, preload, IPC, main-process, persistence, and installed-artifact path. Exercise the user's real event order and immediate repetition; do not attach a second CDP client while production response capture owns `webContents.debugger`.
+- Packaging acceptance is platform-specific and must inspect the actual installed app, launcher, visible version, ASAR contents, bundled runtime, and service ownership. Exclude prior build outputs and never infer an installed result from source or an unpacked directory.
+- Bind progress and busy indicators to the exact operation they describe. Preserve requested versus effective states and do not let a page-wide loading flag claim that calibration, pause, stop, or send has completed.
 
 ## Memory Update Rules
 

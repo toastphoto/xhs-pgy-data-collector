@@ -66,11 +66,15 @@ function normalizeSettings(settings) {
   const src = settings && typeof settings === 'object' ? settings : {};
   return {
     defaultGroupTag: cleanStr(src.defaultGroupTag),
+    projectName: cleanStr(src.projectName),
     defaultGreeting: cleanStr(src.defaultGreeting),
     xiaomifengSmartRemark: cleanStr(src.xiaomifengSmartRemark || '{MMDD}-{昵称}') || '{MMDD}-{昵称}',
     xiaomifengTaskWechat: cleanStr(src.xiaomifengTaskWechat),
     selectionPolicy: cleanStr(src.selectionPolicy),
     contactChannel: normalizeContactChannel(src.contactChannel || '微信') || '微信建联',
+    composerMethod: ['微信建联', '邮件建联', '蒲公英邀约'].includes(cleanStr(src.composerMethod))
+      ? cleanStr(src.composerMethod)
+      : '微信建联',
     emailSubject: cleanStr(src.emailSubject),
     emailBody: cleanStr(src.emailBody),
     pgyCooperationGoal: cleanStr(src.pgyCooperationGoal || '笔记合作') || '笔记合作',

@@ -4,6 +4,19 @@ import {
   createReviewViewportStateRegistry,
   restoreReviewViewport
 } from '../state/review_view_state.mjs';
+import {
+  OUTREACH_CHANNEL_KEYS,
+  createOutreachTemplateId,
+  deleteOutreachTemplate,
+  getOutreachChannel,
+  getSelectedOutreachTemplate,
+  loadOutreachTemplateLibrary,
+  resolveOutreachTemplateText,
+  restoreOutreachVariable,
+  saveOutreachTemplateLibrary,
+  setDefaultOutreachTemplate,
+  upsertOutreachTemplate
+} from '../state/outreach_templates.mjs';
 import { createAdvancedSection } from '../ui/components.js';
 
 let _runs = [];
@@ -16,12 +29,14 @@ let _query = '';
 let _colsLoadedOnce = false;
 let _activeGroup = '';
 let _contactGroupTag = '';
-let _contactGreeting = '您好，我们想和您沟通一下品牌合作，方便的话可以通过一下好友吗？';
+let _contactProjectName = '';
+let _contactGreeting = '你好，我们想和您沟通一下{{项目名称}}合作，方便的话可以通过一下好友吗？';
 let _xiaomifengSmartRemark = '{MMDD}-{昵称}';
 let _xiaomifengTaskWechat = '';
 let _xiaomifengApproval = null;
 let _xiaomifengApprovalCheck = null;
 let _contactChannelStrategy = '自动分流';
+let _contactComposerMethod = '微信建联';
 let _contactEmailSubject = '';
 let _contactEmailBody = '';
 let _contactPgyCooperationGoal = '笔记合作';
@@ -82,6 +97,16 @@ let _emailHandoffState = {
 };
 let _pgyInviteAccountState = { status: 'unknown', message: '邀约账号尚未检测。' };
 const _pgyInviteDraftStates = new Map();
+let _pgyInviteBatchState = {
+  status: 'idle',
+  rowIds: [],
+  currentIndex: -1,
+  results: [],
+  message: '',
+  stopRequested: false
+};
+let _outreachTemplateLibrary = loadOutreachTemplateLibrary(window.localStorage);
+let _outreachTemplateStatus = '';
 
 const FOLLOWUP_STATUS_OPTIONS = ['待建联', '已建联', '已通过', '已拒绝', '需二次跟进', '不建联'];
 const CONTACT_CHANNEL_OPTIONS = ['自动分流', '蒲公英邀约', '微信建联', '邮件建联', '待补联系方式'];
@@ -485,14 +510,283 @@ function makeMetricCard(label, value, tone = '') {
   return card;
 }
 
+function getOutreachChannelKey(method = _contactComposerMethod) {
+  return OUTREACH_CHANNEL_KEYS[method] || 'wechat';
+}
+
+function getOutreachTemplateVariables() {
+  return {
+    项目名称: _contactProjectName,
+    品牌名称: _contactPgyBrandName,
+    产品名称: _contactPgyProductName
+  };
+}
+
+function persistOutreachTemplates() {
+  _outreachTemplateLibrary = saveOutreachTemplateLibrary(window.localStorage, _outreachTemplateLibrary);
+}
+
+function selectOutreachTemplate(method, templateId) {
+  const channelKey = getOutreachChannelKey(method);
+  const channel = _outreachTemplateLibrary.channels[channelKey];
+  if (!channel?.templates.some((item) => item.id === templateId)) return false;
+  channel.selectedId = templateId;
+  persistOutreachTemplates();
+  return true;
+}
+
+function canonicalizeOutreachDraft(method, value) {
+  let result = String(value || '');
+  if (method === '微信建联' || method === '邮件建联') {
+    result = restoreOutreachVariable(result, _contactProjectName, '项目名称');
+  }
+  if (method === '蒲公英邀约') {
+    result = restoreOutreachVariable(result, _contactPgyBrandName, '品牌名称');
+    result = restoreOutreachVariable(result, _contactPgyProductName, '产品名称');
+  }
+  return result;
+}
+
+function applySelectedOutreachTemplate(method) {
+  const template = getSelectedOutreachTemplate(_outreachTemplateLibrary, getOutreachChannelKey(method));
+  const variables = getOutreachTemplateVariables();
+  if (method === '邮件建联') {
+    _contactEmailSubject = resolveOutreachTemplateText(template.subject, variables);
+    _contactEmailBody = resolveOutreachTemplateText(template.body, variables);
+  } else if (method === '蒲公英邀约') {
+    _contactPgyIntro = resolveOutreachTemplateText(template.body, variables);
+    invalidatePgyInviteDrafts();
+  } else {
+    _contactGreeting = resolveOutreachTemplateText(template.body, variables);
+  }
+  scheduleContactReviewSave();
+  return template;
+}
+
+function createOutreachTemplateManager(method, fieldDefinitions) {
+  const channelKey = getOutreachChannelKey(method);
+  const root = document.createElement('div');
+  root.className = 'outreach-template-manager';
+
+  const header = document.createElement('div');
+  header.className = 'outreach-template-head';
+  const heading = document.createElement('div');
+  heading.className = 'outreach-template-heading';
+  heading.textContent = method === '蒲公英邀约' ? '合作内容介绍模板' : '我的个人话术模板';
+  const addButton = document.createElement('button');
+  addButton.type = 'button';
+  addButton.className = 'btn ghost outreach-template-add';
+  addButton.textContent = '新增模板';
+  header.appendChild(heading);
+  header.appendChild(addButton);
+  root.appendChild(header);
+
+  const choices = document.createElement('div');
+  choices.className = 'outreach-template-list';
+  root.appendChild(choices);
+
+  const editor = document.createElement('div');
+  editor.className = 'outreach-template-editor';
+  const nameWrap = document.createElement('label');
+  nameWrap.className = 'field-label compact';
+  nameWrap.textContent = '模板名称';
+  const nameInput = document.createElement('input');
+  nameInput.className = 'tpl-input';
+  nameWrap.appendChild(nameInput);
+  editor.appendChild(nameWrap);
+
+  const inputs = new Map();
+  fieldDefinitions.forEach((definition) => {
+    const wrap = document.createElement('label');
+    wrap.className = `field-label compact ${definition.wide ? 'wide' : ''}`.trim();
+    wrap.textContent = definition.label;
+    const input = document.createElement(definition.multiline ? 'textarea' : 'input');
+    input.className = 'tpl-input';
+    input.placeholder = definition.placeholder || '';
+    input.value = definition.getValue();
+    input.addEventListener('input', () => {
+      definition.setValue(input.value);
+      if (method === '蒲公英邀约') invalidatePgyInviteDrafts();
+      _outreachTemplateStatus = '已修改本次内容；个人模板尚未改变。';
+      status.textContent = _outreachTemplateStatus;
+      scheduleContactReviewSave();
+    });
+    inputs.set(definition.key, input);
+    wrap.appendChild(input);
+    editor.appendChild(wrap);
+  });
+  root.appendChild(editor);
+
+  const hint = document.createElement('div');
+  hint.className = 'outreach-template-hint';
+  hint.textContent = '本次内容可以临时修改；只有点击“保存到当前模板”才会影响以后调用。模板保存在当前电脑。';
+  root.appendChild(hint);
+
+  const footer = document.createElement('div');
+  footer.className = 'outreach-template-footer';
+  const status = document.createElement('div');
+  status.className = 'outreach-template-status';
+  status.setAttribute('role', 'status');
+  const actions = document.createElement('div');
+  actions.className = 'outreach-template-actions';
+  const deleteButton = makeSoftButton('删除当前模板', null);
+  deleteButton.classList.add('danger');
+  const saveAsButton = makeSoftButton('另存为新模板', null);
+  const defaultButton = makeSoftButton('设为默认', null);
+  const saveButton = makeSoftButton('保存到当前模板', null, { primary: true });
+  actions.appendChild(deleteButton);
+  actions.appendChild(saveAsButton);
+  actions.appendChild(defaultButton);
+  actions.appendChild(saveButton);
+  footer.appendChild(status);
+  footer.appendChild(actions);
+  root.appendChild(footer);
+
+  function getDraftTemplate(id, name, isDefault) {
+    const template = { id, name, isDefault };
+    fieldDefinitions.forEach((definition) => {
+      template[definition.key] = canonicalizeOutreachDraft(method, inputs.get(definition.key)?.value || '');
+    });
+    return template;
+  }
+
+  function syncInputsFromState() {
+    fieldDefinitions.forEach((definition) => {
+      const input = inputs.get(definition.key);
+      if (input) input.value = definition.getValue();
+    });
+  }
+
+  function renderChoices() {
+    choices.innerHTML = '';
+    const channel = getOutreachChannel(_outreachTemplateLibrary, channelKey);
+    const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
+    nameInput.value = selected?.name || '';
+    channel.templates.forEach((template) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `outreach-template-choice ${template.id === selected?.id ? 'active' : ''}`.trim();
+      button.setAttribute('aria-pressed', template.id === selected?.id ? 'true' : 'false');
+      const title = document.createElement('span');
+      title.className = 'outreach-template-choice-title';
+      title.textContent = template.name;
+      button.appendChild(title);
+      if (template.isDefault) {
+        const badge = document.createElement('span');
+        badge.className = 'outreach-template-default';
+        badge.textContent = '默认';
+        button.appendChild(badge);
+      }
+      const preview = document.createElement('span');
+      preview.className = 'outreach-template-choice-preview';
+      const previewParts = [];
+      if (template.subject) previewParts.push(resolveOutreachTemplateText(template.subject, getOutreachTemplateVariables()));
+      if (template.body) previewParts.push(resolveOutreachTemplateText(template.body, getOutreachTemplateVariables()));
+      preview.textContent = previewParts.join(' · ');
+      button.appendChild(preview);
+      button.addEventListener('click', () => {
+        if (!selectOutreachTemplate(method, template.id)) return;
+        const applied = applySelectedOutreachTemplate(method);
+        syncInputsFromState();
+        _outreachTemplateStatus = `已调用“${applied.name}”，尚未修改模板。`;
+        renderChoices();
+      });
+      choices.appendChild(button);
+    });
+    deleteButton.disabled = channel.templates.length <= 1;
+    deleteButton.title = channel.templates.length <= 1 ? '至少保留一个模板' : '';
+    defaultButton.disabled = selected?.isDefault === true;
+    status.textContent = _outreachTemplateStatus || `已调用“${selected?.name || ''}”。`;
+  }
+
+  nameInput.addEventListener('input', () => {
+    _outreachTemplateStatus = '已修改模板名称；点击保存后才会更新模板库。';
+    status.textContent = _outreachTemplateStatus;
+  });
+
+  addButton.addEventListener('click', () => {
+    const name = window.prompt('请输入新模板名称：', '新模板');
+    if (!String(name || '').trim()) return;
+    const id = createOutreachTemplateId(channelKey);
+    const empty = { id, name: String(name).trim(), isDefault: false, subject: '', body: '' };
+    _outreachTemplateLibrary = upsertOutreachTemplate(_outreachTemplateLibrary, channelKey, empty);
+    persistOutreachTemplates();
+    applySelectedOutreachTemplate(method);
+    syncInputsFromState();
+    _outreachTemplateStatus = `已新增“${empty.name}”，请填写内容后保存。`;
+    renderChoices();
+  });
+
+  saveAsButton.addEventListener('click', () => {
+    const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
+    const name = window.prompt('另存为新模板：', `${nameInput.value || selected?.name || '模板'} 副本`);
+    if (!String(name || '').trim()) return;
+    const id = createOutreachTemplateId(channelKey);
+    _outreachTemplateLibrary = upsertOutreachTemplate(
+      _outreachTemplateLibrary,
+      channelKey,
+      getDraftTemplate(id, String(name).trim(), false)
+    );
+    persistOutreachTemplates();
+    _outreachTemplateStatus = `已另存为“${String(name).trim()}”。`;
+    renderChoices();
+  });
+
+  saveButton.addEventListener('click', () => {
+    const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
+    if (!selected) return;
+    const name = String(nameInput.value || '').trim() || selected.name;
+    _outreachTemplateLibrary = upsertOutreachTemplate(
+      _outreachTemplateLibrary,
+      channelKey,
+      getDraftTemplate(selected.id, name, selected.isDefault)
+    );
+    persistOutreachTemplates();
+    _outreachTemplateStatus = `已保存到“${name}”，以后调用会使用这版内容。`;
+    renderChoices();
+  });
+
+  defaultButton.addEventListener('click', () => {
+    const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
+    if (!selected) return;
+    _outreachTemplateLibrary = setDefaultOutreachTemplate(_outreachTemplateLibrary, channelKey, selected.id);
+    persistOutreachTemplates();
+    _outreachTemplateStatus = `已将“${selected.name}”设为默认模板。`;
+    renderChoices();
+  });
+
+  deleteButton.addEventListener('click', () => {
+    const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
+    if (!selected) return;
+    if (!window.confirm(`确认删除模板“${selected.name}”？\n\n删除后无法恢复；本次已经生成的内容不会自动发送。`)) return;
+    const result = deleteOutreachTemplate(_outreachTemplateLibrary, channelKey, selected.id);
+    if (!result.ok) {
+      _outreachTemplateStatus = result.reason === 'last_template' ? '至少保留一个模板，无法删除。' : '模板删除失败。';
+      status.textContent = _outreachTemplateStatus;
+      return;
+    }
+    _outreachTemplateLibrary = result.library;
+    persistOutreachTemplates();
+    const applied = applySelectedOutreachTemplate(method);
+    syncInputsFromState();
+    _outreachTemplateStatus = `已删除“${selected.name}”，并切换到“${applied.name}”。`;
+    renderChoices();
+  });
+
+  renderChoices();
+  return { root, renderChoices, syncInputsFromState };
+}
+
 function getContactSettings() {
   return {
-    defaultGroupTag: _contactGroupTag,
+    defaultGroupTag: _contactProjectName || _contactGroupTag,
+    projectName: _contactProjectName,
     defaultGreeting: _contactGreeting,
     xiaomifengSmartRemark: _xiaomifengSmartRemark,
     xiaomifengTaskWechat: _xiaomifengTaskWechat,
     selectionPolicy: CONTACT_SELECTION_POLICY,
     contactChannel: _contactChannelStrategy,
+    composerMethod: _contactComposerMethod,
     emailSubject: _contactEmailSubject,
     emailBody: _contactEmailBody,
     pgyCooperationGoal: _contactPgyCooperationGoal,
@@ -525,6 +819,14 @@ function getPgyInviteSettings() {
 
 function invalidatePgyInviteDrafts() {
   _pgyInviteDraftStates.clear();
+  if (isPgyInviteBatchActive()) {
+    _pgyInviteBatchState = {
+      ..._pgyInviteBatchState,
+      status: 'stopped',
+      stopRequested: true,
+      message: '邀约内容已修改，原批量队列已停止。请重新检查后再启动。'
+    };
+  }
   document.querySelectorAll('.pgy-invite-row-status, .contact-pgy-action.send').forEach((node) => node.remove());
 }
 
@@ -567,7 +869,7 @@ async function preparePgyInviteForRow(row, rowId) {
     const message = `固定邀约模板不完整：${templateErrors.join('；')}`;
     setPgyInviteDraftState(rowId, { status: 'error', message });
     setMsg(message);
-    return;
+    return { ok: false, code: 'PGY_INVITE_TEMPLATE_INCOMPLETE', error: message };
   }
   setPgyInviteDraftState(rowId, { status: 'preparing', message: '正在打开达人、进入详细邀约表单并逐项填写...' });
   const opened = await window.desktopAPI.invites.openCreator({ runDir: _selectedRunDir, rowId });
@@ -575,7 +877,7 @@ async function preparePgyInviteForRow(row, rowId) {
     const message = `邀约账号打开达人失败：${opened?.error || 'unknown error'}`;
     setPgyInviteDraftState(rowId, { status: 'error', message });
     setMsg(message);
-    return;
+    return { ...opened, ok: false, error: message };
   }
   const prepared = await window.desktopAPI.invites.prepare({
     runDir: _selectedRunDir,
@@ -586,11 +888,12 @@ async function preparePgyInviteForRow(row, rowId) {
     const message = `邀约准备失败：${prepared?.error || 'unknown error'}`;
     setPgyInviteDraftState(rowId, { status: 'error', message });
     setMsg(message);
-    return;
+    return { ...prepared, ok: false, error: message };
   }
   const message = `邀约已准备：${prepared.creatorName || row.creatorName || '该达人'}；报备品牌、联系方式、产品、合作内容和发布时间均已填写并回读一致。请核对右侧后再确认发送。`;
   setPgyInviteDraftState(rowId, { status: 'ready', message, prepared });
   setMsg(message);
+  return { ...prepared, ok: true };
 }
 
 async function sendPreparedPgyInviteForRow(row, rowId) {
@@ -598,7 +901,7 @@ async function sendPreparedPgyInviteForRow(row, rowId) {
   const prepared = state?.prepared;
   if (state?.status !== 'ready' || !prepared?.token || !prepared?.fingerprint) {
     setMsg('请先点击“准备邀约”，并等待模板校验通过。');
-    return;
+    return { ok: false, code: 'PGY_INVITE_CONFIRMATION_REQUIRED', error: '请先准备邀约' };
   }
   const template = prepared.template || {};
   const confirmed = window.confirm(
@@ -614,7 +917,7 @@ async function sendPreparedPgyInviteForRow(row, rowId) {
     + `发布时间：${template.publishStart || '-'} 至 ${template.publishEnd || '-'}\n`
     + `合作内容：${template.intro || '-'}\n\n确认后软件只会点击一次详细表单底部的“发起邀约”按钮。`
   );
-  if (!confirmed) return;
+  if (!confirmed) return { ok: false, canceled: true };
   setPgyInviteDraftState(rowId, { ...state, status: 'sending', message: '正在执行已确认的邀约...' });
   const sent = await window.desktopAPI.invites.sendPrepared({
     runDir: _selectedRunDir,
@@ -626,7 +929,7 @@ async function sendPreparedPgyInviteForRow(row, rowId) {
     const message = `邀约发送失败：${sent?.error || 'unknown error'}`;
     setPgyInviteDraftState(rowId, { status: 'error', message });
     setMsg(message);
-    return;
+    return { ...sent, ok: false, error: message };
   }
   const confirmedSuccess = sent.outcome === 'success-confirmed';
   const message = confirmedSuccess
@@ -634,6 +937,183 @@ async function sendPreparedPgyInviteForRow(row, rowId) {
     : `已按确认点击一次“发起邀约”：${sent.creatorName || row.creatorName || '该达人'}。平台未返回可识别的成功文案，请查看右侧页面确认最终状态。`;
   setPgyInviteDraftState(rowId, { status: confirmedSuccess ? 'sent' : 'submitted', message });
   setMsg(message);
+  return { ...sent, ok: true, confirmedSuccess };
+}
+
+function setPgyInviteBatchState(patch) {
+  _pgyInviteBatchState = { ..._pgyInviteBatchState, ...(patch || {}) };
+  store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+}
+
+function getPgyInviteBatchCurrentRow() {
+  const rowId = _pgyInviteBatchState.rowIds[_pgyInviteBatchState.currentIndex];
+  return _contactPreviewRows.find((row) => String(row?.rowId || '') === String(rowId || '')) || null;
+}
+
+function isPgyInviteBatchActive() {
+  return ['preparing', 'awaiting_confirmation', 'sending', 'checking_result', 'cooldown', 'error', 'stopping'].includes(_pgyInviteBatchState.status);
+}
+
+function markPgyInviteBatchRowHandled(row, resultStatus) {
+  const review = ensureReviewRow(row);
+  if (!review) return;
+  if (resultStatus === 'sent' || resultStatus === 'manual') {
+    review.followupStatus = '已建联';
+    review.selected = false;
+  } else if (resultStatus === 'skipped') {
+    review.followupStatus = '需二次跟进';
+    review.selected = false;
+  }
+  scheduleContactReviewSave();
+}
+
+async function prepareCurrentPgyInviteBatchItem() {
+  const row = getPgyInviteBatchCurrentRow();
+  if (!row) {
+    setPgyInviteBatchState({ status: 'error', message: '当前批次达人已经不在名单中，请停止后重新选择。' });
+    return;
+  }
+  const rowId = String(row.rowId || '');
+  setPgyInviteBatchState({
+    status: 'preparing',
+    message: `正在自动打开并准备：${row.creatorName || '该达人'}`
+  });
+  const prepared = await preparePgyInviteForRow(row, rowId);
+  if (_pgyInviteBatchState.stopRequested) {
+    setPgyInviteBatchState({ status: 'stopped', message: '批量邀约已停止；当前未发送任何未经确认的邀约。' });
+    return;
+  }
+  if (!prepared?.ok) {
+    setPgyInviteBatchState({
+      status: 'error',
+      message: `第 ${_pgyInviteBatchState.currentIndex + 1} 位准备失败：${prepared?.error || 'unknown error'}`
+    });
+    return;
+  }
+  setPgyInviteBatchState({
+    status: 'awaiting_confirmation',
+    message: `${row.creatorName || '该达人'} 的邀约已经填写完成。请核对右侧内容，再人工确认发送。`
+  });
+}
+
+async function advancePgyInviteBatch(resultStatus, resultMessage) {
+  const currentRow = getPgyInviteBatchCurrentRow();
+  markPgyInviteBatchRowHandled(currentRow, resultStatus);
+  const results = [
+    ..._pgyInviteBatchState.results,
+    {
+      rowId: String(currentRow?.rowId || ''),
+      creatorName: currentRow?.creatorName || '',
+      status: resultStatus,
+      message: resultMessage || ''
+    }
+  ];
+  const nextIndex = _pgyInviteBatchState.currentIndex + 1;
+  if (nextIndex >= _pgyInviteBatchState.rowIds.length) {
+    const sent = results.filter((item) => item.status === 'sent').length;
+    const manual = results.filter((item) => item.status === 'manual').length;
+    const skipped = results.filter((item) => item.status === 'skipped').length;
+    setPgyInviteBatchState({
+      status: 'completed',
+      currentIndex: nextIndex,
+      results,
+      stopRequested: false,
+      message: `本批次已结束：明确成功 ${sent} 位，人工处理 ${manual} 位，跳过 ${skipped} 位。`
+    });
+    return;
+  }
+  setPgyInviteBatchState({
+    status: 'cooldown',
+    currentIndex: nextIndex,
+    results,
+    message: '上一位已处理，安全间隔后准备下一位达人。'
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  if (_pgyInviteBatchState.stopRequested) {
+    setPgyInviteBatchState({ status: 'stopped', message: '批量邀约已停止。' });
+    return;
+  }
+  await prepareCurrentPgyInviteBatchItem();
+}
+
+async function sendCurrentPgyInviteBatchItem() {
+  const row = getPgyInviteBatchCurrentRow();
+  if (!row || _pgyInviteBatchState.status !== 'awaiting_confirmation') return;
+  setPgyInviteBatchState({ status: 'sending', message: `等待人工确认：${row.creatorName || '该达人'}` });
+  const sent = await sendPreparedPgyInviteForRow(row, String(row.rowId || ''));
+  if (sent?.canceled) {
+    setPgyInviteBatchState({ status: 'awaiting_confirmation', message: '已取消发送。当前达人仍停留在右侧，等待人工确认。' });
+    return;
+  }
+  if (!sent?.ok) {
+    setPgyInviteBatchState({ status: 'error', message: sent?.error || '当前达人邀约发送失败。' });
+    return;
+  }
+  if (!sent.confirmedSuccess) {
+    setPgyInviteBatchState({
+      status: 'checking_result',
+      message: '平台尚未返回可识别的成功提示。请查看右侧结果，确认后再继续下一位。'
+    });
+    return;
+  }
+  await advancePgyInviteBatch('sent', sent?.message || '平台明确返回邀约成功');
+}
+
+async function startPgyInviteBatch(rows) {
+  const targets = (Array.isArray(rows) ? rows : []).filter((row) => row?.rowId && row?.creatorUrl);
+  if (!targets.length) {
+    setMsg('请先在蒲公英邀约界面勾选需要邀约的达人。');
+    return;
+  }
+  if (targets.length > 50) {
+    setMsg('单次蒲公英批量邀约最多 50 位，请分批处理。');
+    return;
+  }
+  const templateErrors = getPgyInviteTemplateErrors();
+  if (templateErrors.length) {
+    setMsg(`请先完善蒲公英邀约信息：${templateErrors.join('；')}`);
+    return;
+  }
+  const login = await window.desktopAPI.invites.checkLogin();
+  if (!login?.ok || !login?.loggedIn || login?.riskDetected) {
+    _pgyInviteAccountState = login?.riskDetected
+      ? { status: 'risk', message: `邀约账号需要人工处理安全验证：${login?.riskText || '请查看右侧页面'}` }
+      : { status: 'waiting', message: login?.error || '请先打开并登录蒲公英邀约账号。' };
+    setMsg(_pgyInviteAccountState.message);
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    return;
+  }
+  const names = targets.slice(0, 10).map((row) => row.creatorName || '未命名达人').join('、');
+  const remaining = targets.length > 10 ? `等 ${targets.length} 位` : `共 ${targets.length} 位`;
+  const confirmed = window.confirm(
+    `确认启动蒲公英批量邀约？\n\n${names}${targets.length > 10 ? '……' : ''}\n${remaining}\n\n`
+    + '软件会逐人自动打开并准备邀约；每一位真正发送前都必须由你人工确认。遇到登录、验证或页面异常会立即停下。'
+  );
+  if (!confirmed) return;
+  targets.forEach((row) => {
+    const review = ensureReviewRow(row);
+    if (review) review.contactChannel = '蒲公英邀约';
+  });
+  scheduleContactReviewSave();
+  _pgyInviteBatchState = {
+    status: 'preparing',
+    rowIds: targets.map((row) => String(row.rowId)),
+    currentIndex: 0,
+    results: [],
+    message: '正在准备第 1 位达人。',
+    stopRequested: false
+  };
+  await prepareCurrentPgyInviteBatchItem();
+}
+
+function stopPgyInviteBatch() {
+  if (!isPgyInviteBatchActive()) return;
+  const isPreparing = ['preparing', 'sending', 'cooldown'].includes(_pgyInviteBatchState.status);
+  setPgyInviteBatchState({
+    stopRequested: true,
+    status: isPreparing ? 'stopping' : 'stopped',
+    message: isPreparing ? '停止请求已收到，将在当前安全点停止。' : '批量邀约已停止。'
+  });
 }
 
 function getEmailTemplateSettings() {
@@ -668,9 +1148,10 @@ function defaultFollowupStatus(review) {
   return review?.selected === true ? '待建联' : '';
 }
 
-function markReviewSelected(review) {
+function markReviewSelected(review, channel = _contactComposerMethod) {
   if (!review) return;
   review.selected = true;
+  review.contactChannel = normalizeContactChannel(channel, _contactComposerMethod);
   if (!String(review.followupStatus || '').trim() || review.followupStatus === '不建联') {
     review.followupStatus = '待建联';
   }
@@ -716,7 +1197,7 @@ function getContactFilteredRows() {
   const search = String(_contactSearch || '').trim().toLowerCase();
   return (_contactPreviewRows || []).filter((row) => {
     const review = ensureReviewRow(row);
-    const selected = review?.selected === true;
+    const selected = review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
     const hasContact = Boolean(String(review?.wechatId || '').trim() || String(review?.phone || '').trim() || String(review?.email || row?.email || '').trim());
     const hasPriority = Boolean(String(review?.priority || '').trim());
     const followupStatus = defaultFollowupStatus(review);
@@ -784,10 +1265,14 @@ async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) 
       _contactReviewMap.set(rowId, next);
     });
     if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
+    if (r.settings?.projectName !== undefined) _contactProjectName = r.settings.projectName;
     if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
     if (r.settings?.xiaomifengSmartRemark) _xiaomifengSmartRemark = r.settings.xiaomifengSmartRemark;
     if (r.settings?.xiaomifengTaskWechat !== undefined) _xiaomifengTaskWechat = r.settings.xiaomifengTaskWechat;
     if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
+    if (['微信建联', '邮件建联', '蒲公英邀约'].includes(r.settings?.composerMethod)) {
+      _contactComposerMethod = r.settings.composerMethod;
+    }
     if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
     if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
     if (r.settings?.pgyCooperationGoal) _contactPgyCooperationGoal = r.settings.pgyCooperationGoal;
@@ -879,6 +1364,10 @@ async function flushContactReviewSaveBeforeRunSwitch(runDir) {
 async function switchSelectedContactRun(nextRunDir) {
   const targetRunDir = String(nextRunDir || '');
   if (targetRunDir === _selectedRunDir) return true;
+  if (isPgyInviteBatchActive()) {
+    setMsg('请先完成或停止当前蒲公英批量邀约，再切换采集结果。');
+    return false;
+  }
   const previousRunDir = _selectedRunDir;
   if (previousRunDir) {
     const flushed = await flushContactReviewSaveBeforeRunSwitch(previousRunDir);
@@ -1241,85 +1730,8 @@ export function renderExports(state) {
   contactHead.appendChild(contactHint);
   contactSec.appendChild(contactHead);
 
-  const contactGrid = document.createElement('div');
-  contactGrid.className = 'export-settings-grid';
-
-  const strategyWrap = document.createElement('label');
-  strategyWrap.className = 'field-label';
-  strategyWrap.textContent = '默认建联方式';
-  const strategySelect = document.createElement('select');
-  strategySelect.className = 'tpl-input';
-  CONTACT_CHANNEL_OPTIONS.forEach((value) => {
-    const opt = document.createElement('option');
-    opt.value = value;
-    opt.textContent = value;
-    if (value === _contactChannelStrategy) opt.selected = true;
-    strategySelect.appendChild(opt);
-  });
-  strategySelect.addEventListener('change', () => {
-    _contactChannelStrategy = normalizeContactChannel(strategySelect.value);
-    _contactPreviewRows.forEach((row) => {
-      const review = ensureReviewRow(row);
-      if (review && normalizeContactChannel(review.contactChannel) === '自动分流') {
-        review.contactChannel = _contactChannelStrategy;
-      }
-    });
-    scheduleContactReviewSave();
-    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
-  });
-  strategyWrap.appendChild(strategySelect);
-
-  const groupWrap = document.createElement('label');
-  groupWrap.className = 'field-label';
-  groupWrap.textContent = '微信分组标签';
-  const groupInput = document.createElement('input');
-  groupInput.className = 'tpl-input';
-  groupInput.placeholder = '例如 FILA';
-  groupInput.value = _contactGroupTag;
-  groupInput.addEventListener('input', () => {
-    _contactGroupTag = groupInput.value;
-    scheduleContactReviewSave();
-  });
-  groupWrap.appendChild(groupInput);
-
-  const greetingWrap = document.createElement('label');
-  greetingWrap.className = 'field-label';
-  greetingWrap.textContent = '默认打招呼内容';
-  const greetingInput = document.createElement('input');
-  greetingInput.className = 'tpl-input';
-  greetingInput.placeholder = '用于建联表和小蜜蜂导入表';
-  greetingInput.value = _contactGreeting;
-  greetingInput.addEventListener('input', () => {
-    _contactGreeting = greetingInput.value;
-    scheduleContactReviewSave();
-  });
-  greetingWrap.appendChild(greetingInput);
-
-  const xmfRemarkWrap = document.createElement('label');
-  xmfRemarkWrap.className = 'field-label';
-  xmfRemarkWrap.textContent = '小蜜蜂智能备注';
-  const xmfRemarkInput = document.createElement('input');
-  xmfRemarkInput.className = 'tpl-input';
-  xmfRemarkInput.placeholder = '{MMDD}-{昵称}';
-  xmfRemarkInput.value = _xiaomifengSmartRemark;
-  xmfRemarkInput.addEventListener('input', () => {
-    _xiaomifengSmartRemark = xmfRemarkInput.value;
-    scheduleContactReviewSave();
-  });
-  xmfRemarkWrap.appendChild(xmfRemarkInput);
-
-  const xmfAccountWrap = document.createElement('label');
-  xmfAccountWrap.className = 'field-label';
-  xmfAccountWrap.textContent = '任务微信';
-  const xmfAccountInput = document.createElement('input');
-  xmfAccountInput.className = 'tpl-input';
-  xmfAccountInput.placeholder = '留空由小蜜蜂智能分配';
-  xmfAccountInput.value = _xiaomifengTaskWechat;
-  xmfAccountInput.addEventListener('input', () => {
-    _xiaomifengTaskWechat = xmfAccountInput.value;
-    scheduleContactReviewSave();
-  });
-  xmfAccountWrap.appendChild(xmfAccountInput);
+  const contactComposer = document.createElement('div');
+  contactComposer.className = 'contact-composer';
 
   const btnExportContact = document.createElement('button');
   btnExportContact.className = 'btn primary';
@@ -1367,126 +1779,248 @@ export function renderExports(state) {
     }
   });
 
-  contactGrid.appendChild(strategyWrap);
-  contactGrid.appendChild(groupWrap);
-  contactGrid.appendChild(greetingWrap);
-  contactGrid.appendChild(xmfRemarkWrap);
-  contactGrid.appendChild(xmfAccountWrap);
+  const composerTabs = document.createElement('div');
+  composerTabs.className = 'contact-composer-tabs';
+  composerTabs.setAttribute('role', 'tablist');
+  composerTabs.setAttribute('aria-label', '默认建联方式');
+  const composerPanels = document.createElement('div');
+  composerPanels.className = 'contact-composer-panels';
+  const panelByMethod = new Map();
+  const buttonByMethod = new Map();
+  const projectInputs = [];
+  const templateManagers = [];
 
-  const emailWrap = document.createElement('label');
-  emailWrap.className = 'field-label';
-  emailWrap.textContent = '邮件标题';
-  const emailSubjectInput = document.createElement('input');
-  emailSubjectInput.className = 'tpl-input';
-  emailSubjectInput.placeholder = '例如 品牌合作沟通';
-  emailSubjectInput.value = _contactEmailSubject;
-  emailSubjectInput.addEventListener('input', () => {
-    _contactEmailSubject = emailSubjectInput.value;
-    scheduleContactReviewSave();
-  });
-  emailWrap.appendChild(emailSubjectInput);
-
-  const emailBodyWrap = document.createElement('label');
-  emailBodyWrap.className = 'field-label wide';
-  emailBodyWrap.textContent = '邮件正文';
-  const emailBodyInput = document.createElement('textarea');
-  emailBodyInput.className = 'tpl-input';
-  emailBodyInput.placeholder = '导出到邮件建联表，暂不自动发送。';
-  emailBodyInput.value = _contactEmailBody;
-  emailBodyInput.addEventListener('input', () => {
-    _contactEmailBody = emailBodyInput.value;
-    scheduleContactReviewSave();
-  });
-  emailBodyWrap.appendChild(emailBodyInput);
-
-  const pgyGrid = document.createElement('div');
-  pgyGrid.className = 'contact-strategy-grid';
-  const appendPgySelect = (label, value, options, setter) => {
+  const createComposerField = ({ label, value, placeholder = '', type = 'text', options = null, readOnly = false, maxLength = 0, onChange }) => {
     const wrap = document.createElement('label');
     wrap.className = 'field-label compact';
     wrap.textContent = label;
-    const select = document.createElement('select');
-    select.className = 'tpl-input';
-    options.forEach((optionValue) => {
-      const option = document.createElement('option');
-      option.value = optionValue;
-      option.textContent = optionValue;
-      option.selected = optionValue === value;
-      select.appendChild(option);
-    });
-    select.addEventListener('change', () => {
-      setter(select.value);
-      invalidatePgyInviteDrafts();
-      scheduleContactReviewSave();
-    });
-    wrap.appendChild(select);
-    pgyGrid.appendChild(wrap);
-  };
-  appendPgySelect('蒲公英合作诉求', _contactPgyCooperationGoal, ['笔记合作', '直播合作'], (value) => {
-    _contactPgyCooperationGoal = value;
-  });
-  appendPgySelect('蒲公英合作模式', _contactPgyCooperationMode, ['定制合作', '种收联动'], (value) => {
-    _contactPgyCooperationMode = value;
-  });
-  appendPgySelect('联系方式披露方式', _contactPgyContactChannel, ['微信', '手机号'], (value) => {
-    _contactPgyContactChannel = value;
-  });
-  const agencyWrap = document.createElement('label');
-  agencyWrap.className = 'field-label compact';
-  agencyWrap.textContent = '代理商';
-  const agencyInput = document.createElement('input');
-  agencyInput.className = 'tpl-input';
-  agencyInput.value = '由邀约账号自动带入';
-  agencyInput.readOnly = true;
-  agencyWrap.appendChild(agencyInput);
-  pgyGrid.appendChild(agencyWrap);
-  const pgyFields = [
-    ['内容形式（仅导出）', _contactPgyCooperationType, (v) => { _contactPgyCooperationType = v; }, '图文 / 视频', 'text'],
-    ['报备品牌', _contactPgyBrandName, (v) => { _contactPgyBrandName = v; }, '必须与蒲公英品牌下拉完全一致', 'text'],
-    ['产品名称', _contactPgyProductName, (v) => { _contactPgyProductName = v; }, '最多 20 个字符', 'text'],
-    ['联系方式账号/号码', _contactPgyContactWay, (v) => { _contactPgyContactWay = v; }, '填写微信号或手机号', 'text'],
-    ['开始日期', _contactPgyPublishStart, (v) => { _contactPgyPublishStart = v; }, 'YYYY-MM-DD', 'date'],
-    ['结束日期', _contactPgyPublishEnd, (v) => { _contactPgyPublishEnd = v; }, 'YYYY-MM-DD', 'date']
-  ];
-  pgyFields.forEach(([label, value, setter, placeholder, type]) => {
-    const wrap = document.createElement('label');
-    wrap.className = 'field-label compact';
-    wrap.textContent = label;
-    const input = document.createElement('input');
+    const input = document.createElement(options ? 'select' : 'input');
     input.className = 'tpl-input';
-    input.type = type;
-    input.placeholder = placeholder;
-    if (label === '产品名称') input.maxLength = 20;
-    input.value = value;
-    input.addEventListener('input', () => {
-      setter(input.value);
-      invalidatePgyInviteDrafts();
+    if (options) {
+      options.forEach((optionValue) => {
+        const option = document.createElement('option');
+        option.value = optionValue;
+        option.textContent = optionValue;
+        option.selected = optionValue === value;
+        input.appendChild(option);
+      });
+    } else {
+      input.type = type;
+      input.placeholder = placeholder;
+      input.value = value;
+      input.readOnly = readOnly;
+      if (maxLength) input.maxLength = maxLength;
+    }
+    const eventName = options ? 'change' : 'input';
+    input.addEventListener(eventName, () => {
+      if (onChange) onChange(input.value, input);
       scheduleContactReviewSave();
     });
     wrap.appendChild(input);
-    pgyGrid.appendChild(wrap);
+    return { wrap, input };
+  };
+
+  const updateProjectName = (nextProjectName) => {
+    const previousProjectName = _contactProjectName;
+    const greetingSource = restoreOutreachVariable(_contactGreeting, previousProjectName, '项目名称');
+    const emailSubjectSource = restoreOutreachVariable(_contactEmailSubject, previousProjectName, '项目名称');
+    const emailBodySource = restoreOutreachVariable(_contactEmailBody, previousProjectName, '项目名称');
+    _contactProjectName = nextProjectName;
+    const variables = getOutreachTemplateVariables();
+    _contactGreeting = resolveOutreachTemplateText(greetingSource, variables);
+    _contactEmailSubject = resolveOutreachTemplateText(emailSubjectSource, variables);
+    _contactEmailBody = resolveOutreachTemplateText(emailBodySource, variables);
+    projectInputs.forEach((input) => { if (input.value !== nextProjectName) input.value = nextProjectName; });
+    _outreachTemplateStatus = nextProjectName.trim()
+      ? `已将模板中的项目名称替换为“${nextProjectName.trim()}”。`
+      : '请输入品牌项目名称；模板变量会在输入后自动替换。';
+    templateManagers.forEach((manager) => {
+      manager.syncInputsFromState();
+      manager.renderChoices();
+    });
+  };
+
+  const addProjectField = (grid) => {
+    const field = createComposerField({
+      label: '品牌项目名称',
+      value: _contactProjectName,
+      placeholder: '例如：安踏项目',
+      onChange: updateProjectName
+    });
+    projectInputs.push(field.input);
+    grid.appendChild(field.wrap);
+  };
+
+  const wechatPanel = document.createElement('div');
+  wechatPanel.className = 'contact-composer-panel';
+  wechatPanel.setAttribute('role', 'tabpanel');
+  const wechatGrid = document.createElement('div');
+  wechatGrid.className = 'contact-composer-grid';
+  addProjectField(wechatGrid);
+  wechatGrid.appendChild(createComposerField({
+    label: '小蜜蜂智能备注',
+    value: _xiaomifengSmartRemark,
+    placeholder: '{MMDD}-{昵称}',
+    onChange: (value) => { _xiaomifengSmartRemark = value; }
+  }).wrap);
+  wechatGrid.appendChild(createComposerField({
+    label: '任务微信',
+    value: _xiaomifengTaskWechat,
+    placeholder: '留空由小蜜蜂智能分配',
+    onChange: (value) => { _xiaomifengTaskWechat = value; }
+  }).wrap);
+  wechatPanel.appendChild(wechatGrid);
+  const wechatManager = createOutreachTemplateManager('微信建联', [
+    {
+      key: 'body',
+      label: '默认打招呼内容',
+      placeholder: '用于建联表和小蜜蜂导入表',
+      multiline: true,
+      wide: true,
+      getValue: () => _contactGreeting,
+      setValue: (value) => { _contactGreeting = value; }
+    }
+  ]);
+  templateManagers.push(wechatManager);
+  wechatPanel.appendChild(wechatManager.root);
+  panelByMethod.set('微信建联', wechatPanel);
+
+  const emailPanel = document.createElement('div');
+  emailPanel.className = 'contact-composer-panel';
+  emailPanel.setAttribute('role', 'tabpanel');
+  const emailGrid = document.createElement('div');
+  emailGrid.className = 'contact-composer-grid single';
+  addProjectField(emailGrid);
+  emailPanel.appendChild(emailGrid);
+  const emailManager = createOutreachTemplateManager('邮件建联', [
+    {
+      key: 'subject',
+      label: '邮件主题',
+      placeholder: '输入项目名称后自动生成',
+      getValue: () => _contactEmailSubject,
+      setValue: (value) => { _contactEmailSubject = value; }
+    },
+    {
+      key: 'body',
+      label: '本次邮件内容',
+      placeholder: '导出到邮件建联表，不会自动发送',
+      multiline: true,
+      wide: true,
+      getValue: () => _contactEmailBody,
+      setValue: (value) => { _contactEmailBody = value; }
+    }
+  ]);
+  templateManagers.push(emailManager);
+  emailPanel.appendChild(emailManager.root);
+  panelByMethod.set('邮件建联', emailPanel);
+
+  const pgyPanel = document.createElement('div');
+  pgyPanel.className = 'contact-composer-panel';
+  pgyPanel.setAttribute('role', 'tabpanel');
+  const pgyGrid = document.createElement('div');
+  pgyGrid.className = 'contact-composer-grid';
+  const pgyFieldDefinitions = [
+    { label: '蒲公英合作诉求', value: _contactPgyCooperationGoal, options: ['笔记合作', '直播合作'], onChange: (value) => { _contactPgyCooperationGoal = value; } },
+    { label: '蒲公英合作模式', value: _contactPgyCooperationMode, options: ['定制合作', '种收联动'], onChange: (value) => { _contactPgyCooperationMode = value; } },
+    { label: '联系方式披露方式', value: _contactPgyContactChannel, options: ['微信', '手机号'], onChange: (value) => { _contactPgyContactChannel = value; } },
+    { label: '代理商', value: '由邀约账号自动带入', readOnly: true },
+    { label: '内容形式（仅导出）', value: _contactPgyCooperationType, placeholder: '图文 / 视频', onChange: (value) => { _contactPgyCooperationType = value; } },
+    { label: '报备品牌', value: _contactPgyBrandName, placeholder: '必须与蒲公英品牌下拉完全一致', onChange: (value) => { _contactPgyBrandName = value; } },
+    { label: '产品名称', value: _contactPgyProductName, placeholder: '最多 20 个字符', maxLength: 20, onChange: (value) => { _contactPgyProductName = value; } },
+    { label: '联系方式账号/号码', value: _contactPgyContactWay, placeholder: '填写微信号或手机号', onChange: (value) => { _contactPgyContactWay = value; } },
+    { label: '开始日期', value: _contactPgyPublishStart, type: 'date', onChange: (value) => { _contactPgyPublishStart = value; } },
+    { label: '结束日期', value: _contactPgyPublishEnd, type: 'date', onChange: (value) => { _contactPgyPublishEnd = value; } }
+  ];
+  pgyFieldDefinitions.forEach((definition) => {
+    const field = createComposerField({
+      ...definition,
+      onChange: (value) => {
+        if (definition.onChange) definition.onChange(value);
+        invalidatePgyInviteDrafts();
+      }
+    });
+    pgyGrid.appendChild(field.wrap);
   });
-  const pgyIntroWrap = document.createElement('label');
-  pgyIntroWrap.className = 'field-label compact wide';
-  pgyIntroWrap.textContent = '合作内容介绍';
-  const pgyIntroInput = document.createElement('textarea');
-  pgyIntroInput.className = 'tpl-input';
-  pgyIntroInput.placeholder = '填写产品介绍、使用场景、亮点优势，以及笔记风格和呈现要求。';
-  pgyIntroInput.value = _contactPgyIntro;
-  pgyIntroInput.addEventListener('input', () => {
-    _contactPgyIntro = pgyIntroInput.value;
-    invalidatePgyInviteDrafts();
-    scheduleContactReviewSave();
+  pgyPanel.appendChild(pgyGrid);
+  const pgyManager = createOutreachTemplateManager('蒲公英邀约', [
+    {
+      key: 'body',
+      label: '本次合作内容介绍',
+      placeholder: '填写产品介绍、使用场景、亮点优势，以及笔记风格和呈现要求',
+      multiline: true,
+      wide: true,
+      getValue: () => _contactPgyIntro,
+      setValue: (value) => { _contactPgyIntro = value; }
+    }
+  ]);
+  templateManagers.push(pgyManager);
+  pgyPanel.appendChild(pgyManager.root);
+  panelByMethod.set('蒲公英邀约', pgyPanel);
+
+  const showComposerMethod = (method, { updateDefault = false } = {}) => {
+    _contactComposerMethod = method;
+    buttonByMethod.forEach((button, key) => {
+      const active = key === method;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    panelByMethod.forEach((panel, key) => { panel.hidden = key !== method; });
+    if (updateDefault) {
+      _contactChannelStrategy = method;
+      scheduleContactReviewSave();
+    }
+  };
+
+  ['微信建联', '邮件建联', '蒲公英邀约'].forEach((method) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'contact-composer-tab';
+    button.setAttribute('role', 'tab');
+    button.textContent = method;
+    button.disabled = isPgyInviteBatchActive() && method !== '蒲公英邀约';
+    if (button.disabled) button.title = '请先完成或停止当前蒲公英批量邀约';
+    button.addEventListener('click', () => {
+      const needsInitialTemplate = (method === '邮件建联' && !_contactEmailSubject && !_contactEmailBody)
+        || (method === '蒲公英邀约' && !_contactPgyIntro)
+        || (method === '微信建联' && !_contactGreeting);
+      if (needsInitialTemplate) applySelectedOutreachTemplate(method);
+      _outreachTemplateStatus = '';
+      showComposerMethod(method, { updateDefault: true });
+      templateManagers.forEach((manager) => {
+        manager.syncInputsFromState();
+        manager.renderChoices();
+      });
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    });
+    buttonByMethod.set(method, button);
+    composerTabs.appendChild(button);
   });
-  pgyIntroWrap.appendChild(pgyIntroInput);
-  pgyGrid.appendChild(pgyIntroWrap);
-  pgyGrid.appendChild(emailWrap);
-  pgyGrid.appendChild(emailBodyWrap);
+
+  panelByMethod.forEach((panel) => composerPanels.appendChild(panel));
+  const composerLabel = document.createElement('div');
+  composerLabel.className = 'contact-composer-label';
+  composerLabel.textContent = '默认建联方式';
+  const safetyNote = document.createElement('div');
+  safetyNote.className = 'contact-composer-safety';
+  safetyNote.textContent = '仅生成或填写草稿，发送前必须人工确认';
+  const composerHead = document.createElement('div');
+  composerHead.className = 'contact-composer-head';
+  const composerMethodWrap = document.createElement('div');
+  composerMethodWrap.appendChild(composerLabel);
+  composerMethodWrap.appendChild(composerTabs);
+  composerHead.appendChild(composerMethodWrap);
+  composerHead.appendChild(safetyNote);
+  contactComposer.appendChild(composerHead);
+  contactComposer.appendChild(composerPanels);
+  showComposerMethod(_contactComposerMethod);
 
   const filteredContactRows = getContactFilteredRows();
   const contactReviewViewportKey = getContactReviewViewportKey();
   const savedContactReviewViewport = _contactReviewViewportStates.get(contactReviewViewportKey);
-  const selectedContactRows = filteredContactRows.filter((row) => ensureReviewRow(row)?.selected === true);
+  const selectedContactRows = filteredContactRows.filter((row) => {
+    const review = ensureReviewRow(row);
+    return review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
+  });
   const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
   const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
 
@@ -1565,7 +2099,7 @@ export function renderExports(state) {
     if (!result?.ok) return setMsg(`打开小红书失败：${result?.error || 'unknown error'}`);
     _xhsContactState = { ..._xhsContactState, session: 'waiting_login', message: '请在右侧人工登录' };
     setMsg('请在右侧完成小红书登录，完成后点击“检测登录”。');
-  }, { disabled: _xhsContactState.running });
+  }, { disabled: _xhsContactState.running || isPgyInviteBatchActive() });
 
   const btnCheckXhsLogin = makeSoftButton('检测登录', async () => {
     const result = await window.desktopAPI.contacts.checkXhsLogin();
@@ -1576,12 +2110,11 @@ export function renderExports(state) {
     }
     _xhsContactState = { ..._xhsContactState, session: result.loggedIn ? 'ready' : 'login_required', message: '' };
     setMsg(result.loggedIn ? '小红书页面已可用。' : '尚未完成小红书登录。');
-  }, { disabled: _xhsContactState.running && !_xhsContactState.paused });
+  }, { disabled: (_xhsContactState.running && !_xhsContactState.paused) || isPgyInviteBatchActive() });
 
   const btnStartXhsContact = makeSoftButton('补采已选达人联系方式', async () => {
-    const targets = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
-    await startXhsContactRows(targets, '已选达人');
-  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running || _xhsContactState.session === 'risk' });
+    await startXhsContactRows(selectedContactRows, `${_contactComposerMethod}已选达人`);
+  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running || _xhsContactState.session === 'risk' || isPgyInviteBatchActive() });
   btnStartXhsContact.title = selectedContactRows.length
     ? '只补采当前明确勾选的达人，并保留串行低频和风险暂停'
     : '请先在下方达人名称前勾选“要建联”';
@@ -1606,7 +2139,7 @@ export function renderExports(state) {
     const result = await window.desktopAPI.browser.returnToCollectionResults();
     if (!result?.ok) return setMsg(`返回筛选结果失败：${result?.error || 'unknown error'}`);
     setMsg(result.warning || '已返回最近的蒲公英筛选结果页。');
-  }, { disabled: _xhsContactState.running });
+  }, { disabled: _xhsContactState.running || isPgyInviteBatchActive() });
 
   xhsContactBar.appendChild(xhsContactStatus);
   xhsContactActions.appendChild(btnReturnCollection);
@@ -1621,7 +2154,7 @@ export function renderExports(state) {
   const contactSettings = createAdvancedSection({
     title: '填写建联话术',
     open: true,
-    children: [contactGrid, pgyGrid]
+    children: [contactComposer]
   });
   contactSettings.classList.add('contact-settings-section');
   contactSec.appendChild(contactSettings);
@@ -1655,7 +2188,7 @@ export function renderExports(state) {
     } catch (e) {
       setMsg(`提交确认异常：${e?.message || String(e)}`);
     }
-  }, { disabled: !allReviewSummary.wechat });
+  }, { disabled: !selectedContactRows.length });
 
   const btnApproveXmf = makeSoftButton('人工确认本批次', async () => {
     const approver = window.prompt('请输入确认人姓名：', _xiaomifengApproval?.approvedBy || '');
@@ -1686,7 +2219,7 @@ export function renderExports(state) {
   approvalBar.appendChild(btnSubmitXmfApproval);
   approvalBar.appendChild(btnApproveXmf);
   approvalBar.appendChild(btnExportXmf);
-  contactSec.appendChild(approvalBar);
+  if (_contactComposerMethod === '微信建联') contactSec.appendChild(approvalBar);
 
   const reviewTop = document.createElement('div');
   reviewTop.className = 'export-review-toolbar';
@@ -1694,13 +2227,14 @@ export function renderExports(state) {
   const reviewStat = document.createElement('div');
   reviewStat.className = 'export-review-summary';
   reviewStat.textContent = _contactPreviewRows.length
-    ? `当前筛选 ${filteredReviewSummary.total} 人，已勾选 ${filteredReviewSummary.selected} 人。只会处理你明确勾选的达人。`
+    ? `当前筛选 ${filteredReviewSummary.total} 人，${_contactComposerMethod}已勾选 ${selectedContactRows.length} 人。只会处理当前渠道明确勾选的达人。`
     : '还没有复核名单。点击“刷新名单”后可以逐个决定是否建联。';
 
   const btnPreview = document.createElement('button');
   btnPreview.className = 'btn ghost';
   btnPreview.style.height = '34px';
   btnPreview.textContent = '刷新名单';
+  btnPreview.disabled = isPgyInviteBatchActive();
   btnPreview.addEventListener('click', async () => {
     await refreshContactPreview();
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1726,7 +2260,7 @@ export function renderExports(state) {
   btnImportReview.className = 'btn ghost';
   btnImportReview.style.height = '34px';
   btnImportReview.textContent = '导入修改后的表';
-  btnImportReview.disabled = !_contactPreviewRows.length;
+  btnImportReview.disabled = !_contactPreviewRows.length || isPgyInviteBatchActive();
   btnImportReview.addEventListener('click', async () => {
     try {
       setContactSaveStatus('导入复核表中...');
@@ -1741,7 +2275,7 @@ export function renderExports(state) {
   btnUnselectAllContact.className = 'btn ghost';
   btnUnselectAllContact.style.height = '34px';
   btnUnselectAllContact.textContent = '清空整批勾选';
-  btnUnselectAllContact.disabled = !_contactPreviewRows.length;
+  btnUnselectAllContact.disabled = !_contactPreviewRows.length || isPgyInviteBatchActive();
   btnUnselectAllContact.addEventListener('click', () => {
     _contactPreviewRows.forEach((row) => {
       const review = ensureReviewRow(row);
@@ -1762,7 +2296,7 @@ export function renderExports(state) {
   btnTencentEmail.disabled = !selectedContactRows.length || _emailHandoffState.status === 'preparing' || _xhsContactState.running;
   btnTencentEmail.title = '只整理当前已有邮箱并打开腾讯企业邮箱；不会启动补采、自动填写或发送';
   btnTencentEmail.addEventListener('click', async () => {
-    const selectedRows = getContactFilteredRows().filter((row) => ensureReviewRow(row)?.selected === true);
+    const selectedRows = selectedContactRows;
     if (!selectedRows.length) return setMsg('请先在达人名称前勾选“要建联”。');
     _emailHandoffState = { status: 'preparing', emails: [], missingNames: [], message: '正在整理已勾选达人的公开邮箱。' };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -1791,7 +2325,7 @@ export function renderExports(state) {
       setMsg('已打开腾讯企业邮箱。系统不会自动点击“写信”、填写收件人或发送邮件。');
     }
   });
-  reviewTop.appendChild(btnTencentEmail);
+  if (_contactComposerMethod === '邮件建联') reviewTop.appendChild(btnTencentEmail);
   const btnOpenPgyInvite = document.createElement('button');
   btnOpenPgyInvite.className = 'btn primary';
   btnOpenPgyInvite.style.height = '34px';
@@ -1804,7 +2338,7 @@ export function renderExports(state) {
       : { status: 'error', message: `邀约账号打开失败：${result?.error || 'unknown error'}` };
     setMsg(_pgyInviteAccountState.message);
   });
-  reviewTop.appendChild(btnOpenPgyInvite);
+  if (_contactComposerMethod === '蒲公英邀约') reviewTop.appendChild(btnOpenPgyInvite);
   const btnCheckPgyInvite = document.createElement('button');
   btnCheckPgyInvite.className = 'btn ghost';
   btnCheckPgyInvite.style.height = '34px';
@@ -1819,12 +2353,12 @@ export function renderExports(state) {
           : { status: result?.ok ? 'waiting' : 'error', message: result?.error || '邀约账号尚未登录，请在右侧完成登录。' });
     setMsg(_pgyInviteAccountState.message);
   });
-  reviewTop.appendChild(btnCheckPgyInvite);
+  if (_contactComposerMethod === '蒲公英邀约') reviewTop.appendChild(btnCheckPgyInvite);
   const pgyInviteAccountStatus = document.createElement('span');
   pgyInviteAccountStatus.className = 'muted-line';
   pgyInviteAccountStatus.setAttribute('role', 'status');
   pgyInviteAccountStatus.textContent = _pgyInviteAccountState.message;
-  reviewTop.appendChild(pgyInviteAccountStatus);
+  if (_contactComposerMethod === '蒲公英邀约') reviewTop.appendChild(pgyInviteAccountStatus);
   const btnOpenLastContact = document.createElement('button');
   btnOpenLastContact.className = 'btn ghost';
   btnOpenLastContact.style.height = '34px';
@@ -1843,7 +2377,72 @@ export function renderExports(state) {
   }
   contactSec.appendChild(reviewTop);
 
-  if (_emailHandoffState.status !== 'idle') {
+  if (_contactComposerMethod === '蒲公英邀约') {
+    const batchPanel = document.createElement('div');
+    batchPanel.className = `pgy-invite-batch-panel ${_pgyInviteBatchState.status}`.trim();
+    batchPanel.setAttribute('role', 'status');
+    batchPanel.setAttribute('aria-live', 'polite');
+
+    const batchCopy = document.createElement('div');
+    batchCopy.className = 'pgy-invite-batch-copy';
+    const batchTitle = document.createElement('b');
+    const total = _pgyInviteBatchState.rowIds.length;
+    const completed = _pgyInviteBatchState.results.length;
+    const currentRow = getPgyInviteBatchCurrentRow();
+    batchTitle.textContent = isPgyInviteBatchActive()
+      ? `蒲公英批量邀约 ${Math.min(_pgyInviteBatchState.currentIndex + 1, total)}/${total}`
+      : (_pgyInviteBatchState.status === 'completed' ? '蒲公英批量邀约已完成' : '蒲公英批量邀约');
+    const batchDescription = document.createElement('span');
+    batchDescription.textContent = _pgyInviteBatchState.message
+      || `已勾选 ${selectedContactRows.length} 位达人。系统逐人准备，每一位发送前都需要人工确认。`;
+    const batchMetrics = document.createElement('small');
+    batchMetrics.textContent = total
+      ? `已处理 ${completed}/${total}${currentRow ? ` · 当前：${currentRow.creatorName || '未命名达人'}` : ''}`
+      : '不会自动批量发送；登录、验证或页面异常会立即暂停。';
+    batchCopy.appendChild(batchTitle);
+    batchCopy.appendChild(batchDescription);
+    batchCopy.appendChild(batchMetrics);
+    batchPanel.appendChild(batchCopy);
+
+    const batchActions = document.createElement('div');
+    batchActions.className = 'pgy-invite-batch-actions';
+    const startBatchButton = makeSoftButton(
+      `蒲公英批量邀约（${selectedContactRows.length}）`,
+      async () => startPgyInviteBatch(selectedContactRows),
+      { primary: true, disabled: !selectedContactRows.length || isPgyInviteBatchActive() || _xhsContactState.running }
+    );
+    startBatchButton.title = '逐位自动打开并准备邀约；每位真正发送前仍需人工确认';
+    batchActions.appendChild(startBatchButton);
+
+    if (_pgyInviteBatchState.status === 'awaiting_confirmation') {
+      batchActions.appendChild(makeSoftButton('人工确认发送当前达人', sendCurrentPgyInviteBatchItem, { primary: true }));
+      batchActions.appendChild(makeSoftButton('已在右侧处理，下一位', async () => {
+        await advancePgyInviteBatch('manual', '由操作人在右侧人工处理');
+      }));
+    }
+    if (_pgyInviteBatchState.status === 'checking_result') {
+      batchActions.appendChild(makeSoftButton('已核对右侧，继续下一位', async () => {
+        await advancePgyInviteBatch('manual', '平台结果由操作人核对');
+      }, { primary: true }));
+    }
+    if (_pgyInviteBatchState.status === 'error') {
+      batchActions.appendChild(makeSoftButton('重试当前达人', prepareCurrentPgyInviteBatchItem, { primary: true }));
+      batchActions.appendChild(makeSoftButton('跳过当前达人', async () => {
+        await advancePgyInviteBatch('skipped', _pgyInviteBatchState.message);
+      }));
+    }
+    if (isPgyInviteBatchActive()) {
+      batchActions.appendChild(makeSoftButton(
+        _pgyInviteBatchState.status === 'stopping' ? '正在安全停止' : '停止批量邀约',
+        stopPgyInviteBatch,
+        { disabled: _pgyInviteBatchState.status === 'stopping' }
+      ));
+    }
+    batchPanel.appendChild(batchActions);
+    contactSec.appendChild(batchPanel);
+  }
+
+  if (_contactComposerMethod === '邮件建联' && _emailHandoffState.status !== 'idle') {
     const emailHandoff = document.createElement('div');
     emailHandoff.className = `email-handoff ${_emailHandoffState.status}`;
     emailHandoff.setAttribute('role', 'status');
@@ -2004,6 +2603,7 @@ export function renderExports(state) {
       scheduleContactReviewSave();
       setMsg(`已选中本批次全部 ${_contactPreviewRows.length} 位达人。`);
     });
+    selectAllButton.disabled = isPgyInviteBatchActive();
     selectAllButton.title = '选中本批次全部已采集达人，不受当前筛选条件影响';
     selectionActions.appendChild(selectAllButton);
 
@@ -2016,6 +2616,7 @@ export function renderExports(state) {
       scheduleContactReviewSave();
       setMsg('已清空本批次全部达人勾选；采集数据和已填写内容保持不变。');
     });
+    resetSelectionButton.disabled = isPgyInviteBatchActive();
     resetSelectionButton.title = '清空本批次全部达人勾选，不删除采集数据或已填写内容';
     selectionActions.appendChild(resetSelectionButton);
 
@@ -2218,11 +2819,12 @@ export function renderExports(state) {
       selectedWrap.className = 'contact-review-check';
       const selectedInput = document.createElement('input');
       selectedInput.type = 'checkbox';
-      selectedInput.checked = review?.selected === true;
+      selectedInput.checked = review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
+      selectedInput.disabled = isPgyInviteBatchActive();
       selectedInput.addEventListener('change', () => {
         if (!review) return;
         _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
-        if (selectedInput.checked) markReviewSelected(review);
+        if (selectedInput.checked) markReviewSelected(review, _contactComposerMethod);
         else clearReviewSelected(review);
         _xiaomifengApprovalCheck = null;
         resetEmailHandoff();
@@ -2257,56 +2859,58 @@ export function renderExports(state) {
           if (!result?.ok) setMsg(`打开蒲公英主页失败：${result?.error || 'unknown error'}`);
         });
         creatorBlock.appendChild(pgyLink);
-        const pgyInviteLink = document.createElement('a');
-        pgyInviteLink.className = 'contact-pgy-link';
-        pgyInviteLink.href = normalizeContactUrl(row.creatorUrl);
-        pgyInviteLink.textContent = '邀约账号打开';
-        pgyInviteLink.title = '在独立邀约账号标签打开该达人；不会填写或发送';
-        pgyInviteLink.addEventListener('click', async (event) => {
-          event.preventDefault();
-          _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
-          setPgyInviteDraftState(rowId, null);
-          const result = await window.desktopAPI.invites.openCreator({
-            runDir: _selectedRunDir,
-            rowId
-          });
-          if (!result?.ok) setMsg(`邀约账号打开达人失败：${result?.error || 'unknown error'}`);
-          else setMsg(`已在邀约账号打开 ${row.creatorName || '该达人'}。当前仅打开页面，不会填写或发送邀约。`);
-        });
-        creatorBlock.appendChild(pgyInviteLink);
-
-        const inviteDraftState = getPgyInviteDraftState(rowId);
-        const prepareInviteButton = document.createElement('button');
-        prepareInviteButton.type = 'button';
-        prepareInviteButton.className = 'contact-pgy-link contact-pgy-action';
-        prepareInviteButton.textContent = inviteDraftState?.status === 'preparing' ? '正在准备...' : '准备邀约';
-        prepareInviteButton.title = '打开该达人，进入详细邀约表单，填写固定模板并逐项回读；不会发送';
-        prepareInviteButton.disabled = inviteDraftState?.status === 'preparing' || inviteDraftState?.status === 'sending';
-        prepareInviteButton.addEventListener('click', async () => {
-          _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
-          await preparePgyInviteForRow(row, rowId);
-        });
-        creatorBlock.appendChild(prepareInviteButton);
-
-        if (inviteDraftState?.status === 'ready') {
-          const sendInviteButton = document.createElement('button');
-          sendInviteButton.type = 'button';
-          sendInviteButton.className = 'contact-pgy-link contact-pgy-action send';
-          sendInviteButton.textContent = '确认发送';
-          sendInviteButton.title = '先展示达人和实际选项；确认后只点击一次平台的“发起邀约”';
-          sendInviteButton.addEventListener('click', async () => {
+        if (_contactComposerMethod === '蒲公英邀约') {
+          const pgyInviteLink = document.createElement('a');
+          pgyInviteLink.className = 'contact-pgy-link';
+          pgyInviteLink.href = normalizeContactUrl(row.creatorUrl);
+          pgyInviteLink.textContent = '邀约账号打开';
+          pgyInviteLink.title = '在独立邀约账号标签打开该达人；不会填写或发送';
+          pgyInviteLink.addEventListener('click', async (event) => {
+            event.preventDefault();
             _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
-            await sendPreparedPgyInviteForRow(row, rowId);
+            setPgyInviteDraftState(rowId, null);
+            const result = await window.desktopAPI.invites.openCreator({
+              runDir: _selectedRunDir,
+              rowId
+            });
+            if (!result?.ok) setMsg(`邀约账号打开达人失败：${result?.error || 'unknown error'}`);
+            else setMsg(`已在邀约账号打开 ${row.creatorName || '该达人'}。当前仅打开页面，不会填写或发送邀约。`);
           });
-          creatorBlock.appendChild(sendInviteButton);
-        }
+          creatorBlock.appendChild(pgyInviteLink);
 
-        if (inviteDraftState?.message) {
-          const inviteStatus = document.createElement('div');
-          inviteStatus.className = `pgy-invite-row-status ${inviteDraftState.status || ''}`.trim();
-          inviteStatus.setAttribute('role', 'status');
-          inviteStatus.textContent = inviteDraftState.message;
-          creatorBlock.appendChild(inviteStatus);
+          const inviteDraftState = getPgyInviteDraftState(rowId);
+          const prepareInviteButton = document.createElement('button');
+          prepareInviteButton.type = 'button';
+          prepareInviteButton.className = 'contact-pgy-link contact-pgy-action';
+          prepareInviteButton.textContent = inviteDraftState?.status === 'preparing' ? '正在准备...' : '准备邀约';
+          prepareInviteButton.title = '打开该达人，进入详细邀约表单，填写固定模板并逐项回读；不会发送';
+          prepareInviteButton.disabled = inviteDraftState?.status === 'preparing' || inviteDraftState?.status === 'sending' || isPgyInviteBatchActive();
+          prepareInviteButton.addEventListener('click', async () => {
+            _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+            await preparePgyInviteForRow(row, rowId);
+          });
+          creatorBlock.appendChild(prepareInviteButton);
+
+          if (inviteDraftState?.status === 'ready' && !isPgyInviteBatchActive()) {
+            const sendInviteButton = document.createElement('button');
+            sendInviteButton.type = 'button';
+            sendInviteButton.className = 'contact-pgy-link contact-pgy-action send';
+            sendInviteButton.textContent = '确认发送';
+            sendInviteButton.title = '先展示达人和实际选项；确认后只点击一次平台的“发起邀约”';
+            sendInviteButton.addEventListener('click', async () => {
+              _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
+              await sendPreparedPgyInviteForRow(row, rowId);
+            });
+            creatorBlock.appendChild(sendInviteButton);
+          }
+
+          if (inviteDraftState?.message) {
+            const inviteStatus = document.createElement('div');
+            inviteStatus.className = `pgy-invite-row-status ${inviteDraftState.status || ''}`.trim();
+            inviteStatus.setAttribute('role', 'status');
+            inviteStatus.textContent = inviteDraftState.message;
+            creatorBlock.appendChild(inviteStatus);
+          }
         }
       }
 

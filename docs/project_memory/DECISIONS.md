@@ -1,5 +1,7 @@
 # Decisions
 
+Last reviewed: 2026-09-04. No new product decision was required; the stable operating consequences of existing decisions were promoted to `AGENTS.md`.
+
 ## 2026-09-02: Preserve Successful Batch Position And Reuse The Mail Workspace
 
 - Decision: after a complete ranked candidate read, keep the manual PGY BrowserView on the last confirmed page; restore the start page only for incomplete, canceled, or safety-stopped work. Keep Tencent Mail in one non-closable `persist:mail_default` BrowserView and reuse its current allowlisted URL for later batches, loading the home page only when the workspace is new or outside the approved mail domains.
@@ -646,3 +648,17 @@ Update on 2026-08-12: exact navigation-context equality was too strict after a v
 - Why: PGY retained the prior page's light-background token after page two became active, while the saved nickname selector now included location and tags after the nickname. The first defect misreported page two as page one and prevented restoration; the second rejected all valid ID-bearing rows.
 - Impact: page transitions and restoration use the actual selected control, current creator information blocks can authorize sanitized response rows, and unbounded prefix collisions still fail. Successful candidate capture also clears stale response failures; only known list routes may report schema mismatch.
 - Reevaluate when: PGY changes its selected-page tokens, nickname ceases to lead the calibrated information block, virtualizes partial rows, or provides an official ordered export. Complete ordered identity and fail-closed collision handling remain required.
+
+## 2026-09-07: Separate Outreach Composers And Keep Personal Templates Local
+
+- Decision: Show only the fields belonging to the selected WeChat, email, or PGY invitation method. Store each operator's reusable template library in local renderer storage, while keeping the selected method, project name, and generated batch drafts in the run review record. Template edits affect only the current draft until explicitly saved; deletion requires confirmation and cannot remove the last template.
+- Why: One mixed form made channel selection meaningless and encouraged accidental edits across unrelated workflows. Personal phrasing and contact details differ by operator, so fixed global templates are the wrong ownership model.
+- Impact: WeChat and email resolve `{{项目名称}}` from one brand-project field, PGY retains its structured platform fields, and all three channels support add, edit/rename, duplicate, set-default, and delete without changing existing human send confirmation gates.
+- Reevaluate when: templates must follow a user across computers or be centrally governed. At that point add an explicit personal/team scope and Feishu-backed synchronization; do not silently turn personal templates into shared mutable data.
+
+## 2026-09-07: Scope Actions By Channel And Batch PGY Preparation Only
+
+- Decision: Bind each visible selection to the active outreach channel and render only that channel's execution controls. Implement PGY batch work as a frozen serial queue that automates creator opening and verified form preparation, but requires a fresh human confirmation before every final send.
+- Why: A mixed action bar makes it unclear whether selected creators will go to WeChat, email, or PGY. Repeating navigation and form preparation is mechanical work, while the final invitation is an external business action that must remain recipient-specific and reviewable.
+- Impact: WeChat exposes only XiaoMiFeng actions, email exposes only mail handoff/copy actions, and PGY exposes account checks plus the batch queue. The start path cannot send; ambiguous outcomes stop progression, handled rows leave the next batch, content edits invalidate the queue, and a five-second interval separates confirmed items.
+- Reevaluate when: PGY offers an official invitation API with recipient-level idempotency and auditable approval callbacks. Per-recipient human approval remains required unless the user explicitly changes that product boundary and the platform permits it.

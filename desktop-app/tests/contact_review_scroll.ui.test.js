@@ -75,7 +75,7 @@ export function seedScrollFixture() {
       import {store} from '/renderer/state/store.js';
       import {enhanceWorkspace} from '/renderer/native-workflow.js';
       import {renderExports,seedScrollFixture} from '/renderer/views/exports.js';
-      seedScrollFixture(); store.state={...store.state,view:'exports',exports:{selectedRunDir:'fixture-run',_loadedOnce:true}};
+      seedScrollFixture(); store.state={...store.state,appInfo:{productVariant:'feishu-project'},view:'exports',exports:{selectedRunDir:'fixture-run',_loadedOnce:true}};
       const views={exports:renderExports}; let lastRenderedView='exports';
       ${renderContent}
       store.subscribe(renderContent); renderContent(store.state);

@@ -2,7 +2,7 @@
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
 const {EventEmitter}=require('node:events'),crypto=require('node:crypto');
 const root=path.resolve(process.argv[2]||'formal111-input/app');
-const main=fs.readFileSync(path.join(root,'main.js'),'utf8');
+const main=fs.readFileSync(path.join(root,'main.js'),'utf8').replace(/\r\n/g,'\n');
 const supervisorSource=fs.readFileSync(path.join(root,'lib/qa_backend_supervisor.js'),'utf8');
 const results=[],observations={};
 function section(a,b){const i=main.indexOf(a),j=main.indexOf(b,i+a.length);assert(i>=0&&j>i,a);return main.slice(i,j);}
@@ -18,7 +18,7 @@ function harness(packaged=true,forkFactory=null){
  app.quit=()=>{h.quits++;const e={prevented:false,preventDefault(){this.prevented=true;}};app.emit('before-quit',e);h.quitPrevented=e.prevented;};
  const win=new EventEmitter();win.webContents={send:(_,payload)=>h.events.push(payload)};
  const c=vm.createContext({require:()=>({fork:spawn}),spawn,process:{env:{},pid:50000,resourcesPath:'C:/synthetic/resources',platform:'win32'},app,
-  path,crypto,fs:{existsSync:()=>h.exists!==false},__dirname:'C:/synthetic/app',qaRuntime:{active:false},backendProc:null,backendInstanceToken:'',backendGeneration:0,backendStopping:false,
+  path,crypto,fs:{existsSync:()=>h.exists!==false},__dirname:'C:/synthetic/app',qaRuntime:{active:false},isolatedRuntime:{active:false},bitableRuntime:{active:false},backendProc:null,backendInstanceToken:'',backendGeneration:0,backendStopping:false,
   DEFAULT_API_HOST:'127.0.0.1',DEFAULT_API_PORT:'8010',packagedBackendExecutable:()=> 'owned-fixture-backend.exe',console:{log(){},warn(){},error(){}},mainWindow:win,
   setTimeout:(fn,ms)=>{const t={fn,ms,active:true};h.timers.push(t);return t;},clearTimeout:t=>{if(t)t.active=false;},
   ipcMain:{handle:(name,fn)=>h.handlers[name]=fn},dialog:{showErrorBox:(title,message)=>h.dialogs.push({title,message})}});
@@ -29,7 +29,7 @@ function harness(packaged=true,forkFactory=null){
  h.c=c;h.app=app;h.win=win;h.info=()=>h.handlers['backend:info']();
  h.exit=(p,code=0)=>{p.exitCode=code;p.emit('exit',code);};
  h.timeout=()=>{const ts=h.timers.filter(t=>t.active&&t.ms===8000);assert(ts.length);for(const t of ts){t.active=false;t.fn();}};
- h.bindQuit=()=>{vm.runInContext(section("app.on('browser-window-created'", "app.on('before-quit', () => feishuWorkbench.clear())"),c);app.emit('browser-window-created',{},win);};
+ h.bindQuit=()=>{vm.runInContext(section("app.on('browser-window-created'", "app.on('before-quit', () => feishuWorkbench"),c);app.emit('browser-window-created',{},win);};
  return h;
 }
 function supervisor(){

@@ -3695,7 +3695,7 @@ export function renderExports(state) {
     });
   }
   root.appendChild(contactSec);
-  root.appendChild(renderFeishuWorkbench({
+  if (state.appInfo?.productVariant === 'feishu-project') root.appendChild(renderFeishuWorkbench({
     runDir: _selectedRunDir,
     rows: _contactPreviewRows.map(row => ({ ...row, ...ensureReviewRow(row) })),
     save: saveContactReviewNow,

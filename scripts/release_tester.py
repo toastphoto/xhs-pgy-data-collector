@@ -28,6 +28,22 @@ MANUAL = {
 }
 
 
+def manual_gates(variant="feishu-project"):
+    if variant not in {"feishu-project", "feishu-bitable"}:
+        raise ValueError("Unknown product variant")
+    gates = dict(MANUAL)
+    if variant == "feishu-bitable":
+        gates.pop("live-feishu")
+        gates["live-bitable"] = ("多维表格真实往返", [
+            "link-auth-schema-and-team-access", "selected-batch-create-read-update-backfill",
+            "identity-maintainer-conflicts-quotes", "restart-stop-unknown-outcome-reconcile",
+            "two-client-concurrency", "marked-test-write-read-cleanup"])
+        gates["edition-isolation"] = ("原版与多维表格版并存", [
+            "independent-install-profile-session-backend", "no-feishu-project-requests",
+            "original-data-and-shortcuts-unchanged"])
+    return gates
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -90,6 +106,9 @@ def package_commands(pkg):
 def plan(pkg, node, python):
     checks = [{"id": key, "scope": "source", "argv": [node, *argv], "cwd": str(ROOT / "desktop-app"), "timeout": 240}
               for key, argv in package_commands(pkg)]
+    if pkg.get("productVariant") == "feishu-bitable":
+        checks.append({"id": "bitable-foundation", "scope": "source", "argv": [node, "--test", "tests/bitable_foundation.test.js"],
+                       "cwd": str(ROOT / "desktop-app"), "timeout": 120})
     for key, args in [
         ("tester-self-test", ["-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_release_tester.py"]),
         ("project-memory", ["scripts/verify_project_memory.py"]),
@@ -162,7 +181,7 @@ def summarize(report):
     checks = report.get("checks", [])
     automatic = "passed" if checks and all(c["status"] == "passed" for c in checks) else "failed" if any(c["status"] == "failed" for c in checks) else "blocked"
     manual = report.get("manual", {})
-    delivered = automatic == "passed" and set(manual) == set(MANUAL) and all(m["status"] == "passed" for m in manual.values())
+    delivered = automatic == "passed" and set(manual) == set(manual_gates(report.get("productVariant", "feishu-project"))) and all(m["status"] == "passed" for m in manual.values())
     return {"automatic": automatic, "delivery": "passed" if delivered else "blocked",
             "counts": {s: sum(c["status"] == s for c in checks) for s in ["passed", "failed", "blocked", "pending", "running"]}}
 
@@ -175,7 +194,8 @@ def persist(report, file):
     rows = "".join(f'<tr><td>{esc(c["id"])}</td><td>{esc(c["scope"])}</td><td class="{c["status"]}">{label[c["status"]]}</td>'
                    f'<td>{esc(c.get("detail", ""))}</td><td><a href="{esc(Path(c["log"]).relative_to(file.parent).as_posix())}">日志</a></td></tr>'
                    if c.get("log") else f'<tr><td>{esc(c["id"])}</td><td>{esc(c["scope"])}</td><td>{label[c["status"]]}</td><td colspan="2">{esc(c.get("detail", ""))}</td></tr>' for c in report["checks"])
-    manual_rows = "".join(f'<tr><td>{esc(MANUAL[k][0])}</td><td>{label[v["status"]]}</td><td>{esc(v.get("detail", "需要人工真实验收"))}</td></tr>' for k, v in report["manual"].items())
+    gates = manual_gates(report.get("productVariant", "feishu-project"))
+    manual_rows = "".join(f'<tr><td>{esc(gates[k][0])}</td><td>{label[v["status"]]}</td><td>{esc(v.get("detail", "需要人工真实验收"))}</td></tr>' for k, v in report["manual"].items())
     source_ver = report.get("sourceVersion", "unknown")
     package_ver = report.get("artifact", {}).get("version", "未核实")
     body = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -204,11 +224,13 @@ def run(args):
     if installer and not installer.is_file():
         raise ValueError(f"Installer does not exist: {installer}")
     checks = plan(pkg, node, sys.executable)
+    variant = pkg.get("productVariant", "feishu-project")
     report = {"schemaVersion": SCHEMA, "startedAt": now(), "root": str(ROOT), "sourceVersion": pkg["version"],
+              "productVariant": variant,
               "sourceFiles": source_snapshot(), "planHash": digest_json(checks), "node": node, "python": sys.executable,
               "installer": str(installer) if installer else None, "installerSha256": sha(installer) if installer else None,
               "checks": [{**c, "status": "pending"} for c in checks],
-              "manual": {k: {"status": "pending"} for k in MANUAL}}
+              "manual": {k: {"status": "pending"} for k in manual_gates(variant)}}
     persist(report, report_file)
     print(f"Report: {report_file}", flush=True)
     env = clean_env()
@@ -256,6 +278,8 @@ def run(args):
                 report["artifact"] = read_json(output / "artifact/identity.json")
                 if report["artifact"]["installerSha256"] != report["installerSha256"]:
                     raise ValueError("Installer changed while tests were running")
+                if report["artifact"].get("productVariant", "feishu-project") != variant:
+                    raise ValueError("Installer belongs to another product variant")
             except (OSError, ValueError) as error:
                 report.pop("artifact", None)
                 check.update(status="failed", detail=str(error))
@@ -274,8 +298,9 @@ def run(args):
     if source_snapshot() != report["sourceFiles"]:
         report["checks"].append({"id": "source-stability", "scope": "identity", "status": "failed", "detail": "Source changed during the run; rerun on a stable tree"})
     report["finishedAt"] = now()
-    for key, (_, cases) in MANUAL.items():
+    for key, (_, cases) in manual_gates(variant).items():
         save_json(output / f"manual-{key}.json", {"gate": key, "installerSha256": report["installerSha256"],
+                  "productVariant": variant,
                   "operator": "", "observedAt": "", "summary": "", "checks": {case: "pending" for case in cases}})
     persist(report, report_file)
     print(json.dumps(report["summary"], ensure_ascii=False), flush=True)
@@ -283,14 +308,17 @@ def run(args):
     return exit_code(report)
 
 
-def validate_manual(record, gate, installer_hash):
-    if gate not in MANUAL or record.get("gate") != gate or not installer_hash or record.get("installerSha256") != installer_hash:
+def validate_manual(record, gate, installer_hash, variant="feishu-project"):
+    gates = manual_gates(variant)
+    if record.get("productVariant", "feishu-project") != variant:
+        raise ValueError("Manual evidence belongs to another product variant")
+    if gate not in gates or record.get("gate") != gate or not installer_hash or record.get("installerSha256") != installer_hash:
         raise ValueError("Manual evidence belongs to another installer or gate")
     for key in ["operator", "observedAt", "summary"]:
         if not isinstance(record.get(key), str) or not record[key].strip():
             raise ValueError(f"Manual evidence missing {key}")
     datetime.fromisoformat(record["observedAt"].replace("Z", "+00:00"))
-    required = set(MANUAL[gate][1])
+    required = set(gates[gate][1])
     if set(record.get("checks", {})) != required or any(record["checks"][case] != "passed" for case in required):
         raise ValueError("Every required case needs an observed passing result; pending/failed cases cannot release")
 
@@ -300,7 +328,11 @@ def verify_integrity(report, root=ROOT):
         raise ValueError("Unsupported report schema")
     if source_snapshot(root) != report.get("sourceFiles"):
         raise ValueError("Source or test code changed. Run acceptance again; do not reuse the report.")
-    expected = plan(read_json(root / "desktop-app/package.json"), report["node"], report["python"])
+    pkg = read_json(root / "desktop-app/package.json")
+    variant = pkg.get("productVariant", "feishu-project")
+    if report.get("productVariant", "feishu-project") != variant:
+        raise ValueError("Report belongs to another product variant")
+    expected = plan(pkg, report["node"], report["python"])
     if report.get("planHash") != digest_json(expected) or [c["id"] for c in report["checks"]] != [c["id"] for c in expected]:
         raise ValueError("Required check plan is incomplete or changed")
     if not report.get("finishedAt"):
@@ -311,6 +343,8 @@ def verify_integrity(report, root=ROOT):
     artifact = report.get("artifact")
     if not artifact or artifact.get("installerSha256") != report["installerSha256"]:
         raise ValueError("Exact installer payload was not validated")
+    if artifact.get("productVariant", "feishu-project") != variant:
+        raise ValueError("Installer belongs to another product variant")
     payload = Path(artifact["payload"])
     expected_files = {item["path"]: item["sha256"] for item in artifact["inventory"]}
     actual_files = {f.relative_to(payload).as_posix(): sha(f) for f in payload.rglob("*") if f.is_file()}
@@ -321,14 +355,14 @@ def verify_integrity(report, root=ROOT):
             raise ValueError(f'Passing check lacks a successful process log: {check["id"]}')
         if check.get("logSha256") and (not Path(check["log"]).is_file() or sha(check["log"]) != check["logSha256"]):
             raise ValueError(f'Check log missing/changed: {check["id"]}')
-    if set(report.get("manual", {})) != set(MANUAL):
+    if set(report.get("manual", {})) != set(manual_gates(variant)):
         raise ValueError("Manual gates missing")
     for gate, record in report["manual"].items():
         if record["status"] == "passed":
             file = Path(record["evidence"])
             if not file.is_file() or sha(file) != record["evidenceSha256"]:
                 raise ValueError(f"Manual evidence changed: {gate}")
-            validate_manual(read_json(file), gate, report["installerSha256"])
+            validate_manual(read_json(file), gate, report["installerSha256"], variant)
 
 
 def exit_code(report):
@@ -366,7 +400,7 @@ def main(argv=None):
             evidence_file = Path(args.evidence).resolve()
             evidence = read_json(evidence_file)
             gate = evidence.get("gate")
-            validate_manual(evidence, gate, report["installerSha256"])
+            validate_manual(evidence, gate, report["installerSha256"], report.get("productVariant", "feishu-project"))
             report["manual"][gate] = {"status": "passed", "evidence": str(evidence_file), "evidenceSha256": sha(evidence_file), "detail": evidence["summary"]}
             persist(report, file)
         if args.command == "deliver":
@@ -382,7 +416,8 @@ def main(argv=None):
                 raise ValueError("Installer changed while copying. Handoff directory is NOT approved.")
             save_json(target / "ACCEPTED.json", {"version": report["artifact"]["version"], "installerSha256": report["installerSha256"],
                       "acceptedAt": now(), "reportSha256": sha(file), "automaticChecks": len(report["checks"]),
-                      "manualGates": list(MANUAL), "scope": "Recorded acceptance, not a guarantee of zero bugs"})
+                      "productVariant": report.get("productVariant", "feishu-project"),
+                      "manualGates": list(report["manual"]), "scope": "Recorded acceptance, not a guarantee of zero bugs"})
             print(f"Approved handoff: {target}")
         print(json.dumps(summarize(report), ensure_ascii=False))
         return exit_code(report)

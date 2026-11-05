@@ -1,6 +1,8 @@
 {
-  "name": "content-analyzer-desktop",
-  "version": "0.1.112",
+  "name": "pgy-workbench-bitable",
+  "version": "0.2.0-bitable.1",
+  "productVariant": "feishu-bitable",
+  "desktopAppId": "com.solo.contentanalyzer.bitable",
   "private": true,
   "description": "达人账号内容分析工具（桌面内嵌浏览器版）",
   "main": "main.js",
@@ -12,6 +14,7 @@
     "start": "node ./scripts/run-electron.js",
     "test": "node --test tests/task_recovery.test.js && node tests/normalize.test.js && node tests/providers.test.js && node tests/path_guard.test.js && node tests/quality_report.test.js && node tests/backend_runtime.test.js && node tests/recording_privacy.test.js && node tests/process_stdio.test.js && node tests/pgy_risk.test.js && node tests/task_runner_safety.test.js && node tests/task_browser_isolation.test.js && node tests/workspace_continuity.test.js && node tests/workspace_layout.test.mjs && node tests/pgy_invite_account_isolation.test.js && node tests/pgy_invite_ipc.test.js && node tests/pgy_invite_batch.test.js && node tests/candidate_list_navigation.test.js && node tests/pagination_autocalibration.test.js && node tests/calibration_status_ui.test.js && node tests/pgy_candidate_command.test.js && node tests/pgy_candidate_response_cache.test.js && node tests/pgy_candidate_checkpoint.test.js && node tests/candidate_merge.test.mjs && node tests/calibration_selector.test.mjs && node tests/review_view_state.test.mjs && node tests/outreach_templates.test.mjs && node tests/outreach_composer_ui.test.js && node tests/browser_tab_registry.test.js && node tests/signing_task.test.js && node tests/signing_task_store.test.js && node tests/xhs_contact_enrichment.test.js && node tests/tencent_email_compose.test.js && node tests/candidate_sheet.test.js && node tests/pgy_excel.test.js && node tests/contact_sheet.test.js && node tests/contact_review_store.test.js && node tests/contact_review_excel.test.js && node tests/execution_approval.test.js && node tests/approval_store.test.js && node tests/feishu_contracts.test.js && node tests/import_runs.test.js && node tests/kb.test.js && node tests/sqlite.test.js",
     "test:invite-dom": "node tests/pgy_invite_dom.test.js",
+    "test:bitable": "node --test tests/bitable_foundation.test.js",
     "test:release": "python ../scripts/release_tester.py run",
     "release:verify": "python ../scripts/release_tester.py verify",
     "release:deliver": "python ../scripts/release_tester.py deliver",
@@ -35,8 +38,8 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.solo.contentanalyzer",
-    "productName": "小红书相关信息采集工具",
+    "appId": "com.solo.contentanalyzer.bitable",
+    "productName": "蒲公英工作台-多维表格版",
     "directories": {
       "output": "dist"
     },
@@ -97,7 +100,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
-      "shortcutName": "小红书相关信息采集工具"
+      "shortcutName": "蒲公英工作台-多维表格版"
     },
     "portable": {
       "artifactName": "${productName}-${version}-windows-${arch}-portable.${ext}"

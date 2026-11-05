@@ -6,6 +6,8 @@ Xiaohongshu Pugongying Data Collector is a conservative desktop data collection 
 
 ## Main Paths
 
+- Bitable edition worktree: `C:\Users\feibo\Documents\Codex\2026-06-25\s\projects\xhs-pgy-data-collector-bitable`, branch `codex/feishu-bitable` (recheck Git before work). Base checkpoint `1ee6711` was verified on GitHub; the original checkout remains on its own branch. Follow [Bitable plan](docs/project_memory/BITABLE_BRANCH_PLAN_2026-11-05.md) and [foundation scope](docs/project_memory/BITABLE_FOUNDATION_2026-11-05.md). This is development, not an installed release. Never initialize old Project connections or reuse old Project credentials here; pasted Base links identify a destination, not permission to write.
+
 - Current Windows checkout: `C:\Users\feibo\Documents\Codex\2026-06-25\s\projects\xhs-pgy-data-collector`
 - Mac checkout: `/Users/jingjing/Documents/Codex/2026-06-03/new-chat/product/xhs-pgy-data-collector` (needs recheck before Mac work)
 - Main product line: `desktop-app/`

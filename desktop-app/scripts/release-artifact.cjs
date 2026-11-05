@@ -40,7 +40,13 @@ function main() {
   }
   const asarPath = path.join(payload, 'resources', 'app.asar');
   const pkg = JSON.parse(asar.extractFile(asarPath, 'package.json').toString());
-  assert.equal(pkg.name, 'content-analyzer-desktop', 'Not this product');
+  const productVariant = pkg.productVariant || 'feishu-project';
+  assert.ok(['feishu-project', 'feishu-bitable'].includes(productVariant), 'Unknown product variant');
+  assert.equal(pkg.name, productVariant === 'feishu-bitable' ? 'pgy-workbench-bitable' : 'content-analyzer-desktop', 'Not this product');
+  if (productVariant === 'feishu-bitable') {
+    assert.equal(pkg.desktopAppId, 'com.solo.contentanalyzer.bitable', 'Bitable installer must not replace the original edition');
+    assert.ok(asar.extractFile(asarPath, path.normalize('lib/bitable_runtime.js')).length, 'Bitable runtime missing');
+  }
   assert.match(pkg.version, /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/);
   for (const name of ['main.js', 'preload.js', 'renderer/index.html', 'renderer/views/tasks.js', 'renderer/views/exports.js']) {
     assert.ok(asar.extractFile(asarPath, path.normalize(name)).length, `Missing packaged file ${name}`);
@@ -54,7 +60,7 @@ function main() {
   assert.ok(fs.existsSync(backend), 'Windows Python backend is missing');
   assert.ok(fs.existsSync(path.join(payload, 'resources', 'app.asar.unpacked', 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm')), 'Unpacked SQLite WASM is missing');
   const inventory = files(payload).sort((a, b) => a.path.localeCompare(b.path));
-  const identity = { installer, installerSha256: sha(installer), version: pkg.version,
+  const identity = { installer, installerSha256: sha(installer), version: pkg.version, productVariant,
     payload, executable, asarSha256: sha(asarPath), backendSha256: sha(backend), inventory };
   fs.writeFileSync(path.join(output, 'identity.json'), JSON.stringify(identity, null, 2));
   console.log(`Verified NSIS payload ${pkg.version}; ${inventory.length} files; installer sha256=${identity.installerSha256}`);

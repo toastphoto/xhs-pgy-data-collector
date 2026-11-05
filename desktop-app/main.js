@@ -106,7 +106,11 @@ const {
 const { calculateBrowserLayout } = require('./lib/browser_layout');
 
 const { configureQaRuntime, backendPortAvailable } = require('./lib/qa_runtime');
-const qaRuntime = configureQaRuntime(app, require('./package.json'));
+const { configureBitableRuntime } = require('./lib/bitable_runtime');
+const packageMetadata = require('./package.json');
+const bitableRuntime = configureBitableRuntime(app, packageMetadata);
+const qaRuntime = configureQaRuntime(app, packageMetadata);
+const isolatedRuntime = bitableRuntime.active ? bitableRuntime : qaRuntime;
 
 installProcessStdioGuards(process);
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -2783,8 +2787,8 @@ async function startBackendIfNeeded() {
   if (backendProc) return;
   const generation = ++backendGeneration;
   backendStopping = false;
-  if (qaRuntime.active && !(await backendPortAvailable())) {
-    mainWindow?.webContents.send('backend:status', { running: false, host: '127.0.0.1', port: qaRuntime.port, code: 'QA_PORT_BUSY' });
+  if (isolatedRuntime.active && !(await backendPortAvailable(isolatedRuntime.port))) {
+    mainWindow?.webContents.send('backend:status', { running: false, host: '127.0.0.1', port: isolatedRuntime.port, code: bitableRuntime.active ? 'BITABLE_PORT_BUSY' : 'QA_PORT_BUSY' });
     return;
   }
 
@@ -2966,7 +2970,8 @@ function stopBackend() {
 // =========================
 ipcMain.handle('app:info', async () => ({
   ok: true,
-  version: app.getVersion()
+  version: app.getVersion(),
+  productVariant: bitableRuntime.active ? 'feishu-bitable' : 'feishu-project'
 }));
 
 ipcMain.handle('app:focusRenderer', async (event) => {
@@ -8099,7 +8104,7 @@ function feishuJournalPath() {
   return path.join(dir, 'test-records.json');
 }
 
-const feishuWorkbench = createFeishuWorkbench({
+const feishuWorkbench = bitableRuntime.active ? null : createFeishuWorkbench({
   connectionStore: createFeishuConnectionStore({ file: path.join(app.getPath('userData'), 'feishu_sync', 'connection.bin'), safeStorage }),
   maintainerStore: createFeishuMaintainerStore({ file: path.join(app.getPath('userData'), 'feishu_sync', 'maintainer.bin'), safeStorage }),
   getRow: async (runDir, rowId) => {
@@ -8127,6 +8132,7 @@ for (const method of ['connect', 'status', 'clear', 'lookup', 'applyContact', 'l
     // Only the main renderer, never the PGY browser, a child frame or another window.
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
       || event.senderFrame !== mainWindow.webContents.mainFrame) return { ok: false, code: 'FEISHU_SENDER_REJECTED' };
+    if (!feishuWorkbench) return { ok: false, code: 'FEISHU_PROJECT_DISABLED', error: '多维表格版不连接飞书项目' };
     try {
       if (method === 'clear') { feishuWorkbench.clear(); return { ok: true }; }
       return await feishuWorkbench[method](payload);
@@ -8540,12 +8546,16 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
-    if (process.platform === 'win32') app.setAppUserModelId(qaRuntime.active ? qaRuntime.appId : 'com.solo.contentanalyzer');
+    if (process.platform === 'win32') app.setAppUserModelId(isolatedRuntime.active ? isolatedRuntime.appId : 'com.solo.contentanalyzer');
     ensureDefaultTemplateInUserData();
     createMainWindow();
     if (qaRuntime.active) {
       mainWindow.on('page-title-updated', event => event.preventDefault());
       mainWindow.setTitle('PGY Workbench QA · 并存测试版');
+    }
+    if (bitableRuntime.active) {
+      mainWindow.on('page-title-updated', event => event.preventDefault());
+      mainWindow.setTitle('蒲公英工作台 - 多维表格版');
     }
     startBackendIfNeeded();
 
@@ -8573,7 +8583,7 @@ app.on('before-quit', event => {
     else dialog.showErrorBox('服务尚未退出', '本次服务停止失败，清理句柄已保留。请再次退出重试；不要启动另一实例或手动结束未知进程。');
   });
 });
-app.on('before-quit', () => feishuWorkbench.clear());
+app.on('before-quit', () => feishuWorkbench?.clear());
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

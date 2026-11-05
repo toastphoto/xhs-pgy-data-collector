@@ -1,5 +1,13 @@
 # Decisions
 
+## 2026-11-05: Link-Based Bitable Setup After One-Time Authorization
+
+Teammates should create/use a standard Base template and paste its link (or enter Base/table IDs), not repeat Feishu Project plugin/User Key configuration. Link parsing and authorization are separate: resolve wiki nodes before using their Bitable target, select a table when absent, validate the actual fields and show missing permissions explicitly. Do not embed a shared secret in the installer or claim an anonymous link can write. Team ownership, app/OAuth deployment and permissions still require setup; no live credentials are available in this branch.
+
+User additionally requires an in-app permission-resolution wizard. Separate login consent, app API scopes, document/advanced permissions and schema errors; offer verified official authorization/application paths and recheck on return. Never claim an application was submitted without evidence, auto-approve access, enable public sharing or use a silent test write to determine readiness. Prefer a one-time authorized user flow for teammates already allowed to edit their table, subject to the real app deployment review. Wizard is planned, not yet implemented.
+
+The complete existing source is checkpointed and remote-verified before making an independent worktree. Bitable uses immutable package identity, separate profile/session/backend roots and port28010; main-process Project initialization is disabled and all legacy IPC refuses in this edition. The new API/planning modules are tested foundations, not a wired UI or delivered sync. Extend the release tester with Bitable-specific and coexistence gates; old Project acceptance cannot satisfy them. Reevaluate after authorization, schema, artifact or multi-client design changes.
+
 ## 2026-11-05: Separate Bitable Edition, Explicit Selected Sync
 
 User requests a separate Bitable branch, preserving the Project edition and unrelated product functionality. User confirmed selecting creators in the software before batch synchronization; neither collection nor later enrichment automatically writes cloud data. Preserve local results and independent invitation/export selection. New edition must not initialize/restore the old Project connection; do not reuse Project credentials or roles as Bitable credentials/person IDs. No silent old-cloud migration or profile copying. Detailed schema, independent package identity, authorization, concurrency and acceptance proposals remain in [the plan](BITABLE_BRANCH_PLAN_2026-11-05.md), not implemented facts. Reevaluate when sync scope, team concurrency, baseline or authorization is decided; no business code or branch was changed in this planning turn.

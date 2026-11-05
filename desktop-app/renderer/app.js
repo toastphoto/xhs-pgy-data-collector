@@ -552,7 +552,7 @@ function initSplitters() {
 async function bootstrap() {
   try {
     const info = await window.desktopAPI.app.info();
-    if (info?.ok) store.set({ appInfo: { version: info.version || '' } });
+    if (info?.ok) store.set({ appInfo: { version: info.version || '', productVariant: info.productVariant || '' } });
   } catch (_) {}
 
   const applyBackendStatus = (status) => {

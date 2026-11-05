@@ -28,6 +28,27 @@ class ReleaseTesterTests(unittest.TestCase):
             with self.subTest(script=script), self.assertRaises(ValueError):
                 rt.package_commands({"scripts": {"pretest": script, "test": "node test.js"}})
 
+    def test_bitable_checks_and_manual_gates_are_not_legacy_project_evidence(self):
+        pkg = {"productVariant": "feishu-bitable", "scripts": {"pretest": "node pre.js", "test": "node test.js"}}
+        self.assertIn("bitable-foundation", [c["id"] for c in rt.plan(pkg, "node", "python")])
+        gates = rt.manual_gates("feishu-bitable")
+        self.assertIn("live-bitable", gates)
+        self.assertIn("edition-isolation", gates)
+        self.assertNotIn("live-feishu", gates)
+        report = {"productVariant": "feishu-bitable", "checks": [{"status": "passed"}],
+                  "manual": {k: {"status": "passed"} for k in rt.MANUAL}}
+        self.assertEqual(rt.exit_code(report), 2)
+        record = {"gate": "live-bitable", "installerSha256": "b" * 64, "operator": "Fixture",
+                  "summary": "Validator test only", "observedAt": "2026-11-05T00:00:00Z",
+                  "checks": {case: "passed" for case in gates["live-bitable"][1]}}
+        with self.assertRaisesRegex(ValueError, "product variant"):
+            rt.validate_manual(record, "live-bitable", "b" * 64, "feishu-bitable")
+        record["productVariant"] = "feishu-bitable"
+        rt.validate_manual(record, "live-bitable", "b" * 64, "feishu-bitable")
+        record["checks"].pop("two-client-concurrency")
+        with self.assertRaises(ValueError):
+            rt.validate_manual(record, "live-bitable", "b" * 64, "feishu-bitable")
+
     def test_source_hash_sees_uncommitted_changes_but_not_runtime_data(self):
         script = self.root / "desktop-app/lib/item.js"
         script.parent.mkdir(parents=True)

@@ -1,12 +1,12 @@
 const fs=require('fs'),vm=require('vm'),path=require('path'),assert=require('assert/strict'),{EventEmitter}=require('events');
 const root=process.env.PGY_TEST_APP||path.resolve(__dirname, '..');
-const main=fs.readFileSync(root+'/main.js','utf8'),results=[];
+const main=fs.readFileSync(root+'/main.js','utf8').replace(/\r\n/g,'\n'),results=[];
 function section(a,b){let i=main.indexOf(a),j=main.indexOf(b,i+a.length);assert(i>=0&&j>i);return main.slice(i,j);}
 const flush=()=>new Promise(r=>setImmediate(r));
 function harness(packaged=true){
  const h={events:[],children:[],requests:[],handlers:{},pending:[]};
  const spawn=()=>{const p=new EventEmitter();p.pid=50000+h.children.length;p.exitCode=null;p.signalCode=null;p.connected=true;p.send=(m,cb)=>{h.messages??=[];h.messages.push(m);if(p.sendError)cb?.(Error('denied'));};p.stdout=new EventEmitter();p.stderr=new EventEmitter();p.kill=()=>{p.kills=(p.kills||0)+1;if(p.throwKill)throw Error('denied');return p.killResult!==false;};h.children.push(p);return p;};
- const c=vm.createContext({require:n=>({fork:spawn}),spawn,process:{env:{},pid:45000,resourcesPath:'C:/synthetic/resources'},app:{isPackaged:packaged,getPath:()=> 'C:/synthetic/profile'},path,crypto:require('crypto'),fs:{existsSync:()=>h.exists!==false},__dirname:'C:/synthetic/app',qaRuntime:{active:false},backendProc:null,backendInstanceToken:'',backendGeneration:0,backendStopping:false,DEFAULT_API_HOST:'127.0.0.1',DEFAULT_API_PORT:'8010',packagedBackendExecutable:()=> 'synthetic-backend.exe',console:{log(){},warn(){},error(){}},mainWindow:{webContents:{send:(_,p)=>h.events.push(p)}},setTimeout,clearTimeout,ipcMain:{handle:(n,f)=>h.handlers[n]=f}});
+ const c=vm.createContext({require:n=>({fork:spawn}),spawn,process:{env:{},pid:45000,resourcesPath:'C:/synthetic/resources'},app:{isPackaged:packaged,getPath:()=> 'C:/synthetic/profile'},path,crypto:require('crypto'),fs:{existsSync:()=>h.exists!==false},__dirname:'C:/synthetic/app',qaRuntime:{active:false},isolatedRuntime:{active:false},bitableRuntime:{active:false},backendProc:null,backendInstanceToken:'',backendGeneration:0,backendStopping:false,DEFAULT_API_HOST:'127.0.0.1',DEFAULT_API_PORT:'8010',packagedBackendExecutable:()=> 'synthetic-backend.exe',console:{log(){},warn(){},error(){}},mainWindow:{webContents:{send:(_,p)=>h.events.push(p)}},setTimeout,clearTimeout,ipcMain:{handle:(n,f)=>h.handlers[n]=f}});
  vm.runInContext(section('function ownsBackend(', 'function getActiveBrowserView('),c);
  vm.runInContext(section('async function startBackendIfNeeded()', '// =========================\n// IPC：浏览器控制'),c);
  c.waitForBackendReady=()=>new Promise(resolve=>h.pending.push(resolve));
@@ -15,6 +15,7 @@ function harness(packaged=true){
 }
 async function check(name,f){await f();results.push({name,ok:true});}
 (async()=>{
+ await check('Bitable occupied isolated port refuses launch without probing the original backend',async()=>{const h=harness();h.c.isolatedRuntime={active:true,port:'28010'};h.c.bitableRuntime={active:true};h.c.backendPortAvailable=async port=>{assert.equal(port,'28010');return false;};await h.c.startBackendIfNeeded();assert.equal(h.children.length,0);assert.equal(h.pending.length,0);assert.equal(h.events.at(-1).code,'BITABLE_PORT_BUSY');});
  await check('no owned process/token never probes foreign service',async()=>{const h=harness();assert.equal((await h.info()).running,false);assert.equal(h.pending.length,0);});
  await check('missing packaged backend never probes',async()=>{const h=harness();h.exists=false;await h.c.startBackendIfNeeded();assert.equal((await h.info()).running,false);assert.equal(h.children.length,0);});
  await check('late startup and info probes after exit cannot report running',async()=>{const h=harness();await h.c.startBackendIfNeeded();const inf=h.info();h.exit(h.children[0]);h.pending.forEach(r=>r({ok:true}));await flush();assert.equal((await inf).running,false);assert.equal(h.events.at(-1).running,false);});
@@ -25,7 +26,7 @@ async function check(name,f){await f();results.push({name,ok:true});}
  await check('failed quit retains operator window and allows a second quit',async()=>{
   const app=new EventEmitter(),win=new EventEmitter();let quits=0,errors=0,attempts=0;app.quit=()=>quits++;
   const c=vm.createContext({app,backendProc:{pid:1},mainWindow:win,dialog:{showErrorBox:()=>errors++},stopBackend:async()=>({ok:++attempts>1})});
-  vm.runInContext(section("app.on('browser-window-created'", "app.on('before-quit', () => feishuWorkbench.clear())"),c);
+  vm.runInContext(section("app.on('browser-window-created'", "app.on('before-quit', () => feishuWorkbench"),c);
   app.emit('browser-window-created',{},win);let prevented=0;win.emit('close',{preventDefault:()=>prevented++});assert.equal(prevented,1);
   app.emit('before-quit',{preventDefault:()=>prevented++});await flush();assert.equal(errors,1);
   app.emit('before-quit',{preventDefault:()=>prevented++});await flush();assert.equal(attempts,2);assert.equal(quits,2);

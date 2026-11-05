@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-11-05: Independent Worktree Verification
+
+First Bitable source run had5 failures, not a release. Two SQLite tests found JS through NODE_PATH but the existing loader still required its relative WASM path; use a complete existing same-platform dependency directory, not JS resolution alone. This worktree now has an ignored node_modules junction to the original same-machine dependency tree; do not run dependency installers through the shared junction. Backend fixture source slicing assumed LF and the old quit marker; normalize line endings and update its explicit runtime stubs. The legacy Project layout fixture must declare Project edition now that the renderer refuses implicit Project startup. Keep original failures; verify all cases in a new complete run, never relax product isolation or delete coverage to make fixtures pass.
+
 Weekly disposition2026-10-26: the resolved release-tester harness entry is fully absorbed in AGENTS and DECISIONS `2026-10-26: Verify The Tester And Its Side Effects`; original text/evidence/closure scope are in [archive](archive/2026-10-26.md). Recovery rules were promoted but the entry below remains: installed/live acceptance is not closed. All other unresolved entries are retained; no product tests or account operations ran during this review.
 
 - 2026-10-23: A restored paused queue has no running loop; a stop request alone cannot finish it. Test restore->stop without Resume and verify no navigation, preserved output, persisted unlock and next start. Finalization must remain retryable across task-state/cooldown write failures and restarts. Recovery is a top-level action, not a hidden history search. Native screenshot review caught inherited grid layout despite passing click tests; use the actual shipped CSS and verify text/button geometry. See [receipt](TASK_RECOVERY_2026-10-23.md).

@@ -29,6 +29,8 @@ python -B scripts/release_tester.py run --installer "C:\build\setup.exe"
 
 ## 真实验收
 
+多维表格版按`productVariant=feishu-bitable`单独验收：新增`bitable-foundation`源码检查，以`live-bitable`替代旧`live-feishu`真实门槛，另加`edition-isolation`并存门槛（共六项）。人工记录和精确包必须匹配同一产品版本类型；不能用旧项目版往返证据替代。多维表格真实项包括授权/链接/团队可编辑、勾选批量往返、归属/冲突/报价、停止重启/未知结果、两客户端并发及标记测试清理；并存项包括独立profile/后端/安装身份、零旧项目请求及原版数据/快捷方式不变。下面五项为原项目版清单。
+
 报告生成五份 `manual-*.json` 待填记录。由实际验收者完成对应场景，保留脱敏说明；不要填写密钥、Cookie、联系人或真实达人链接：
 
 1. 安装升级：精确安装包启动、保留账号/连接/名单/模板、重启和后端服务。

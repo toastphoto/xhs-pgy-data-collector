@@ -1,4 +1,4 @@
-const { app, BrowserWindow, BrowserView, ipcMain, shell, clipboard, dialog } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, shell, clipboard, dialog, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -33,6 +33,9 @@ const { loadContactReview, saveContactReview } = require('./lib/contact_review_s
 const { loadApproval, saveApproval } = require('./lib/approval_store');
 const { approveRequest, buildXiaomifengApprovalPayload, checkApproval, createApprovalRequest, executionFingerprint } = require('./lib/execution_approval');
 const { buildFeishuSyncEnvelope } = require('./lib/feishu_contracts');
+const { createFeishuWorkbench, safeError: feishuSafeError } = require('./lib/feishu_workbench');
+const { createFeishuConnectionStore } = require('./lib/feishu_connection_store');
+const { createFeishuMaintainerStore } = require('./lib/feishu_maintainer_store');
 const {
   buildXhsRiskDetectionSnippet,
   classifyXhsProfilePageRead,
@@ -100,6 +103,10 @@ const {
   XHS_TAB_ID,
   PGY_INVITE_TAB_ID
 } = require('./lib/browser_tab_registry');
+const { calculateBrowserLayout } = require('./lib/browser_layout');
+
+const { configureQaRuntime, backendPortAvailable } = require('./lib/qa_runtime');
+const qaRuntime = configureQaRuntime(app, require('./package.json'));
 
 installProcessStdioGuards(process);
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -111,7 +118,10 @@ let taskBrowserView = null;
 let mailBrowserView = null;
 let xhsBrowserView = null;
 let pgyInviteBrowserView = null;
+let pgyInviteDocumentProof = null;
 let pgyInvitePreparedDraft = null;
+let pgyInviteOperation = null;
+let pgyInvitePageGeneration = 0;
 let applyBrowserBounds = () => {};
 let collectionInteractionLockState = '';
 let taskInteractionLockState = '';
@@ -147,6 +157,8 @@ let recordingEnabled = false;
 let recordingReplayRunning = false;
 let currentRecording = [];
 let xhsContactJob = {
+  runDir: '',
+  jobId: '',
   running: false,
   paused: false,
   pauseRequested: false,
@@ -159,12 +171,6 @@ let xhsContactJob = {
   resumeGateResolve: null,
   controlWaiters: new Set()
 };
-const UI_WIDTH_RATIO = 0.72;   // 默认优先保证左侧建联工作台的可读宽度
-const UI_MIN_WIDTH = 620;
-const UI_MAX_WIDTH = 1040;
-const BROWSER_MIN_WIDTH = 320; // 右侧仍保留登录、跳转和人工操作所需的最小宽度
-const SPLITTER_WIDTH = 10;     // renderer 分割条宽度（px）
-const TOPBAR_HEIGHT = 88;      // 顶部浏览器标签栏 + 工具栏高度（与 renderer 里保持一致）
 const DEFAULT_API_HOST = '127.0.0.1';
 const DEFAULT_API_PORT = '8010';
 const PGY_MIN_TAB_WAIT_MS = 2500;
@@ -184,6 +190,22 @@ const XHS_LOGIN_URL = 'https://www.xiaohongshu.com/explore';
 const PGY_CANDIDATE_RESULTS_URL = 'https://pgy.xiaohongshu.com/solar/pre-trade/note/kol';
 const DESKTOP_BACKEND_PROTOCOL_VERSION = '1';
 let backendInstanceToken = '';
+let backendGeneration = 0;
+let backendStopping = false;
+function ownsBackend(proc, generation, token) {
+  return backendProc === proc && backendGeneration === generation && !!token
+    && backendInstanceToken === token && !backendStopping
+    && proc?.pid > 0 && proc.exitCode === null && proc.signalCode === null;
+}
+function publishBackendProbe(proc, generation, token, env) {
+  waitForBackendReady({ host: env.API_HOST, port: env.API_PORT, expectedToken: token })
+    .then(ready => {
+      if (!ownsBackend(proc, generation, token)) return;
+      mainWindow?.webContents.send('backend:status', { running: !!ready?.ok, host: env.API_HOST, port: env.API_PORT, readyPath: ready?.path || '', code: ready?.ok ? '' : ready?.code || 'BACKEND_NOT_READY' });
+    }).catch(err => {
+      if (ownsBackend(proc, generation, token)) mainWindow?.webContents.send('backend:status', { running: false, code: err?.code || 'BACKEND_PROBE_ERROR' });
+    });
+}
 
 function getActiveBrowserView() {
   return browserTabViews.get(browserTabRegistry.activeId) || browserView;
@@ -200,6 +222,7 @@ function isPgyCandidateResultsUrl(value) {
 }
 
 function currentBrowserAutomationLock() {
+  if (pgyInviteOperation) return '蒲公英邀约操作运行中';
   if (pgyCandidateReadRunning) return '正在读取蒲公英候选，请等待本次读取结束';
   if (pgyCandidateCheckpointSession) return '候选读取正处于安全暂停，请继续或结束本次读取';
   if (taskRunner?.state?.running) return '蒲公英采集任务运行中';
@@ -211,6 +234,7 @@ function currentBrowserAutomationLock() {
 }
 
 function browserTabNavigationLockReason(tabId) {
+  if (pgyInviteOperation) return '蒲公英邀约操作运行中，暂时不能导航或刷新';
   const safeId = String(tabId || '');
   if (safeId === COLLECTION_TAB_ID) {
     if (pgyCandidateReadRunning) return '正在读取蒲公英候选，请等待本次读取结束';
@@ -230,6 +254,7 @@ function browserTabNavigationLockReason(tabId) {
 }
 
 function canSwitchBrowserTabDuringAutomation(tabId) {
+  if (pgyInviteOperation) return false;
   const safeId = String(tabId || '');
   if (taskRunner?.state?.running) {
     return safeId === COLLECTION_TAB_ID || safeId === AUTOMATION_TAB_ID;
@@ -252,7 +277,7 @@ function rejectBrowserAutomationStart(actionLabel, { allowTaskRunner = false } =
 }
 
 async function syncCollectionInteractionLock({ force = false } = {}) {
-  if (!browserView || browserView.webContents.isDestroyed()) return;
+  if (!liveBrowserContents(browserView)) return;
   const shouldBlock = Boolean(
     pgyCandidateReadRunning
     || pgyCandidateCheckpointSession
@@ -294,7 +319,7 @@ async function syncCollectionInteractionLock({ force = false } = {}) {
 }
 
 async function syncTaskInteractionLock({ force = false } = {}) {
-  if (!taskBrowserView || taskBrowserView.webContents.isDestroyed()) return;
+  if (!liveBrowserContents(taskBrowserView)) return;
   const shouldBlock = Boolean(taskRunner?.state?.running && !taskRunner?.state?.paused);
   const reason = browserTabNavigationLockReason(AUTOMATION_TAB_ID);
   const nextState = shouldBlock ? reason : '';
@@ -329,7 +354,7 @@ async function syncTaskInteractionLock({ force = false } = {}) {
 }
 
 function sendBrowserTabsSnapshot() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow || mainWindow.isDestroyed() || !liveBrowserContents(mainWindow)) return;
   const tabs = browserTabRegistry.list().map((tab) => {
     const view = browserTabViews.get(tab.id);
     const webContents = view?.webContents;
@@ -368,7 +393,7 @@ function sendBrowserTabsSnapshot() {
 }
 
 function sendActiveBrowserUrl() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow || mainWindow.isDestroyed() || !liveBrowserContents(mainWindow)) return;
   const activeId = browserTabRegistry.activeId;
   const view = getActiveBrowserView();
   let url = '';
@@ -379,14 +404,54 @@ function sendActiveBrowserUrl() {
   sendBrowserTabsSnapshot();
 }
 
+function liveBrowserContents(view) {
+  try {
+    const contents = view?.webContents;
+    return contents && !contents.isDestroyed() ? contents : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function retireBrowserTabView(view, tabId, contents = null, { publish = true, deferPresentation = false } = {}) {
+  // A late event from an old view must never remove its replacement.
+  if (!view || browserTabViews.get(tabId) !== view) return;
+  if (pgyInviteOperation?.webContents === contents && contents) {
+    pgyInviteOperation.invalidated = true;
+    pgyInviteOperation.invalidationReason = 'view-destroyed';
+  }
+  browserTabViews.delete(tabId);
+  browserTabRegistry.discard(tabId);
+  if (browserView === view) browserView = null;
+  if (taskBrowserView === view) taskBrowserView = null;
+  if (mailBrowserView === view) mailBrowserView = null;
+  if (xhsBrowserView === view) xhsBrowserView = null;
+  if (pgyInviteBrowserView === view) {
+    pgyInviteBrowserView = null;
+    pgyInvitePreparedDraft = null;
+    pgyInviteDocumentProof = null;
+    pgyInvitePageGeneration += 1;
+  }
+  const present = () => {
+    try { mainWindow?.removeBrowserView?.(view); } catch (_) {}
+    if (publish && mainWindow && !mainWindow.isDestroyed()) {
+      applyBrowserBounds();
+      sendActiveBrowserUrl();
+    }
+  };
+  // Electron is still tearing down native views inside the destroyed event.
+  if (deferPresentation) setImmediate(present);
+  else present();
+}
+
 function configureBrowserTabView(view, tabId) {
   const webContents = view.webContents;
   webContents.setWindowOpenHandler((details) => {
     try {
       const url = String(details?.url || '');
       if (tabId === PGY_INVITE_TAB_ID) {
-        if (isAllowedPgyInviteNavigationUrl(url)) {
-          webContents.loadURL(url);
+        if (isAllowedPgyInviteNavigationUrl(url) && permitsPgyInviteNavigation(webContents, url)) {
+          webContents.loadURL(url).catch(() => {});
           if (browserTabRegistry.activeId === tabId) sendActiveBrowserUrl();
         }
         return { action: 'deny' };
@@ -406,7 +471,8 @@ function configureBrowserTabView(view, tabId) {
   });
 
   webContents.on('will-navigate', (event, url) => {
-    if (tabId === PGY_INVITE_TAB_ID && !isAllowedPgyInviteNavigationUrl(url)) {
+    if (tabId === PGY_INVITE_TAB_ID && ((pgyInviteOperation?.navigationPermit?.settling && !permitsPgyInviteAccountFallback(webContents, url))
+      || !isAllowedPgyInviteNavigationUrl(url) || !permitsPgyInviteNavigation(webContents, url))) {
       event.preventDefault();
       return;
     }
@@ -417,8 +483,35 @@ function configureBrowserTabView(view, tabId) {
     detailView.webContents.loadURL(url);
   });
   webContents.on('will-redirect', (event, url) => {
-    if (tabId === PGY_INVITE_TAB_ID && !isAllowedPgyInviteNavigationUrl(url)) event.preventDefault();
+    if (tabId === PGY_INVITE_TAB_ID && (!isAllowedPgyInviteNavigationUrl(url) || !permitsPgyInviteNavigation(webContents, url))) event.preventDefault();
   });
+
+  if (tabId === PGY_INVITE_TAB_ID) {
+    webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame) => {
+      if (event.isMainFrame ?? isMainFrame) notePgyInviteNavigation(webContents, event.url ?? url, {
+        inPage: event.isSameDocument ?? isInPlace, event: 'start'
+      });
+    });
+    webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+      if (isMainFrame) notePgyInviteNavigation(webContents, url, { inPage: true, event: 'in-page' });
+    });
+    webContents.on('did-navigate', (_event, url) => {
+      notePgyInviteNavigation(webContents, url, { event: 'commit' });
+    });
+  }
+
+  // Electron 30.5.1 removes WebContentsView.webContents before destroyed.
+  // Detach at its earlier teardown event while BrowserView.ownerWindow is usable.
+  webContents.on('will-destroy', () => {
+    retireBrowserTabView(view, tabId, webContents, { publish: false });
+    setImmediate(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        applyBrowserBounds();
+        sendActiveBrowserUrl();
+      }
+    });
+  });
+  webContents.on('destroyed', () => retireBrowserTabView(view, tabId, webContents, { deferPresentation: true }));
 
   const onNavigation = (_event, url) => {
     if (tabId === COLLECTION_TAB_ID && isPgyCandidateResultsUrl(url)) {
@@ -440,6 +533,9 @@ function configureBrowserTabView(view, tabId) {
 
 function activateBrowserTab(tabId, { force = false } = {}) {
   const safeId = String(tabId || '');
+  if (pgyInviteOperation && safeId !== PGY_INVITE_TAB_ID) {
+    return { ok: false, code: 'BROWSER_TAB_LOCKED', error: '蒲公英邀约操作运行中，暂时不能切换标签' };
+  }
   if (!browserTabRegistry.has(safeId)) {
     return { ok: false, code: 'BROWSER_TAB_NOT_FOUND', error: '浏览器标签不存在' };
   }
@@ -453,7 +549,10 @@ function activateBrowserTab(tabId, { force = false } = {}) {
     return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换标签` };
   }
   const view = browserTabViews.get(safeId);
-  if (!view) return { ok: false, code: 'BROWSER_TAB_NOT_READY', error: '浏览器标签尚未就绪' };
+  if (!liveBrowserContents(view)) {
+    retireBrowserTabView(view, safeId);
+    return { ok: false, code: 'BROWSER_TAB_NOT_READY', error: '该网页已关闭，请重新打开；账号登录数据仍保留' };
+  }
   browserTabRegistry.activate(safeId);
   applyBrowserBounds();
   sendActiveBrowserUrl();
@@ -465,7 +564,8 @@ function ensureCollectionTabActive(options = {}) {
 }
 
 function ensureTaskBrowserTab() {
-  if (taskBrowserView && !taskBrowserView.webContents.isDestroyed()) return taskBrowserView;
+  if (liveBrowserContents(taskBrowserView)) return taskBrowserView;
+  retireBrowserTabView(taskBrowserView, AUTOMATION_TAB_ID, null, { publish: false });
   taskBrowserView = new BrowserView({
     webPreferences: {
       // Share authentication with the manual search workspace, but isolate
@@ -483,13 +583,16 @@ function ensureTaskBrowserTab() {
   });
   browserTabViews.set(AUTOMATION_TAB_ID, taskBrowserView);
   configureBrowserTabView(taskBrowserView, AUTOMATION_TAB_ID);
-  taskBrowserView.webContents.loadURL('about:blank');
+  taskBrowserView.webContents.loadURL('about:blank').catch((error) => {
+    if (error?.code !== 'ERR_ABORTED' && error?.errno !== -3) console.error('Task tab initialization failed', error);
+  });
   sendBrowserTabsSnapshot();
   return taskBrowserView;
 }
 
 function ensureMailBrowserTab() {
-  if (mailBrowserView && !mailBrowserView.webContents.isDestroyed()) return mailBrowserView;
+  if (liveBrowserContents(mailBrowserView)) return mailBrowserView;
+  retireBrowserTabView(mailBrowserView, MAIL_TAB_ID, null, { publish: false });
   mailBrowserView = new BrowserView({
     webPreferences: {
       partition: 'persist:mail_default',
@@ -507,13 +610,16 @@ function ensureMailBrowserTab() {
   });
   browserTabViews.set(MAIL_TAB_ID, mailBrowserView);
   configureBrowserTabView(mailBrowserView, MAIL_TAB_ID);
-  mailBrowserView.webContents.loadURL('about:blank');
+  mailBrowserView.webContents.loadURL('about:blank').catch((error) => {
+    if (error?.code !== 'ERR_ABORTED' && error?.errno !== -3) console.error('Mail tab initialization failed', error);
+  });
   sendBrowserTabsSnapshot();
   return mailBrowserView;
 }
 
 function ensureXhsBrowserTab() {
-  if (xhsBrowserView && !xhsBrowserView.webContents.isDestroyed()) return xhsBrowserView;
+  if (liveBrowserContents(xhsBrowserView)) return xhsBrowserView;
+  retireBrowserTabView(xhsBrowserView, XHS_TAB_ID, null, { publish: false });
   xhsBrowserView = new BrowserView({
     webPreferences: {
       // Share the existing PGY/XHS session while keeping page history and scroll
@@ -531,13 +637,16 @@ function ensureXhsBrowserTab() {
   });
   browserTabViews.set(XHS_TAB_ID, xhsBrowserView);
   configureBrowserTabView(xhsBrowserView, XHS_TAB_ID);
-  xhsBrowserView.webContents.loadURL('about:blank');
+  xhsBrowserView.webContents.loadURL('about:blank').catch((error) => {
+    if (error?.code !== 'ERR_ABORTED' && error?.errno !== -3) console.error('XHS tab initialization failed', error);
+  });
   sendBrowserTabsSnapshot();
   return xhsBrowserView;
 }
 
 function ensurePgyInviteBrowserTab() {
-  if (pgyInviteBrowserView && !pgyInviteBrowserView.webContents.isDestroyed()) return pgyInviteBrowserView;
+  if (liveBrowserContents(pgyInviteBrowserView)) return pgyInviteBrowserView;
+  retireBrowserTabView(pgyInviteBrowserView, PGY_INVITE_TAB_ID, null, { publish: false });
   pgyInviteBrowserView = new BrowserView({
     webPreferences: {
       // The invitation operator uses a different PGY account. Never share this
@@ -547,6 +656,7 @@ function ensurePgyInviteBrowserTab() {
       nodeIntegration: false
     }
   });
+  pgyInvitePageGeneration += 1;
   browserTabRegistry.add({
     id: PGY_INVITE_TAB_ID,
     role: 'pgy-invite',
@@ -555,7 +665,6 @@ function ensurePgyInviteBrowserTab() {
   });
   browserTabViews.set(PGY_INVITE_TAB_ID, pgyInviteBrowserView);
   configureBrowserTabView(pgyInviteBrowserView, PGY_INVITE_TAB_ID);
-  pgyInviteBrowserView.webContents.loadURL('about:blank');
   sendBrowserTabsSnapshot();
   return pgyInviteBrowserView;
 }
@@ -574,18 +683,10 @@ function closeBrowserTab(tabId) {
     return { ok: false, code: 'BROWSER_TAB_NOT_FOUND', error: '浏览器标签不存在' };
   }
   try {
+    const contents = liveBrowserContents(view);
     browserTabRegistry.close(safeId);
-    browserTabViews.delete(safeId);
-    try {
-      mainWindow?.removeBrowserView?.(view);
-    } catch (_) {}
-    if (!view.webContents.isDestroyed()) view.webContents.destroy();
-    if (safeId === MAIL_TAB_ID) mailBrowserView = null;
-    if (safeId === XHS_TAB_ID) xhsBrowserView = null;
-    if (safeId === PGY_INVITE_TAB_ID) {
-      pgyInviteBrowserView = null;
-      pgyInvitePreparedDraft = null;
-    }
+    retireBrowserTabView(view, safeId, contents, { publish: false });
+    if (contents && !contents.isDestroyed()) contents.destroy();
     activateBrowserTab(browserTabRegistry.activeId, { force: true });
     return { ok: true, activeTabId: browserTabRegistry.activeId };
   } catch (err) {
@@ -1779,12 +1880,14 @@ function sameCandidatePageAnchors(left, right) {
 async function readPgyCandidatesFromResponsePages({
   startRank = 1,
   endRank = 1,
+  rankOrigin = 'search_start',
   resumeSession = null,
   initialItems = [],
   commandWindow = null,
   calibration = {}
 } = {}) {
   const requestedCount = endRank - startRank + 1;
+  rankOrigin = resumeSession?.rankOrigin || rankOrigin;
   const activeCommandWindow = resumeSession?.commandWindow || commandWindow;
   let firstPage = pgyCandidateResponseCache.latest(MAX_CANDIDATE_COUNT, {
     commandWindow: activeCommandWindow
@@ -1803,6 +1906,7 @@ async function readPgyCandidatesFromResponsePages({
   const waitForNewResponse = async (previous = {}, expectedPage = null) => {
     const waitUntil = Date.now() + 15000;
     while (Date.now() < waitUntil) {
+      if (!await navigationSafetyPassed()) return null;
       const latest = await resolveCandidateSnapshotForVisiblePage({
         commandWindow: activeCommandWindow,
         expectedPage,
@@ -1857,6 +1961,7 @@ async function readPgyCandidatesFromResponsePages({
   let startPage = 1;
   let currentPage = 1;
   let pagesRead = 0;
+  let pageNavigationAttempted = false;
   let stoppedForRisk = false;
   let waitedCheckpoints = [];
   let currentPageEvidence = null;
@@ -1864,8 +1969,17 @@ async function readPgyCandidatesFromResponsePages({
   let currentPageRefreshMethod = '';
   let currentPageRefreshFailureCode = '';
 
+  const navigationSafetyPassed = async () => {
+    try {
+      const risk = await pgyDetectRiskOnCurrentPage(browserView.webContents);
+      if (risk?.ok && !risk.riskDetected) return true;
+    } catch (_) {}
+    stoppedForRisk = true;
+    return false;
+  };
   const restoreStartPage = async () => {
-    if (currentPage === startPage || stoppedForRisk) return;
+    if ((currentPage === startPage && !pageNavigationAttempted) || stoppedForRisk) return;
+    if (!await navigationSafetyPassed()) return;
     try {
       const restore = await browserView.webContents.executeJavaScript(
         buildSearchPaginationScript('goto', startPage, calibration),
@@ -1876,6 +1990,10 @@ async function readPgyCandidatesFromResponsePages({
   };
   const failIncomplete = async (code, error) => {
     await restoreStartPage();
+    if (stoppedForRisk) {
+      code = 'PGY_RISK_STOP';
+      error = '出现登录或安全提示，或无法核实安全状态，已停止读取且没有自动回页。请人工检查右侧页面。';
+    }
     return {
       ok: false,
       code,
@@ -1939,6 +2057,9 @@ async function readPgyCandidatesFromResponsePages({
       });
     }
     currentPage = startPage;
+    if (rankOrigin === 'current_page' && !domPageNumber) {
+      return failIncomplete('PGY_CURRENT_PAGE_UNCONFIRMED', '无法确认当前搜索页码，未读取或翻页。请先核实右侧分页状态。');
+    }
     const initialEvidence = seedItems.length
       ? {
           items: seedItems,
@@ -1948,7 +2069,7 @@ async function readPgyCandidatesFromResponsePages({
         }
       : firstPage;
 
-    if (startPage === 1) {
+    if (startPage === 1 || rankOrigin === 'current_page') {
       const firstItems = seedItems.length ? seedItems : firstPage?.items;
       append(firstItems);
       currentPageEvidence = initialEvidence;
@@ -1965,6 +2086,7 @@ async function readPgyCandidatesFromResponsePages({
           sequence: initialEvidence?.sequence
         };
         let first = null;
+        pageNavigationAttempted = true;
         try {
           first = await browserView.webContents.executeJavaScript(
             buildSearchPaginationScript('goto', 1, calibration),
@@ -1972,11 +2094,8 @@ async function readPgyCandidatesFromResponsePages({
           );
         } catch (_) {}
         if (!first?.clicked && !first?.alreadyAtTarget) {
-          return {
-            ok: false,
-            code: 'PGY_PAGINATION_FIRST_PAGE_FAILED',
-            error: '当前不在搜索结果第 1 页，且未能自动回到第 1 页。请手动切到第 1 页后重试。'
-          };
+          return failIncomplete('PGY_PAGINATION_FIRST_PAGE_FAILED',
+            '当前不在搜索结果第 1 页，且未能自动回到第 1 页。请手动切到第 1 页后重试。');
         }
         currentPage = 1;
         let page = null;
@@ -2100,6 +2219,7 @@ async function readPgyCandidatesFromResponsePages({
         requestedCount,
         items: items.slice(),
         startPage,
+        rankOrigin,
         currentPage,
         pagesRead,
         waitedCheckpoints: [...waitedCheckpoints, checkpoint],
@@ -2168,6 +2288,9 @@ async function readPgyCandidatesFromResponsePages({
       sequence: previousPage?.sequence
     };
     let next = null;
+    if (!await navigationSafetyPassed()) return failIncomplete('PGY_RISK_STOP', '已停止翻页。');
+    // A page click may succeed before its execution context disappears.
+    pageNavigationAttempted = true;
     try {
       next = await browserView.webContents.executeJavaScript(
         buildSearchPaginationScript('next', 1, calibration),
@@ -2252,6 +2375,8 @@ async function readPgyCandidatesFromResponsePages({
       requested: requestedCount,
       startRank,
       endRank,
+      rankOrigin,
+      startPage,
       available: items.length,
       extracted: resultItems.length,
       source: 'pgy-list-response',
@@ -2259,7 +2384,7 @@ async function readPgyCandidatesFromResponsePages({
       checkpointsWaited: waitedCheckpoints,
       stoppedForRisk: false
     },
-    message: `已按当前排序完整读取${candidateRangeLabel(startRank, endRank)}达人。`
+    message: `已从第 ${rankOrigin === 'current_page' ? startPage : 1} 页起按当前排序完整读取${candidateRangeLabel(startRank, endRank)}达人。`
   };
 }
 
@@ -2372,17 +2497,28 @@ async function cancelCandidateCheckpointSession(sessionId) {
     return { ok: true, canceled: false };
   }
   pgyCandidateCheckpointSession = null;
+  let restoreSkipped = false;
   try {
     if (browserView && Number(session.currentPage || 1) !== Number(session.startPage || 1)) {
-      const restore = await browserView.webContents.executeJavaScript(
-        buildSearchPaginationScript('goto', session.startPage, session.calibration || {}),
-        true
-      );
-      if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+      const target = browserView.webContents;
+      const samePageContext = () => browserView?.webContents === target
+        && target.id === session.webContentsId && target.getURL() === session.url;
+      if (!samePageContext()) restoreSkipped = true;
+      else {
+        const risk = await pgyDetectRiskOnCurrentPage(target);
+        if (!samePageContext() || risk?.ok !== true || risk.riskDetected) restoreSkipped = true;
+        else {
+          const restore = await target.executeJavaScript(
+            buildSearchPaginationScript('goto', session.startPage, session.calibration || {}), true
+          );
+          restoreSkipped = !restore?.clicked && !restore?.alreadyAtTarget;
+          if (restore?.clicked) await sleep(PGY_MIN_TAB_WAIT_MS);
+        }
+      }
     }
-  } catch (_) {}
+  } catch (_) { restoreSkipped = true; }
   sendBrowserTabsSnapshot();
-  return { ok: true, canceled: true };
+  return { ok: true, canceled: true, restoreSkipped };
 }
 
 function createMainWindow() {
@@ -2427,25 +2563,21 @@ function createMainWindow() {
   mainWindow.addBrowserView(browserView);
 
   // 初始打开空白页
-  browserView.webContents.loadURL('about:blank');
+  browserView.webContents.loadURL('about:blank').catch((error) => {
+    if (error?.code !== 'ERR_ABORTED' && error?.errno !== -3) console.error('Collection tab initialization failed', error);
+  });
 
-  const [initialWindowWidth] = mainWindow.getContentSize();
-  let uiWidth = Math.min(
-    UI_MAX_WIDTH,
-    Math.max(UI_MIN_WIDTH, Math.round(initialWindowWidth * UI_WIDTH_RATIO))
-  );
+  let uiWidth; // CSS px; the first calculation uses the renderer's default ratio.
   applyBrowserBounds = () => {
     const activeView = getActiveBrowserView();
-    if (!mainWindow || !activeView) return;
-    const [w, h] = mainWindow.getContentSize();
-    const x = Math.round(uiWidth + SPLITTER_WIDTH);
-    const y = TOPBAR_HEIGHT;
-    const width = Math.max(BROWSER_MIN_WIDTH, w - x);
-    const height = Math.max(240, h - TOPBAR_HEIGHT);
-    const bounds = { x, y, width, height };
+    if (!mainWindow || mainWindow.isDestroyed() || !liveBrowserContents(activeView)
+      || !liveBrowserContents(mainWindow)) return;
+    const layout = calculateBrowserLayout(mainWindow, uiWidth);
+    uiWidth = layout.consoleWidth;
+    const bounds = layout.bounds;
     const attachedViews = mainWindow.getBrowserViews();
     for (const view of browserTabViews.values()) {
-      if (!view || view.webContents.isDestroyed()) continue;
+      if (!liveBrowserContents(view)) continue;
       if (!attachedViews.includes(view)) mainWindow.addBrowserView(view);
       // Keep background automation views attached at full size. Electron can
       // otherwise stall capturePage/DOM work when setBrowserView detaches them.
@@ -2462,15 +2594,15 @@ function createMainWindow() {
   // renderer 拖拽分割条后同步右侧 BrowserView 边界
   ipcMain.handle('browser:setLayout', async (_e, payload) => {
     try {
-      const cw = Number(payload?.consoleWidth || 0);
-      if (Number.isFinite(cw) && cw > 0) {
-        // 工作台优先，但右侧仍保留可人工操作的最小宽度。
-        const [w] = mainWindow.getContentSize();
-        const min = UI_MIN_WIDTH;
-        const max = Math.max(min, w - BROWSER_MIN_WIDTH - SPLITTER_WIDTH);
-        uiWidth = Math.max(min, Math.min(max, cw));
-        applyBrowserBounds();
+      if (!mainWindow || mainWindow.isDestroyed()
+        || _e.sender !== mainWindow.webContents
+        || _e.senderFrame !== mainWindow.webContents.mainFrame) {
+        return { ok: false, error: 'Untrusted layout sender' };
       }
+      const cw = payload?.consoleWidth;
+      if (!Number.isFinite(cw) || cw <= 0) return { ok: false, error: 'Invalid consoleWidth' };
+      uiWidth = cw;
+      applyBrowserBounds();
       return { ok: true, uiWidth };
     } catch (err) {
       return { ok: false, error: String(err?.message || err) };
@@ -2517,7 +2649,7 @@ function createMainWindow() {
   });
   // 推一份初始 state，避免渲染端等待
   try {
-    mainWindow?.webContents.send('tasks:state', taskRunner.state);
+    mainWindow?.webContents.send('tasks:state', taskRunner.getState());
   } catch (_) {}
 
   mainWindow.on('closed', () => {
@@ -2645,11 +2777,18 @@ async function waitForBackendReady({
   };
 }
 
-function startBackendIfNeeded() {
+async function startBackendIfNeeded() {
   // 默认启动 Python 后端（可通过环境变量禁用）
   if (process.env.ELECTRON_START_BACKEND === 'false') return;
   if (backendProc) return;
+  const generation = ++backendGeneration;
+  backendStopping = false;
+  if (qaRuntime.active && !(await backendPortAvailable())) {
+    mainWindow?.webContents.send('backend:status', { running: false, host: '127.0.0.1', port: qaRuntime.port, code: 'QA_PORT_BUSY' });
+    return;
+  }
 
+  if (generation !== backendGeneration || backendProc || backendStopping) return;
   const backendDir = app.isPackaged
     ? path.join(process.resourcesPath, 'content-analyzer')
     : path.resolve(__dirname, '..', 'content-analyzer');
@@ -2694,14 +2833,13 @@ function startBackendIfNeeded() {
 
   if (shouldUsePackagedBackend) {
     console.log('[backend] 启动内置后端：', packagedBackendEntry);
-    const proc = spawn(packagedBackendEntry, [], {
-      cwd: packagedBackendDir,
-      env,
-      stdio: 'ignore',
-      windowsHide: true
-    });
+    const proc = require('child_process').fork(path.join(__dirname, 'lib/qa_backend_supervisor.js'), [], {
+          env: { ...env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true
+        });
 
     proc.on('error', (err) => {
+      if (backendProc !== proc || backendGeneration !== generation) return;
+      if (!Number.isSafeInteger(proc.pid) || proc.pid <= 0) { backendProc = null; backendInstanceToken = ''; backendGeneration++; backendStopping = false; }
       console.error('[backend] 内置后端启动失败：', err);
       mainWindow?.webContents.send('backend:status', { running: false, code: err?.code || 'SPAWN_ERROR' });
     });
@@ -2716,25 +2854,21 @@ function startBackendIfNeeded() {
     });
     proc.on('exit', (code) => {
       console.warn('[backend] exited:', code);
-      if (backendProc === proc) backendProc = null;
+      if (backendProc !== proc) return;
+      backendProc = null; backendInstanceToken = ''; backendGeneration++; backendStopping = false;
       mainWindow?.webContents.send('backend:status', { running: false, code });
     });
 
+    proc.on('close', () => {
+      if (backendProc === proc && (!Number.isSafeInteger(proc.pid) || proc.pid <= 0)) {
+        backendProc = null; backendInstanceToken = ''; backendGeneration++; backendStopping = false;
+      }
+    });
     backendProc = proc;
-    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT, expectedToken: backendInstanceToken })
-      .then((ready) => {
-        mainWindow?.webContents.send('backend:status', ready?.ok
-          ? { running: true, host: env.API_HOST, port: env.API_PORT, readyPath: ready.path }
-          : { running: false, host: env.API_HOST, port: env.API_PORT, code: ready?.code || 'BACKEND_NOT_READY' });
-      })
-      .catch((err) => {
-        mainWindow?.webContents.send('backend:status', {
-          running: false,
-          host: env.API_HOST,
-          port: env.API_PORT,
-          code: err?.code || 'BACKEND_PROBE_ERROR'
-        });
-      });
+    proc.send({ type: 'start', parentPid: process.pid, executable: packagedBackendEntry, cwd: packagedBackendDir }, err => {
+      if (err && backendProc === proc) mainWindow?.webContents.send('backend:status', { running: false, code: 'BACKEND_START_FAILED' });
+    });
+    publishBackendProbe(proc, generation, backendInstanceToken, env);
     return;
   }
 
@@ -2745,6 +2879,7 @@ function startBackendIfNeeded() {
   pythonCandidates.push('python3', 'py', 'python');
 
   const trySpawn = (idx) => {
+    if (generation !== backendGeneration || backendStopping) return;
     if (idx >= pythonCandidates.length) {
       console.error('[backend] 未找到可用的 Python 命令。请设置环境变量 PYTHON（例如 python3/py/python 或 Python.exe 全路径）。');
       mainWindow?.webContents.send('backend:status', { running: false, code: 'PYTHON_NOT_FOUND' });
@@ -2763,8 +2898,10 @@ function startBackendIfNeeded() {
 
     // 关键：命令不存在时会触发 error 事件（ENOENT）
     proc.on('error', (err) => {
+      if (backendProc !== proc || backendGeneration !== generation) return;
       if (err && err.code === 'ENOENT') {
         console.warn('[backend] 命令不存在：', pythonCmd);
+        if (backendProc === proc) backendProc = null;
         trySpawn(idx + 1);
         return;
       }
@@ -2782,49 +2919,46 @@ function startBackendIfNeeded() {
     });
     proc.on('exit', (code) => {
       console.warn('[backend] exited:', code);
-      if (backendProc === proc) backendProc = null;
+      if (backendProc !== proc) return;
+      backendProc = null; backendInstanceToken = ''; backendGeneration++; backendStopping = false;
       mainWindow?.webContents.send('backend:status', { running: false, code });
     });
 
     backendProc = proc;
-    // Task 2：spawn 后先探测后端就绪（成功后才 running=true）
-    waitForBackendReady({ host: env.API_HOST, port: env.API_PORT, expectedToken: backendInstanceToken })
-      .then((ready) => {
-        if (!ready?.ok) {
-          mainWindow?.webContents.send('backend:status', {
-            running: false,
-            host: env.API_HOST,
-            port: env.API_PORT,
-            code: ready?.code || 'BACKEND_NOT_READY'
-          });
-          return;
-        }
-        mainWindow?.webContents.send('backend:status', {
-          running: true,
-          host: env.API_HOST,
-          port: env.API_PORT,
-          readyPath: ready.path
-        });
-      })
-      .catch((err) => {
-        mainWindow?.webContents.send('backend:status', {
-          running: false,
-          host: env.API_HOST,
-          port: env.API_PORT,
-          code: err?.code || 'BACKEND_PROBE_ERROR'
-        });
-      });
+    publishBackendProbe(proc, generation, backendInstanceToken, env);
   };
 
   trySpawn(0);
 }
 
 function stopBackend() {
-  if (!backendProc) return;
-  try {
-    backendProc.kill();
-  } catch (_) {}
-  backendProc = null;
+  const proc = backendProc;
+  if (!proc) return Promise.resolve({ ok: true });
+  // spawn failure has no OS process to stop; it must not trap the window.
+  if (!Number.isSafeInteger(proc.pid) || proc.pid <= 0) {
+    backendProc = null; backendInstanceToken = ''; backendGeneration++; backendStopping = false;
+    return Promise.resolve({ ok: true });
+  }
+  backendStopping = true;
+  backendGeneration++;
+  mainWindow?.webContents.send('backend:status', { running: false, code: 'BACKEND_STOP_REQUESTED' });
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = result => {
+      if (settled) return; settled = true;
+      clearTimeout(timer); proc.removeListener('exit', exited); proc.removeListener('message', message);
+      if (!result.ok) mainWindow?.webContents.send('backend:status', { running: false, code: result.code });
+      resolve(result);
+    };
+    const exited = () => finish({ ok: true });
+    const message = m => { if (m?.type === 'stop-failed') finish({ ok: false, code: 'BACKEND_STOP_FAILED' }); };
+    const timer = setTimeout(() => finish({ ok: false, code: 'BACKEND_STOP_TIMEOUT' }), 8000);
+    proc.once('exit', exited); proc.on('message', message);
+    try {
+      if (app.isPackaged && proc.connected) proc.send({ type: 'stop' }, err => { if (err) finish({ ok: false, code: 'BACKEND_STOP_FAILED' }); });
+      else if (app.isPackaged || !proc.kill()) finish({ ok: false, code: 'BACKEND_STOP_FAILED' });
+    } catch (_) { finish({ ok: false, code: 'BACKEND_STOP_FAILED' }); }
+  });
 }
 
 // =========================
@@ -2850,14 +2984,19 @@ ipcMain.handle('app:focusRenderer', async (event) => {
 });
 
 ipcMain.handle('backend:info', async () => {
+  const proc = backendProc, generation = backendGeneration, token = backendInstanceToken;
+  if (!ownsBackend(proc, generation, token)) {
+    return { ok: true, running: false, code: 'BACKEND_NOT_OWNED' };
+  }
   const host = process.env.API_HOST || DEFAULT_API_HOST;
   const port = process.env.API_PORT || DEFAULT_API_PORT;
   const ready = await waitForBackendReady({
     host,
     port,
     timeoutMs: 300,
-    expectedToken: backendInstanceToken
+    expectedToken: token
   });
+  if (!ownsBackend(proc, generation, token)) return { ok: true, running: false, code: 'BACKEND_INSTANCE_CHANGED' };
   return {
     ok: true,
     host,
@@ -3108,7 +3247,9 @@ function emitXhsContactProgress(payload = {}) {
     phase: xhsContactJob.phase,
     currentRowId: xhsContactJob.currentRowId,
     currentCreatorName: xhsContactJob.currentCreatorName,
-    ...payload
+    ...payload,
+    runDir: xhsContactJob.runDir,
+    jobId: xhsContactJob.jobId
   });
 }
 
@@ -3815,6 +3956,293 @@ ipcMain.handle('contacts:openTencentEmail', async () => {
   };
 });
 
+function beginPgyInviteOperation(kind, inviteView) {
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) throw Object.assign(new Error(lockReason), { code: 'BROWSER_TAB_LOCKED' });
+  const operation = {
+    kind,
+    webContents: inviteView.webContents,
+    generation: pgyInvitePageGeneration,
+    navigationPermit: null,
+    invalidated: false,
+    lastNavigation: 'none',
+    invalidationReason: ''
+  };
+  pgyInviteOperation = operation;
+  return operation;
+}
+
+function endPgyInviteOperation(operation) {
+  if (pgyInviteOperation !== operation) return;
+  pgyInviteOperation = null;
+  // Renderer teardown must not replace a determined send outcome with an IPC rejection.
+  try {
+    sendBrowserTabsSnapshot();
+  } catch (_) {}
+}
+
+function permitsPgyInviteAccountFallback(webContents, url) {
+  const operation = pgyInviteOperation;
+  if (!operation || operation.invalidated || operation.webContents !== webContents
+    || !['open-account', 'check-login'].includes(operation.kind)
+    || operation.navigationPermit?.kind !== 'account') return false;
+  try {
+    const target = new URL(url);
+    // The verified PGY public homepage hosts the login UI. Do not guess other login routes.
+    return target.origin === 'https://pgy.xiaohongshu.com'
+      && !target.username && !target.password && target.pathname === '/'
+      && !target.search && !target.hash;
+  } catch (_) { return false; }
+}
+
+function permitsPgyInviteNavigation(webContents, url) {
+  const operation = pgyInviteOperation;
+  if (!operation) return true;
+  if (operation.webContents !== webContents || operation.invalidated) return false;
+  const permit = operation.navigationPermit;
+  if (!permit) return false;
+  if (!isAllowedPgyInviteNavigationUrl(url)) return false;
+  const accountFallback = permitsPgyInviteAccountFallback(webContents, url);
+  if (permit.settling && pgyInviteNavigationKey(url) !== permit.settlingKey && !accountFallback) return false;
+  if (permit.kind === 'account') return pgyInviteNavigationKey(url) === pgyInviteNavigationKey(permit.url) || accountFallback;
+  if (permit.kind === 'submitted') return isAllowedPgyInviteNavigationUrl(url);
+  if (permit.kind === 'creator') return normalizePgyInviteCreatorUrl(url) === permit.url;
+  const formUrl = normalizePgyInviteFormUrl(url);
+  return permit.kind === 'form' && Boolean(formUrl) && (!permit.url || permit.url === formUrl);
+}
+
+function pgyInviteNavigationKey(url) {
+  return normalizePgyInviteCreatorUrl(url) || normalizePgyInviteFormUrl(url) || String(url || '');
+}
+
+function pgyInviteDepartingPageKey(url) {
+  if (!isAllowedPgyInviteNavigationUrl(url)) return '';
+  const identity = normalizePgyInviteCreatorUrl(url) || normalizePgyInviteFormUrl(url);
+  if (identity) return identity;
+  const parsed = new URL(url);
+  return `${parsed.origin}${parsed.pathname.replace(/\/$/, '')}` === PGY_CANDIDATE_RESULTS_URL
+    ? PGY_CANDIDATE_RESULTS_URL : '';
+}
+
+function hasPgyInviteCreatorDocument(webContents, url) {
+  return pgyInviteDocumentProof?.webContents === webContents && pgyInviteDocumentProof.key === url
+    && normalizePgyInviteCreatorUrl(webContents.getURL()) === url
+    && new URL(webContents.getURL()).origin === 'https://pgy.xiaohongshu.com';
+}
+
+function notePgyInviteNavigation(webContents, url, { inPage = false, event = 'destroyed' } = {}) {
+  if (pgyInviteBrowserView?.webContents !== webContents) return;
+  pgyInvitePageGeneration += 1;
+  pgyInvitePreparedDraft = null;
+  if (event === 'commit' && isAllowedPgyInviteNavigationUrl(url)
+    && new URL(url).origin === 'https://pgy.xiaohongshu.com') {
+    pgyInviteDocumentProof = { webContents, key: pgyInviteNavigationKey(url) };
+  } else if (!inPage || pgyInviteDocumentProof?.webContents !== webContents
+    || pgyInviteDocumentProof.key !== pgyInviteNavigationKey(url)) {
+    pgyInviteDocumentProof = null;
+  }
+  const operation = pgyInviteOperation;
+  if (!operation || operation.webContents !== webContents) return;
+  operation.lastNavigation = `${event}:${inPage ? 'same-document' : 'document'}`;
+  const permit = operation.navigationPermit;
+  const accountFallback = permitsPgyInviteAccountFallback(webContents, url);
+  // loadURL leaves the old document alive until commit; its own history cleanup is not a new target.
+  const departingPageUpdate = inPage && (permit?.kind === 'creator' || permit?.kind === 'form')
+    && !permit.committed && !permit.settling
+    && Boolean(permit.sourceKey) && permit.sourceKey !== permit.url
+    && pgyInviteDepartingPageKey(url) === permit.sourceKey
+    && pgyInviteDepartingPageKey(webContents.getURL()) === permit.sourceKey;
+  if (!url || (!departingPageUpdate && !permitsPgyInviteNavigation(webContents, url))
+    || (operation.navigationPermit?.settling && !inPage && !accountFallback)) {
+    operation.invalidated = true;
+    operation.invalidationReason = !url ? 'view-destroyed'
+      : operation.navigationPermit?.settling && !inPage ? 'reload-during-settle' : 'unexpected-navigation';
+    operation.invalidationPhase = !permit ? 'no-permit' : permit.settling ? 'settling' : permit.committed ? 'committed' : 'before-commit';
+    operation.invalidationSource = normalizePgyInviteCreatorUrl(permit?.sourceKey) ? 'creator'
+      : normalizePgyInviteFormUrl(permit?.sourceKey) ? 'form' : permit?.sourceKey === PGY_CANDIDATE_RESULTS_URL ? 'search' : 'other';
+    return;
+  }
+  if (accountFallback && permit.settling && (event === 'commit' || inPage)) permit.settlingKey = pgyInviteNavigationKey(url);
+  if (event === 'commit') permit.committed = true;
+  if (!departingPageUpdate && operation.navigationPermit.kind === 'form') {
+    operation.navigationPermit.url = normalizePgyInviteFormUrl(url);
+  }
+  operation.generation = pgyInvitePageGeneration;
+}
+
+function assertPgyInviteContext(operation, page = null, { allowLoading = false } = {}) {
+  const webContents = operation.webContents;
+  const reason = pgyInviteOperation !== operation ? 'operation-replaced'
+    : operation.invalidated ? operation.invalidationReason || 'invalidated'
+    : pgyInviteBrowserView?.webContents !== webContents ? 'view-replaced'
+    : webContents.isDestroyed() ? 'view-destroyed'
+    : operation.generation !== pgyInvitePageGeneration ? 'generation-changed'
+    : page && (page.generation !== pgyInvitePageGeneration || page.url !== webContents.getURL()) ? 'snapshot-changed'
+    : !allowLoading && webContents.isLoadingMainFrame() ? 'main-frame-loading' : '';
+  if (reason) {
+    const diagnostic = `${operation.kind}/${reason}/${operation.lastNavigation}`
+      + (operation.invalidationPhase ? `/phase:${operation.invalidationPhase}/source:${operation.invalidationSource}` : '');
+    throw Object.assign(new Error(`邀约页面已变化或仍在加载，请重新准备并确认邀约 [${diagnostic}]`), {
+      code: 'PGY_INVITE_CONTEXT_CHANGED', diagnostic
+    });
+  }
+}
+
+function capturePgyInvitePage(operation) {
+  assertPgyInviteContext(operation);
+  return { generation: pgyInvitePageGeneration, url: operation.webContents.getURL() };
+}
+
+async function checkPgyInviteActionSafety(operation, deadline = Infinity) {
+  const riskDeadline = Math.min(Date.now() + 8000, deadline);
+  const timeoutError = () => Object.assign(new Error('读取邀约页面风控状态超时，已停止操作'), {
+    code: 'PGY_INVITE_SAFETY_CHECK_FAILED'
+  });
+  if (Date.now() >= riskDeadline) throw timeoutError();
+  const page = capturePgyInvitePage(operation);
+  if (/\/login(?:\/|$)/i.test(new URL(page.url).pathname)) {
+    throw Object.assign(new Error('邀约账号已跳转到登录页，请人工登录后重新准备邀约'), { code: 'PGY_INVITE_LOGIN_REQUIRED' });
+  }
+  if (!normalizePgyInviteCreatorUrl(page.url) && !normalizePgyInviteFormUrl(page.url)) {
+    throw Object.assign(new Error('邀约页面不在已核验的达人或表单路由，已停止操作'), { code: 'PGY_INVITE_CONTEXT_CHANGED' });
+  }
+  let riskTimer;
+  const timeoutMs = riskDeadline - Date.now();
+  if (timeoutMs <= 0) throw timeoutError();
+  let risk;
+  try {
+    risk = await Promise.race([pgyDetectRiskOnCurrentPage(operation.webContents), new Promise((_, reject) => {
+      riskTimer = setTimeout(() => reject(timeoutError()), timeoutMs);
+    })]);
+  } finally { clearTimeout(riskTimer); }
+  if (Date.now() >= riskDeadline) throw timeoutError();
+  assertPgyInviteContext(operation, page);
+  if (risk?.riskDetected) {
+    throw Object.assign(new Error('蒲公英出现验证或风控提示，已停止邀约，请人工处理'), { code: 'PGY_INVITE_RISK_DETECTED' });
+  }
+  if (!risk?.ok) {
+    throw Object.assign(new Error('无法读取邀约页面风控状态，已停止操作，请人工检查'), { code: 'PGY_INVITE_SAFETY_CHECK_FAILED' });
+  }
+  if (risk.url !== page.url) {
+    throw Object.assign(new Error('邀约页面风控检查来自不同页面，已停止操作'), { code: 'PGY_INVITE_CONTEXT_CHANGED' });
+  }
+}
+
+async function loadPgyInviteOperationUrl(operation, url, kind) {
+  const sourceUrl = operation.webContents.getURL();
+  const sourceKey = kind === 'creator' ? pgyInviteDepartingPageKey(sourceUrl)
+    : isAllowedPgyInviteNavigationUrl(sourceUrl) ? normalizePgyInviteCreatorUrl(sourceUrl) || normalizePgyInviteFormUrl(sourceUrl) : '';
+  operation.navigationPermit = { kind, url, sourceKey, committed: false };
+  const deadline = Date.now() + 25000;
+  try {
+    let settled = false;
+    let loadError = null;
+    Promise.resolve(operation.webContents.loadURL(url)).then(
+      () => { settled = true; },
+      (error) => { loadError = error; settled = true; }
+    );
+    while (!settled && Date.now() < deadline) {
+      assertPgyInviteContext(operation, null, { allowLoading: true });
+      await sleep(50);
+    }
+    if (!settled) {
+      operation.invalidated = true;
+      operation.invalidationReason = 'load-timeout';
+      operation.webContents.stop();
+      throw Object.assign(new Error('邀约页面打开超时，已停止加载，请人工检查后重试'), { code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT' });
+    }
+    assertPgyInviteContext(operation, null, { allowLoading: true });
+    // A resolved load is not necessarily the end of an already-running document navigation.
+    if (!loadError && kind === 'creator' && !operation.navigationPermit.committed) {
+      const commitDeadline = Math.min(Date.now() + 8000, deadline);
+      while (!operation.navigationPermit.committed && Date.now() < commitDeadline) {
+        assertPgyInviteContext(operation, null, { allowLoading: true });
+        await sleep(50);
+      }
+      assertPgyInviteContext(operation, null, { allowLoading: true });
+      if (!operation.navigationPermit.committed && operation.webContents.isLoadingMainFrame()) {
+        operation.invalidated = true;
+        operation.invalidationReason = 'creator-commit-timeout';
+        operation.webContents.stop();
+        throw Object.assign(new Error('达人页仍在加载，等待本次页面提交超时；已停止，请检查页面状态'), {
+          code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT'
+        });
+      }
+    }
+    if (loadError && (loadError.code !== 'ERR_ABORTED' && loadError.errno !== -3
+      || operation.webContents.isLoadingMainFrame()
+      || !operation.navigationPermit.committed
+      || !permitsPgyInviteNavigation(operation.webContents, operation.webContents.getURL()))) throw loadError;
+    // A resolved load can leave a SPA at the target URL without committing a fresh document.
+    // Recover this preparation-only state once; URL equality never grants send readiness.
+    if (!operation.navigationPermit.committed && !loadError && kind === 'creator'
+      && !operation.webContents.isLoadingMainFrame()
+      && normalizePgyInviteCreatorUrl(operation.webContents.getURL()) === url
+      && new URL(operation.webContents.getURL()).origin === 'https://pgy.xiaohongshu.com') {
+      await checkPgyInviteActionSafety(operation, deadline);
+      assertPgyInviteContext(operation);
+      if (Date.now() >= deadline) throw Object.assign(new Error('达人页打开已超时，未继续自动恢复'), {
+        code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT'
+      });
+      operation.documentRecoveryUsed = true;
+      operation.navigationPermit = { kind, url, sourceKey: url, committed: false };
+      operation.webContents.reload();
+      const recoveryDeadline = Math.min(Date.now() + 8000, deadline);
+      while (!operation.navigationPermit.committed && Date.now() < recoveryDeadline) {
+        assertPgyInviteContext(operation, null, { allowLoading: true });
+        await sleep(50);
+      }
+      assertPgyInviteContext(operation, null, { allowLoading: true });
+      if (!operation.navigationPermit.committed) {
+        operation.invalidated = true;
+        operation.invalidationReason = 'creator-reload-timeout';
+        operation.webContents.stop();
+        throw Object.assign(new Error('已自动重载达人页一次，但未完成加载；已停止，请检查登录或页面状态'), { code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT' });
+      }
+    }
+    if (!operation.navigationPermit.committed) {
+      const loading = operation.webContents.isLoadingMainFrame() ? 'yes' : 'no';
+      const target = permitsPgyInviteNavigation(operation.webContents, operation.webContents.getURL()) ? 'match' : 'other';
+      throw Object.assign(new Error(`邀约页面尚未完成本次目标加载，请重新打开达人 [${kind}/commit-missing/loading:${loading}/target:${target}]`), {
+        code: 'PGY_INVITE_CONTEXT_CHANGED'
+      });
+    }
+    await settlePgyInviteNavigation(operation, deadline);
+  } finally {
+    operation.navigationPermit = null;
+  }
+}
+
+async function settlePgyInviteNavigation(operation, loadDeadline = Infinity) {
+  assertPgyInviteContext(operation, null, { allowLoading: true });
+  const permit = operation.navigationPermit;
+  const url = operation.webContents.getURL();
+  if (!permit || !permitsPgyInviteNavigation(operation.webContents, url)) {
+    throw Object.assign(new Error('邀约页面没有到达本次指定目标，已停止操作'), { code: 'PGY_INVITE_CONTEXT_CHANGED' });
+  }
+  // Only owned same-document initialization can settle here. Reads/sends retain strict snapshots.
+  permit.settling = true;
+  permit.settlingKey = pgyInviteNavigationKey(url);
+  const deadline = Math.min(Date.now() + 3000, loadDeadline);
+  let quietSince = Date.now();
+  let generation = operation.generation;
+  while (Date.now() < deadline) {
+    assertPgyInviteContext(operation, null, { allowLoading: true });
+    if (!permitsPgyInviteNavigation(operation.webContents, operation.webContents.getURL())) {
+      throw Object.assign(new Error('邀约页面目标在等待期间发生变化，已停止操作'), { code: 'PGY_INVITE_CONTEXT_CHANGED' });
+    }
+    if (operation.webContents.isLoadingMainFrame() || generation !== operation.generation) {
+      quietSince = Date.now();
+      generation = operation.generation;
+    } else if (Date.now() - quietSince >= 750) {
+      assertPgyInviteContext(operation);
+      return;
+    }
+    await sleep(50);
+  }
+  throw Object.assign(new Error('邀约页面仍在加载或切换，等待稳定超时，请人工检查后重试'), { code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT' });
+}
+
 function resolvePgyInviteTargetPayload(payload = {}) {
   const runDir = resolveInsideRuns(payload?.runDir || '');
   if (!runDir) return { ok: false, code: 'PGY_INVITE_RUN_REQUIRED', error: '请选择有效的采集结果' };
@@ -3826,12 +4254,13 @@ function resolvePgyInviteTargetPayload(payload = {}) {
   return { ok: true, runDir, target };
 }
 
-function sendTrustedPgyInviteClick(webContents, point) {
+function sendTrustedPgyInviteClick(webContents, point, { beforeDispatch } = {}) {
   const x = Math.round(Number(point?.x));
   const y = Math.round(Number(point?.y));
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
     return { ok: false, code: 'PGY_INVITE_CLICK_TARGET_INVALID', error: '邀约页面返回了无效的控件位置' };
   }
+  beforeDispatch?.();
   webContents.sendInputEvent({ type: 'mouseMove', x, y });
   webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
   webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
@@ -3879,7 +4308,7 @@ async function sendTrustedPgyInviteText(webContents, value) {
   }
 }
 
-async function drivePgyInviteToDetailForm(inviteView, template) {
+async function drivePgyInviteToDetailForm(inviteView, template, operation) {
   const deadline = Date.now() + 25000;
   const retryableEntryCodes = new Set([
     'PGY_INVITE_BUTTON_NOT_FOUND',
@@ -3889,9 +4318,21 @@ async function drivePgyInviteToDetailForm(inviteView, template) {
   let lastResult = null;
   let actionCount = 0;
   while (Date.now() < deadline && actionCount < 12) {
+    assertPgyInviteContext(operation, null, { allowLoading: true });
     const formUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
-    if (formUrl) return { ok: true, formUrl };
+    if (formUrl && !inviteView.webContents.isLoadingMainFrame()) {
+      if (operation.navigationPermit) await settlePgyInviteNavigation(operation);
+      operation.navigationPermit = null;
+      return { ok: true, formUrl };
+    }
+    if (operation.navigationPermit || inviteView.webContents.isLoadingMainFrame()) {
+      await sleep(250);
+      continue;
+    }
+    await checkPgyInviteActionSafety(operation);
+    const page = capturePgyInvitePage(operation);
     lastResult = await inviteView.webContents.executeJavaScript(buildPgyInviteEntryInspectScript(template), true);
+    assertPgyInviteContext(operation, page);
     if (!lastResult?.ok) {
       if (retryableEntryCodes.has(lastResult?.code)) {
         await sleep(250);
@@ -3902,6 +4343,9 @@ async function drivePgyInviteToDetailForm(inviteView, template) {
     if (!lastResult?.action?.point) {
       await sleep(180);
       continue;
+    }
+    if (lastResult.action.type === 'open-detail-form') {
+      operation.navigationPermit = { kind: 'form', sourceKey: normalizePgyInviteCreatorUrl(page.url), committed: false };
     }
     const clicked = sendTrustedPgyInviteClick(inviteView.webContents, lastResult.action.point);
     if (!clicked.ok) return clicked;
@@ -3916,15 +4360,36 @@ async function drivePgyInviteToDetailForm(inviteView, template) {
   };
 }
 
-async function preparePgyInviteDetailForm(inviteView, template) {
+async function preparePgyInviteDetailForm(inviteView, template, operation) {
+  console.warn('[invite-brand-metrics]', JSON.stringify({zoom: inviteView.webContents.getZoomFactor?.() || 1}));
   const deadline = Date.now() + 18000;
   const retryablePrepareCodes = new Set([
     'PGY_INVITE_DETAIL_FORM_NOT_FOUND'
   ]);
   let lastResult = null;
   let actionCount = 0;
+  let brandSearchDeadline = 0;
+  let brandSelectionConfirmed = false;
+  let brandSelectionSettled = false;
+  const brandSearchResult = () => {
+    const brandCandidates = Array.isArray(lastResult?.brandCandidates) ? lastResult.brandCandidates : [];
+    if (!brandCandidates.length && lastResult?.brandDiagnostics) {
+      console.warn('[invite-brand-shape]', JSON.stringify(lastResult.brandDiagnostics));
+    }
+    return brandCandidates.length
+      ? { ok: false, code: 'PGY_INVITE_BRAND_SELECTION_REQUIRED', brandCandidates,
+        error: '品牌搜索已有结果，但没有完全匹配。请选择正确的报备品牌后继续准备。' }
+      : { ok: false, code: 'PGY_INVITE_BRAND_NOT_FOUND',
+        error: '品牌搜索暂未返回匹配项，请检查品牌名称或品牌ID后重试。' };
+  };
   while (Date.now() < deadline && actionCount < 10) {
-    lastResult = await inviteView.webContents.executeJavaScript(buildPgyInvitePrepareScript(template), true);
+    // Focusing can reposition an open picker; do it before measuring click points.
+    inviteView.webContents.focus?.();
+    await sleep(80);
+    await checkPgyInviteActionSafety(operation);
+    const page = capturePgyInvitePage(operation);
+    lastResult = await inviteView.webContents.executeJavaScript(buildPgyInvitePrepareScript(template, { brandSelectionConfirmed, brandSelectionSettled }), true);
+    assertPgyInviteContext(operation, page);
     if (!lastResult?.ok) {
       if (retryablePrepareCodes.has(lastResult?.code)) {
         await sleep(250);
@@ -3933,25 +4398,46 @@ async function preparePgyInviteDetailForm(inviteView, template) {
       return lastResult;
     }
     if (lastResult?.readyToSend) return lastResult;
+    if (lastResult?.waitingForBrand) {
+      if (!brandSearchDeadline) brandSearchDeadline = Math.min(deadline, Date.now() + 10000);
+      if (Date.now() >= brandSearchDeadline) return brandSearchResult();
+      await sleep(250);
+      continue;
+    }
     if (Array.isArray(lastResult?.missingFields) && lastResult.missingFields.length === 0 && lastResult?.finalAction?.found) {
       await sleep(350);
       continue;
     }
     if (!lastResult?.action?.point) return lastResult;
-    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, lastResult.action.point);
-    if (!clicked.ok) return clicked;
+    if (lastResult.action.type === 'settle-brand') {
+      // Leave the searchable select without clicking an overlapping popup row.
+      inviteView.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' });
+      inviteView.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' });
+    } else {
+      const clicked = sendTrustedPgyInviteClick(inviteView.webContents, lastResult.action.point);
+      if (!clicked.ok) return clicked;
+    }
     actionCount += 1;
+    if (lastResult.action.type === 'select-brand') {
+      brandSelectionConfirmed = true;
+      brandSelectionSettled = false;
+    }
+    if (lastResult.action.type === 'settle-brand') brandSelectionSettled = true;
     if (lastResult.action.type === 'open-brand-picker') {
       await sleep(500);
+      assertPgyInviteContext(operation, page);
       const focused = await focusPgyInviteFieldAtPoint(inviteView.webContents, lastResult.action.point);
+      assertPgyInviteContext(operation, page);
       if (!focused.ok) return focused;
       const typed = await sendTrustedPgyInviteText(inviteView.webContents, lastResult.action.value || lastResult.action.label);
+      assertPgyInviteContext(operation, page);
       if (!typed.ok) return typed;
       await sleep(700);
     } else {
       await sleep(lastResult.action.type === 'select-brand' ? 600 : 280);
     }
   }
+  if (lastResult?.waitingForBrand) return brandSearchResult();
   if (lastResult?.action?.point) {
     return {
       ...lastResult,
@@ -3970,12 +4456,14 @@ ipcMain.handle('invites:openAccount', async () => {
   if (lockReason) {
     return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换到邀约账号` };
   }
+  const inviteView = ensurePgyInviteBrowserTab();
+  const operation = beginPgyInviteOperation('open-account', inviteView);
   try {
-    const inviteView = ensurePgyInviteBrowserTab();
-    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     if (!activated?.ok) return activated;
     const currentUrl = String(inviteView.webContents.getURL() || '');
-    if (!isAllowedTaskUrl(currentUrl)) await inviteView.webContents.loadURL(PGY_CANDIDATE_RESULTS_URL);
+    if (!isAllowedTaskUrl(currentUrl)) await loadPgyInviteOperationUrl(operation, PGY_CANDIDATE_RESULTS_URL, 'account');
+    assertPgyInviteContext(operation);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     sendActiveBrowserUrl();
     return {
@@ -3985,7 +4473,9 @@ ipcMain.handle('invites:openAccount', async () => {
       accountProfile: 'invite'
     };
   } catch (err) {
-    return { ok: false, error: String(err?.message || err) };
+    return { ok: false, code: err?.code, error: String(err?.message || err) };
+  } finally {
+    endPgyInviteOperation(operation);
   }
 });
 
@@ -3994,18 +4484,23 @@ ipcMain.handle('invites:checkLogin', async () => {
   if (lockReason) {
     return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能检测邀约账号` };
   }
+  const inviteView = ensurePgyInviteBrowserTab();
+  const operation = beginPgyInviteOperation('check-login', inviteView);
   try {
-    const inviteView = ensurePgyInviteBrowserTab();
-    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     if (!activated?.ok) return activated;
     const currentUrl = String(inviteView.webContents.getURL() || '');
-    if (!isAllowedTaskUrl(currentUrl)) await inviteView.webContents.loadURL(PGY_CANDIDATE_RESULTS_URL);
+    if (!isAllowedTaskUrl(currentUrl)) await loadPgyInviteOperationUrl(operation, PGY_CANDIDATE_RESULTS_URL, 'account');
+    const page = capturePgyInvitePage(operation);
     const result = await pgyCheckLogin(inviteView.webContents);
+    assertPgyInviteContext(operation, page);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     sendActiveBrowserUrl();
     return { ...result, tabId: PGY_INVITE_TAB_ID, accountProfile: 'invite' };
   } catch (err) {
-    return { ok: false, error: String(err?.message || err) };
+    return { ok: false, code: err?.code, error: String(err?.message || err) };
+  } finally {
+    endPgyInviteOperation(operation);
   }
 });
 
@@ -4016,6 +4511,8 @@ ipcMain.handle('invites:openCreator', async (_e, payload = {}) => {
   }
   if (taskRunner?.state?.running) return { ok: false, code: 'PGY_TASK_RUNNING', error: '请先等待当前采集任务结束' };
   if (xhsContactJob.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING', error: '请先结束小红书联系方式补采' };
+  const lockReason = currentBrowserAutomationLock();
+  if (lockReason) return { ok: false, code: 'BROWSER_TAB_LOCKED', error: `${lockReason}，暂时不能切换邀约达人` };
   const resolved = resolvePgyInviteTargetPayload(payload);
   if (!resolved.ok) return resolved;
   const { target } = resolved;
@@ -4028,27 +4525,38 @@ ipcMain.handle('invites:openCreator', async (_e, payload = {}) => {
     creatorName: target.creatorName,
     accountProfile: 'invite'
   });
+  const inviteView = ensurePgyInviteBrowserTab();
+  const operation = beginPgyInviteOperation('open-creator', inviteView);
   try {
     pgyInvitePreparedDraft = null;
-    const inviteView = ensurePgyInviteBrowserTab();
-    const activated = activateBrowserTab(PGY_INVITE_TAB_ID);
+    const activated = activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     if (!activated?.ok) return activated;
     const currentCreatorUrl = normalizePgyInviteCreatorUrl(inviteView.webContents.getURL());
-    if (currentCreatorUrl !== url) await inviteView.webContents.loadURL(url);
+    if (currentCreatorUrl !== url || !hasPgyInviteCreatorDocument(inviteView.webContents, url)) {
+      await loadPgyInviteOperationUrl(operation, url, 'creator');
+    } else if (inviteView.webContents.isLoadingMainFrame()) {
+      const deadline = Date.now() + 8000;
+      while (inviteView.webContents.isLoadingMainFrame() && Date.now() < deadline) {
+        assertPgyInviteContext(operation, null, { allowLoading: true });
+        await sleep(100);
+      }
+      assertPgyInviteContext(operation, null, { allowLoading: true });
+      if (inviteView.webContents.isLoadingMainFrame()) {
+        pgyInviteDocumentProof = null;
+        inviteView.webContents.stop();
+        throw Object.assign(new Error('当前达人页尚在加载，等待完成超时；请检查页面后重新准备'), {
+          code: 'PGY_INVITE_PAGE_LOAD_TIMEOUT'
+        });
+      }
+    }
+    assertPgyInviteContext(operation);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     sendActiveBrowserUrl();
-    return successResult();
+    return { ...successResult(), ...(operation.documentRecoveryUsed ? { documentReloaded: true } : {}) };
   } catch (err) {
-    const settleDeadline = Date.now() + 3000;
-    while (Date.now() < settleDeadline) {
-      if (normalizePgyInviteCreatorUrl(ensurePgyInviteBrowserTab().webContents.getURL()) === url) {
-        activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
-        sendActiveBrowserUrl();
-        return successResult();
-      }
-      await sleep(160);
-    }
-    return { ok: false, error: String(err?.message || err) };
+    return { ok: false, code: err?.code, error: String(err?.message || err) };
+  } finally {
+    endPgyInviteOperation(operation);
   }
 });
 
@@ -4070,26 +4578,34 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
   }
   const template = templateValidation.template;
   const inviteView = ensurePgyInviteBrowserTab();
-  let currentUrl = '';
-  const targetUrlDeadline = Date.now() + 8000;
-  while (Date.now() < targetUrlDeadline) {
-    currentUrl = normalizePgyInviteCreatorUrl(inviteView.webContents.getURL());
-    if (currentUrl === target.creatorUrl) break;
-    await sleep(160);
-  }
-  if (!currentUrl || currentUrl !== target.creatorUrl) {
-    pgyInvitePreparedDraft = null;
-    return {
-      ok: false,
-      code: 'PGY_INVITE_TARGET_MISMATCH',
-      error: '邀约账号未能稳定切换到所选达人，请重新点击“准备邀约”',
-      currentUrl,
-      expectedUrl: target.creatorUrl
-    };
-  }
+  const operation = beginPgyInviteOperation('prepare', inviteView);
   try {
+    pgyInvitePreparedDraft = null;
+    let currentUrl = '';
+    const targetUrlDeadline = Date.now() + 8000;
+    while (Date.now() < targetUrlDeadline) {
+      assertPgyInviteContext(operation, null, { allowLoading: true });
+      currentUrl = normalizePgyInviteCreatorUrl(inviteView.webContents.getURL());
+      if (currentUrl === target.creatorUrl && !inviteView.webContents.isLoadingMainFrame()) break;
+      await sleep(160);
+    }
+    if (!currentUrl || currentUrl !== target.creatorUrl) {
+      return {
+        ok: false,
+        code: 'PGY_INVITE_TARGET_MISMATCH',
+        error: '邀约账号未能稳定切换到所选达人，请重新点击“准备邀约”',
+        currentUrl,
+        expectedUrl: target.creatorUrl
+      };
+    }
+    if (!hasPgyInviteCreatorDocument(inviteView.webContents, target.creatorUrl)) {
+      throw Object.assign(new Error('当前达人页尚未完成有效加载，请重新准备；不能仅凭相同地址继续邀约'), {
+        code: 'PGY_INVITE_CONTEXT_CHANGED'
+      });
+    }
+    assertPgyInviteContext(operation);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
-    const entry = await drivePgyInviteToDetailForm(inviteView, template);
+    const entry = await drivePgyInviteToDetailForm(inviteView, template, operation);
     if (!entry?.ok) {
       pgyInvitePreparedDraft = null;
       activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
@@ -4101,7 +4617,9 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
         rowId: target.rowId
       };
     }
-    const prepared = await preparePgyInviteDetailForm(inviteView, template);
+    const formPage = capturePgyInvitePage(operation);
+    const prepared = await preparePgyInviteDetailForm(inviteView, template, operation);
+    assertPgyInviteContext(operation, formPage);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     sendActiveBrowserUrl();
     if (!prepared?.ok || !prepared?.readyToSend) {
@@ -4116,7 +4634,7 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
       };
     }
     const formUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
-    if (!formUrl || formUrl !== normalizePgyInviteFormUrl(prepared?.formUrl)) {
+    if (!formUrl || formUrl !== entry.formUrl || formUrl !== normalizePgyInviteFormUrl(prepared?.formUrl)) {
       pgyInvitePreparedDraft = null;
       return { ok: false, code: 'PGY_INVITE_FORM_URL_MISMATCH', error: '详细邀约表单地址发生变化，请重新准备邀约' };
     }
@@ -4125,6 +4643,8 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
       rowId: target.rowId,
       creatorUrl: target.creatorUrl,
       formUrl,
+      webContentsId: inviteView.webContents.id,
+      pageGeneration: formPage.generation,
       template
     })).digest('hex');
     const token = crypto.randomUUID();
@@ -4138,6 +4658,8 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
       creatorName: target.creatorName,
       creatorUrl: target.creatorUrl,
       formUrl,
+      webContentsId: inviteView.webContents.id,
+      pageGeneration: formPage.generation,
       template
     };
     return {
@@ -4164,7 +4686,9 @@ ipcMain.handle('invites:prepare', async (_e, payload = {}) => {
     };
   } catch (err) {
     pgyInvitePreparedDraft = null;
-    return { ok: false, code: 'PGY_INVITE_PREPARE_FAILED', error: `准备邀约失败：${String(err?.message || err)}` };
+    return { ok: false, code: err?.code || 'PGY_INVITE_PREPARE_FAILED', error: `准备邀约失败：${String(err?.message || err)}` };
+  } finally {
+    endPgyInviteOperation(operation);
   }
 });
 
@@ -4190,21 +4714,53 @@ ipcMain.handle('invites:sendPrepared', async (_e, payload = {}) => {
   }
   const inviteView = ensurePgyInviteBrowserTab();
   const currentUrl = normalizePgyInviteFormUrl(inviteView.webContents.getURL());
-  if (!currentUrl || currentUrl !== draft.formUrl) {
+  if (!currentUrl || currentUrl !== draft.formUrl
+    || draft.webContentsId !== inviteView.webContents.id || draft.pageGeneration !== pgyInvitePageGeneration) {
     pgyInvitePreparedDraft = null;
     return { ok: false, code: 'PGY_INVITE_TARGET_MISMATCH', error: '发送前发现详细邀约表单已切换，已停止发送' };
   }
   pgyInvitePreparedDraft = null;
+  const operation = beginPgyInviteOperation('send', inviteView);
+  let dispatchAttempted = false;
+  const unconfirmed = (details = {}) => ({
+    ...details,
+    ok: true,
+    clicked: true,
+    outcome: 'submitted-unconfirmed',
+    creatorName: target.creatorName,
+    rowId: target.rowId,
+    accountProfile: 'invite'
+  });
   try {
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
+    await checkPgyInviteActionSafety(operation);
+    const page = capturePgyInvitePage(operation);
     const verified = await inviteView.webContents.executeJavaScript(buildPgyInviteSendScript(draft.template), true);
-    if (!verified?.ok || !verified?.ready || !verified?.finalAction?.point) return verified;
-    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, verified.finalAction.point);
+    assertPgyInviteContext(operation, page);
+    if (!verified?.ok || !verified?.ready || !verified?.finalAction?.point) {
+      return { ...verified, ok: false, code: verified?.code || 'PGY_INVITE_NOT_READY' };
+    }
+    if (Date.now() > draft.expiresAt) {
+      return { ok: false, code: 'PGY_INVITE_CONFIRMATION_EXPIRED', error: '发送确认已过期，请重新准备邀约' };
+    }
+    if (normalizePgyInviteFormUrl(inviteView.webContents.getURL()) !== draft.formUrl) {
+      return { ok: false, code: 'PGY_INVITE_TARGET_MISMATCH', error: '发送前发现详细邀约表单已切换，已停止发送' };
+    }
+    const clicked = sendTrustedPgyInviteClick(inviteView.webContents, verified.finalAction.point, {
+      beforeDispatch: () => {
+        // From the first input dispatch onward, failure cannot prove that nothing was submitted.
+        dispatchAttempted = true;
+        operation.navigationPermit = { kind: 'submitted' };
+      }
+    });
     if (!clicked.ok) return clicked;
     await sleep(1800);
+    const outcomePage = capturePgyInvitePage(operation);
     const outcome = await inviteView.webContents.executeJavaScript(buildPgyInviteOutcomeScript(), true);
+    assertPgyInviteContext(operation, outcomePage);
     activateBrowserTab(PGY_INVITE_TAB_ID, { force: true });
     sendActiveBrowserUrl();
+    if (!outcome?.ok || outcome?.riskDetected || outcome?.outcome !== 'success-confirmed') return unconfirmed(outcome);
     return {
       ...outcome,
       clicked: true,
@@ -4213,7 +4769,12 @@ ipcMain.handle('invites:sendPrepared', async (_e, payload = {}) => {
       accountProfile: 'invite'
     };
   } catch (err) {
-    return { ok: false, code: 'PGY_INVITE_SEND_FAILED', error: `邀约按钮点击失败：${String(err?.message || err)}` };
+    if (dispatchAttempted) {
+      return unconfirmed({ code: 'PGY_INVITE_SEND_UNCONFIRMED', error: `已尝试发送，结果未确认，请人工核验，勿直接重试：${String(err?.message || err)}` });
+    }
+    return { ok: false, code: err?.code || 'PGY_INVITE_SEND_FAILED', error: `邀约发送前检查失败：${String(err?.message || err)}` };
+  } finally {
+    endPgyInviteOperation(operation);
   }
 });
 
@@ -4263,6 +4824,11 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
   const contactView = ensureXhsBrowserTab();
   const runDir = resolveInsideRuns(payload.runDir || '');
   if (!runDir) return { ok: false, error: '未选择有效运行结果' };
+  if (payload.jobId !== undefined && (typeof payload.jobId !== 'string'
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(payload.jobId))) {
+    return { ok: false, code: 'XHS_CONTACT_SCOPE_INVALID', error: '补采任务标识无效，请重新启动本次补采' };
+  }
+  const jobId = payload.jobId === undefined ? crypto.randomUUID() : payload.jobId;
 
   const seen = new Set();
   const rows = (Array.isArray(payload.rows) ? payload.rows : []).map((row) => ({
@@ -4283,6 +4849,8 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
   }
 
   xhsContactJob = {
+    runDir,
+    jobId,
     running: true,
     paused: false,
     pauseRequested: false,
@@ -4311,6 +4879,8 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
       if (preflight?.riskDetected) {
         return {
           ok: false,
+          runDir,
+          jobId,
           code: 'XHS_RISK_DETECTED',
           riskText: preflight.riskText || '安全验证',
           error: `小红书当前处于安全验证或访问频繁状态：${preflight.riskText || '请查看右侧页面'}。请勿继续重试，等待页面恢复后再检测登录。`
@@ -4325,12 +4895,12 @@ ipcMain.handle('contacts:enrichXhsBatch', async (_e, payload = {}) => {
       message: result.canceled ? '补采已安全停止，未处理达人不会继续' : '补采任务已完成',
       ...result
     });
-    return { ok: true, total: rows.length, ...result };
+    return { ok: true, total: rows.length, ...result, runDir, jobId };
   } catch (err) {
     const error = String(err?.message || err);
     xhsContactJob.phase = 'failed';
     emitXhsContactProgress({ type: 'failed', total: rows.length, error });
-    return { ok: false, error };
+    return { ok: false, error, runDir, jobId };
   } finally {
     resumeXhsContactJob(xhsContactJob.cancelRequested ? 'cancel' : 'resume');
     xhsContactJob.running = false;
@@ -5388,6 +5958,10 @@ async function extractPgySearchCandidates(options = {}) {
   if (!loadedCalibration.ok) return loadedCalibration;
   const calibration = loadedCalibration.calibration || {};
   try {
+    const rankOrigin = options?.rankOrigin || 'search_start';
+    if (!['search_start', 'current_page'].includes(rankOrigin)) {
+      return { ok: false, code: 'PGY_CANDIDATE_ORIGIN_INVALID', error: '读取起点无效，请重新执行指令。' };
+    }
     const startRank = Math.max(1, Math.min(
       MAX_CANDIDATE_RANK,
       Math.trunc(Number(options?.startRank || 1) || 1)
@@ -5414,6 +5988,7 @@ async function extractPgySearchCandidates(options = {}) {
     const responseResult = await readPgyCandidatesFromResponsePages({
       startRank,
       endRank,
+      rankOrigin,
       initialItems: [],
       commandWindow: pgyCandidateCommandWindow,
       calibration
@@ -5642,35 +6217,40 @@ ipcMain.handle('pgy:extractSearchCandidates', async (_e, options = {}) => {
   }
   const busy = rejectBrowserAutomationStart('读取蒲公英候选');
   if (busy) return busy;
-  ensureCollectionTabActive();
-  await ensurePgyCandidateResponseCapture(browserView?.webContents);
-  await closeCandidateCommandWindow();
-  const commandWindow = pgyCandidateResponseCache.beginCommandWindow({
-    sourceContext: currentCandidateSourceContext()
-  });
-  pgyCandidateCommandWindow = commandWindow;
+  const previousWindow = pgyCandidateCommandWindow;
+  let commandWindow = null;
   pgyCandidateReadRunning = true;
-  sendBrowserTabsSnapshot();
   let keepCommandWindow = false;
   let completedResult = null;
   try {
+    sendBrowserTabsSnapshot();
+    ensureCollectionTabActive();
+    await ensurePgyCandidateResponseCapture(browserView?.webContents);
+    if (previousWindow) await closeCandidateCommandWindow(previousWindow);
+    commandWindow = pgyCandidateResponseCache.beginCommandWindow({
+      sourceContext: currentCandidateSourceContext()
+    });
+    pgyCandidateCommandWindow = commandWindow;
     const result = await extractPgySearchCandidates(options);
     completedResult = result;
     keepCommandWindow = Boolean(result?.paused);
     return result;
   } finally {
-    if (!keepCommandWindow) {
-      await closeCandidateCommandWindow(commandWindow, {
-        preserveVerifiedSnapshot: Boolean(
-          completedResult?.ok
-          && !completedResult?.paused
-          && !completedResult?.stats?.stoppedForRisk
-        ),
-        calibration: loadCandidateSearchCalibration(options?.templatePath)?.calibration || {}
-      });
+    try {
+      if (commandWindow && !keepCommandWindow) {
+        await closeCandidateCommandWindow(commandWindow, {
+          preserveVerifiedSnapshot: Boolean(
+            completedResult?.ok
+            && !completedResult?.paused
+            && !completedResult?.stats?.stoppedForRisk
+          ),
+          calibration: loadCandidateSearchCalibration(options?.templatePath)?.calibration || {}
+        });
+      }
+    } finally {
+      pgyCandidateReadRunning = false;
+      sendBrowserTabsSnapshot();
     }
-    pgyCandidateReadRunning = false;
-    sendBrowserTabsSnapshot();
   }
 });
 
@@ -5685,20 +6265,20 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
       error: '已有其他网页自动化或录制操作正在进行，不能继续候选读取。'
     };
   }
-  ensureCollectionTabActive();
-  const validated = await validateCandidateCheckpointSession(sessionId);
-  if (!validated.ok) {
-    if (!pgyCandidateCheckpointSession) await closeCandidateCommandWindow();
-    return validated;
-  }
-  const session = validated.session;
-  pgyCandidateCommandWindow = session.commandWindow;
-  pgyCandidateCheckpointSession = null;
+  const session = pgyCandidateCheckpointSession;
   pgyCandidateReadRunning = true;
-  sendBrowserTabsSnapshot();
+  let resumed = false;
   let keepCommandWindow = false;
   let completedResult = null;
   try {
+    sendBrowserTabsSnapshot();
+    ensureCollectionTabActive();
+    const validated = await validateCandidateCheckpointSession(sessionId);
+    if (!validated.ok) return validated;
+    resumed = true;
+    pgyCandidateCommandWindow = session.commandWindow;
+    pgyCandidateCheckpointSession = null;
+    sendBrowserTabsSnapshot();
     const result = await readPgyCandidatesFromResponsePages({
       startRank: session.startRank,
       endRank: session.endRank,
@@ -5709,25 +6289,43 @@ ipcMain.handle('pgy:continueSearchCandidates', async (_e, sessionId) => {
     keepCommandWindow = Boolean(result?.paused);
     return { ...result, url: browserView.webContents.getURL() };
   } finally {
-    if (!keepCommandWindow) {
-      await closeCandidateCommandWindow(session.commandWindow, {
-        preserveVerifiedSnapshot: Boolean(
-          completedResult?.ok
-          && !completedResult?.paused
-          && !completedResult?.stats?.stoppedForRisk
-        ),
-        calibration: session.calibration || {}
-      });
+    try {
+      if (session?.commandWindow && !keepCommandWindow && (resumed || !pgyCandidateCheckpointSession)) {
+        await closeCandidateCommandWindow(session.commandWindow, {
+          preserveVerifiedSnapshot: Boolean(
+            completedResult?.ok
+            && !completedResult?.paused
+            && !completedResult?.stats?.stoppedForRisk
+          ),
+          calibration: session.calibration || {}
+        });
+      }
+    } finally {
+      pgyCandidateReadRunning = false;
+      sendBrowserTabsSnapshot();
     }
-    pgyCandidateReadRunning = false;
-    sendBrowserTabsSnapshot();
   }
 });
 
 ipcMain.handle('pgy:cancelSearchCandidateCheckpoint', async (_e, sessionId) => {
-  const result = await cancelCandidateCheckpointSession(sessionId);
-  if (!pgyCandidateCheckpointSession) await closeCandidateCommandWindow();
-  return result;
+  if (pgyCandidateReadRunning) {
+    return { ok: false, code: 'PGY_CANDIDATE_READ_RUNNING', error: '已有候选读取正在进行，请等待完成。' };
+  }
+  const session = pgyCandidateCheckpointSession;
+  pgyCandidateReadRunning = true;
+  try {
+    sendBrowserTabsSnapshot();
+    return await cancelCandidateCheckpointSession(sessionId);
+  } finally {
+    try {
+      if (session?.commandWindow && pgyCandidateCheckpointSession !== session) {
+        await closeCandidateCommandWindow(session.commandWindow);
+      }
+    } finally {
+      pgyCandidateReadRunning = false;
+      sendBrowserTabsSnapshot();
+    }
+  }
 });
 
 ipcMain.handle('pgy:parseCandidateInstruction', async (_e, instruction) => (
@@ -5777,7 +6375,7 @@ async function pgyExtractResourceDelta(webContents, tabKey, noteCardSelector) {
             const idTxt = idEl ? (idEl.innerText || idEl.textContent || '').trim() : '';
             if (idTxt) out.creator.xhs_id = idTxt;
             const profileHref = idEl ? String(idEl.href || idEl.getAttribute('href') || '').trim() : '';
-            if (/xiaohongshu\.com\/user\/profile\//i.test(profileHref)) {
+            if (/xiaohongshu\\.com\\/user\\/profile\\//i.test(profileHref)) {
               out.creator.xhs_profile_url = profileHref;
             }
           } catch (_) {}
@@ -6061,7 +6659,13 @@ async function pgyExtractResourceDelta(webContents, tabKey, noteCardSelector) {
       })()
     `;
     return await webContents.executeJavaScript(js, true);
-  } catch (_) {
+  } catch (error) {
+    if (!tabKey || tabKey === 'base' || error?.name === 'SyntaxError') {
+      const failure = new Error('达人基础信息读取失败，已阻止保存不可靠结果。');
+      failure.code = error?.name === 'SyntaxError'
+        ? 'PGY_RESOURCE_SCRIPT_INVALID' : 'PGY_RESOURCE_READ_FAILED';
+      throw failure;
+    }
     return { metrics: {}, creator: {}, notesTop: [] };
   }
 }
@@ -6206,8 +6810,13 @@ async function pgyExtractCurrentMultiPage(
   let noteCardSelector = String(template?.noteCardSelector || '').trim();
 
   const assertNoRiskPage = async (stage) => {
-    const risk = await pgyDetectRiskOnCurrentPage(targetWebContents);
-    if (risk?.ok && risk?.riskDetected) {
+    let risk;
+    try {
+      risk = await pgyDetectRiskOnCurrentPage(targetWebContents);
+    } catch (error) {
+      if (error?.riskDetected || error?.code === 'PGY_RISK_DETECTED') throw error;
+    }
+    if (risk?.riskDetected) {
       const err = new Error(`检测到页面可能触发安全验证/风控：${risk.riskText || '请在右侧手工确认后继续'}`);
       err.code = 'PGY_RISK_DETECTED';
       err.riskDetected = true;
@@ -6215,6 +6824,11 @@ async function pgyExtractCurrentMultiPage(
       err.riskStage = stage || '';
       err.url = risk.url || targetWebContents.getURL();
       throw err;
+    }
+    if (risk?.ok !== true) {
+      throw Object.assign(new Error('无法核实页面风控状态，已停止采集，请人工检查后继续'), {
+        code: 'PGY_SAFETY_CHECK_FAILED', riskStage: stage || '', url: targetWebContents.getURL()
+      });
     }
     return risk;
   };
@@ -6245,8 +6859,8 @@ async function pgyExtractCurrentMultiPage(
     });
 
     // 资源表 v1：额外抽取（缺失留空）
+    await assertNoRiskPage(`before_resource_delta:${pageName}`);
     try {
-      await assertNoRiskPage(`before_resource_delta:${pageName}`);
       const key = tabText ? String(tabText) : 'base';
       if (key.includes('笔记') && !noteCardSelector) {
         const s = await pgySuggestNoteCardSelectorForCurrentPage(targetWebContents);
@@ -6269,7 +6883,10 @@ async function pgyExtractCurrentMultiPage(
       if (key.includes('笔记') && Array.isArray(delta?.notesTop) && delta.notesTop.length) {
         notesTop10 = delta.notesTop.slice(0, 10);
       }
-    } catch (_) {}
+    } catch (error) {
+      if (error?.riskDetected || ['PGY_RISK_DETECTED', 'PGY_SAFETY_CHECK_FAILED'].includes(error?.code)) throw error;
+      if (['PGY_RESOURCE_SCRIPT_INVALID', 'PGY_RESOURCE_READ_FAILED'].includes(error?.code)) throw error;
+    }
 
     return extracted;
   };
@@ -6312,7 +6929,7 @@ async function pgyExtractCurrentMultiPage(
           );
           await assertNoRiskPage(`after_note_url_resolve:${tabText}`);
         } catch (err) {
-          if (err?.riskDetected || err?.code === 'PGY_RISK_DETECTED') throw err;
+          if (err?.riskDetected || ['PGY_RISK_DETECTED', 'PGY_SAFETY_CHECK_FAILED'].includes(err?.code)) throw err;
         }
       }
       Object.assign(mergedSummary, mergePreferNonEmpty(mergedSummary, r.creator_summary));
@@ -6803,6 +7420,11 @@ ipcMain.handle('template:clone', async (_e, srcPath, newName) => {
 // =========================
 // IPC：批量任务（start/pause/resume/stop/skipCurrent）
 // =========================
+ipcMain.handle('tasks:getState', async () => {
+  if (!taskRunner) return { ok: false, error: '任务服务尚未就绪，请重试' };
+  return { ok: true, state: taskRunner.getState() };
+});
+
 ipcMain.handle('tasks:start', async (_e, payload) => {
   if (!taskRunner) return { ok: false, error: 'taskRunner 未初始化' };
   if (pgyCandidateReadRunning || pgyCandidateCheckpointSession) {
@@ -7068,6 +7690,8 @@ function getResourceTableGroups(columns) {
 
 function normalizeSelectedColumns(selected, allColumns) {
   const all = Array.isArray(allColumns) ? allColumns : [];
+  if (selected == null) return all.slice();
+  if (!Array.isArray(selected)) throw new Error('导出列格式无效');
   const setAll = new Set(all);
   const sel = Array.isArray(selected) ? selected.map((x) => String(x)) : [];
   const out = [];
@@ -7078,7 +7702,8 @@ function normalizeSelectedColumns(selected, allColumns) {
     seen.add(c);
     out.push(c);
   }
-  return out.length ? out : all.slice();
+  if (!out.length) throw new Error('请至少选择 1 个有效导出列');
+  return out;
 }
 
 function getColumnPresetPath() {
@@ -7140,7 +7765,7 @@ function exportRunToExcel(runDir) {
   return { outPath, creators: creators.length, notes: notes.length, files: jsonFiles.length };
 }
 
-function exportRunToResourceXlsx(runDir, opts) {
+async function exportRunToResourceXlsx(runDir, opts) {
   const jsonFiles = findRawResultFiles(runDir);
   const results = [];
   for (const fp of jsonFiles) {
@@ -7152,6 +7777,8 @@ function exportRunToResourceXlsx(runDir, opts) {
 
   const allCols = getResourceTableColumns();
   const cols = normalizeSelectedColumns(opts?.selectedColumns, allCols);
+  if (!results.length) throw new Error('当前批次没有可导出的达人数据');
+  const firstValue = (...values) => values.map(cleanStr).find((value) => value !== '') || '';
 
   let creatorCount = 0;
   let noteCount = 0;
@@ -7169,8 +7796,14 @@ function exportRunToResourceXlsx(runDir, opts) {
     row['达人昵称'] = cleanStr(sum.creator_name || sum.name || '');
     row['小红书号'] = cleanStr(sum.xhs_id || sum.xhsId || '');
     row['达人主页'] = cleanStr(sum.creator_url || obj.creator_url || '');
-    row['标签'] = cleanStr(sum.tags || '');
-    row['地区'] = cleanStr(sum.location || sum.region || '');
+    row['标签'] = firstValue(sum.tags, metrics['内容标签']);
+    row['地区'] = firstValue(sum.location, sum.region, metrics['地区']);
+    row['粉丝数'] = firstValue(metrics['粉丝数'], metrics['粉丝'], metrics['粉丝量'], sum.followers);
+    row['图文笔记一口价'] = firstValue(metrics['图文笔记一口价'], metrics['图文报价'], sum.price_image);
+    row['视频笔记一口价'] = firstValue(metrics['视频笔记一口价'], metrics['视频报价'], sum.price_video);
+    row['曝光中位数'] = firstValue(metrics['曝光中位数'], metrics['近90天笔记曝光中位数']);
+    row['阅读中位数'] = firstValue(metrics['阅读中位数'], metrics['近90天笔记阅读中位数']);
+    row['互动中位数'] = firstValue(metrics['互动中位数'], metrics['近90天笔记互动中位数']);
 
     // 直接映射同名字段（从全量列名中映射，避免 selectedColumns 丢失字段名时无法赋值）
     for (const k of allCols) {
@@ -7181,9 +7814,9 @@ function exportRunToResourceXlsx(runDir, opts) {
     for (let i = 1; i <= 10; i++) {
       const n = top[i - 1] || {};
       row[`笔记${i}-标题`] = cleanStr(n['标题'] || n.title || '');
-      row[`笔记${i}-阅读`] = cleanStr(n['阅读'] || n.read || '');
-      row[`笔记${i}-点赞`] = cleanStr(n['点赞'] || n.like || '');
-      row[`笔记${i}-收藏`] = cleanStr(n['收藏'] || n.collect || '');
+      row[`笔记${i}-阅读`] = firstValue(n['阅读'], n.read);
+      row[`笔记${i}-点赞`] = firstValue(n['点赞'], n.like);
+      row[`笔记${i}-收藏`] = firstValue(n['收藏'], n.collect);
       row[`笔记${i}-发布时间`] = cleanStr(n['发布时间'] || n.date || '');
       row[`笔记${i}-含推广`] = cleanStr(n['含推广'] || n.promo || '');
       if (row[`笔记${i}-标题`]) noteCount += 1;
@@ -7198,15 +7831,14 @@ function exportRunToResourceXlsx(runDir, opts) {
   const outName = mode === 'slim' ? `媒介资源表_${base}_精简版.xlsx` : `媒介资源表_${base}.xlsx`;
   const outPath = path.join(runDir, outName);
 
-  // 1) 去掉“整列全为空”的列（用户选择 A 策略）
+  // Explicit selections survive even when a field was not collected.
+  const emptyColumns = cols.filter((c) => !rows.some((r) => (
+    r[c] !== undefined && r[c] !== null && String(r[c]).trim() !== ''
+  )));
   const alwaysKeep = new Set(['平台', '达人昵称', '小红书号', '达人主页']);
-  const finalCols = cols.filter((c) => {
-    if (alwaysKeep.has(c)) return true;
-    return rows.some((r) => {
-      const v = r[c];
-      return v !== undefined && v !== null && String(v).trim() !== '';
-    });
-  });
+  const finalCols = Array.isArray(opts?.selectedColumns)
+    ? cols
+    : cols.filter((c) => alwaysKeep.has(c) || !emptyColumns.includes(c));
 
   // 2) 导出美化（优先 ExcelJS；若依赖缺失则回退到 SheetJS）
   if (ExcelJS) {
@@ -7283,8 +7915,8 @@ function exportRunToResourceXlsx(runDir, opts) {
       to: { row: 1, column: finalCols.length }
     };
 
-    wb.xlsx.writeFile(outPath);
-    return { outPath, creators: creatorCount, notesTop: noteCount, files: jsonFiles.length, droppedCols: cols.length - finalCols.length, selectedCols: cols.length };
+    await wb.xlsx.writeFile(outPath);
+    return { outPath, creators: creatorCount, notesTop: noteCount, files: jsonFiles.length, droppedCols: cols.length - finalCols.length, selectedCols: cols.length, exportedCols: finalCols.length, emptyColumns };
   }
 
   // fallback: SheetJS（无样式，但至少列减少）
@@ -7294,7 +7926,7 @@ function exportRunToResourceXlsx(runDir, opts) {
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   XLSX.utils.book_append_sheet(wb, ws, '媒介资源表');
   XLSX.writeFile(wb, outPath);
-  return { outPath, creators: creatorCount, notesTop: noteCount, files: jsonFiles.length, droppedCols: cols.length - finalCols.length, selectedCols: cols.length };
+  return { outPath, creators: creatorCount, notesTop: noteCount, files: jsonFiles.length, droppedCols: cols.length - finalCols.length, selectedCols: cols.length, exportedCols: finalCols.length, emptyColumns };
 }
 
 ipcMain.handle('exports:getResourceColumns', async () => {
@@ -7362,7 +7994,7 @@ ipcMain.handle('exports:exportResourceRun', async (_e, payload) => {
     const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
     const pick = runDir || (listRunDirs()[0]?.path || '');
     if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
-    const r = exportRunToResourceXlsx(pick, {
+    const r = await exportRunToResourceXlsx(pick, {
       selectedColumns: payload?.selectedColumns,
       mode: payload?.mode || 'full'
     });
@@ -7461,32 +8093,79 @@ ipcMain.handle('exports:getContactPreview', async (_e, payload) => {
   }
 });
 
+function feishuJournalPath() {
+  const dir = path.join(app.getPath('userData'), 'feishu_sync');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'test-records.json');
+}
+
+const feishuWorkbench = createFeishuWorkbench({
+  connectionStore: createFeishuConnectionStore({ file: path.join(app.getPath('userData'), 'feishu_sync', 'connection.bin'), safeStorage }),
+  maintainerStore: createFeishuMaintainerStore({ file: path.join(app.getPath('userData'), 'feishu_sync', 'maintainer.bin'), safeStorage }),
+  getRow: async (runDir, rowId) => {
+    const pick = resolveInsideRuns(runDir);
+    const review = loadContactReview(getContactReviewsDir(), pick);
+    return getContactPreview(pick, { reviewRows: review.reviewRows }).rows?.find(r => r.rowId === rowId);
+  },
+  loadJournal: () => {
+    const file = feishuJournalPath();
+    if (!fs.existsSync(file)) return { version: 1, entries: [] };
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (j?.version !== 1 || !Array.isArray(j.entries)) throw new Error('invalid journal');
+    return j;
+  },
+  saveJournal: journal => {
+    const file = feishuJournalPath();
+    const temp = `${file}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(journal), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temp, file);
+  }
+});
+
+for (const method of ['connect', 'status', 'clear', 'lookup', 'applyContact', 'listRecords', 'archiveDeletedRecords', 'prepareManualCleanup', 'prepare', 'execute', 'reconcile', 'verifyOwnedAbsence', 'searchMaintainers', 'inspectOperator', 'refreshOperator', 'restoreConnection', 'disconnect', 'forgetConnection']) {
+  ipcMain.handle(`feishu:${method}`, async (event, payload) => {
+    // Only the main renderer, never the PGY browser, a child frame or another window.
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+      || event.senderFrame !== mainWindow.webContents.mainFrame) return { ok: false, code: 'FEISHU_SENDER_REJECTED' };
+    try {
+      if (method === 'clear') { feishuWorkbench.clear(); return { ok: true }; }
+      return await feishuWorkbench[method](payload);
+    } catch (e) { return feishuSafeError(e); }
+  });
+}
+
 ipcMain.handle('exports:loadContactReview', async (_e, payload) => {
   try {
-    const runDirRaw = payload?.runDir || '';
+    const runDirRaw = payload?.runDir ?? '';
+    if (typeof runDirRaw !== 'string') return { ok: false, code: 'CONTACT_REVIEW_RUN_INVALID', error: '复核批次无效，请重新选择结果' };
     const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    if (runDirRaw && !runDir) return { ok: false, code: 'CONTACT_REVIEW_RUN_INVALID', error: '复核批次无效，请重新选择结果' };
     const pick = runDir || (listRunDirs()[0]?.path || '');
     if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
     const r = loadContactReview(getContactReviewsDir(), pick);
-    return { ok: true, runDir: pick, ...r };
-  } catch (err) {
-    return { ok: false, error: String(err?.message || err) };
+    return { ok: true, ...r, runDir: pick };
+  } catch (_) {
+    return { ok: false, code: 'CONTACT_REVIEW_READ_FAILED', error: '复核文件读取失败，未覆盖原文件；请检查文件或从备份恢复后重试' };
   }
 });
 
 ipcMain.handle('exports:saveContactReview', async (_e, payload) => {
   try {
-    const runDirRaw = payload?.runDir || '';
+    const runDirRaw = payload?.runDir ?? '';
+    if (typeof runDirRaw !== 'string') return { ok: false, code: 'CONTACT_REVIEW_RUN_INVALID', error: '复核批次无效，请重新选择结果' };
     const runDir = runDirRaw ? resolveInsideRuns(runDirRaw) : null;
+    if (runDirRaw && !runDir) return { ok: false, code: 'CONTACT_REVIEW_RUN_INVALID', error: '复核批次无效，请重新选择结果' };
     const pick = runDir || (listRunDirs()[0]?.path || '');
     if (!pick) return { ok: false, error: '未找到 runs 目录或 run_* 目录为空' };
     const r = saveContactReview(getContactReviewsDir(), pick, {
       reviewRows: payload?.reviewRows,
       settings: payload?.settings
     });
-    return { ok: true, runDir: pick, ...r };
+    return { ok: true, ...r, runDir: pick };
   } catch (err) {
-    return { ok: false, error: String(err?.message || err) };
+    const unreadable = err?.code === 'CONTACT_REVIEW_READ_FAILED';
+    return { ok: false, code: unreadable ? 'CONTACT_REVIEW_READ_FAILED' : 'CONTACT_REVIEW_SAVE_FAILED',
+      error: unreadable ? '原复核文件不可读取，已阻止覆盖；请检查文件或从备份恢复后重试' : '复核文件保存未完成，请检查磁盘空间或文件权限后重试' };
   }
 });
 
@@ -7861,9 +8540,13 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
-    if (process.platform === 'win32') app.setAppUserModelId('com.solo.contentanalyzer');
+    if (process.platform === 'win32') app.setAppUserModelId(qaRuntime.active ? qaRuntime.appId : 'com.solo.contentanalyzer');
     ensureDefaultTemplateInUserData();
     createMainWindow();
+    if (qaRuntime.active) {
+      mainWindow.on('page-title-updated', event => event.preventDefault());
+      mainWindow.setTitle('PGY Workbench QA · 并存测试版');
+    }
     startBackendIfNeeded();
 
     app.on('activate', () => {
@@ -7872,9 +8555,27 @@ if (hasSingleInstanceLock) {
   });
 }
 
-app.on('before-quit', stopBackend);
+// Keep the operator window available when cleanup fails so Exit can retry.
+app.on('browser-window-created', (_event, window) => {
+  window.on('close', event => {
+    if (window === mainWindow && backendProc) { event.preventDefault(); app.quit(); }
+  });
+});
+let backendQuitPending = false;
+app.on('before-quit', event => {
+  if (!backendProc) return;
+  event.preventDefault();
+  if (backendQuitPending) return;
+  backendQuitPending = true;
+  stopBackend().then(result => {
+    backendQuitPending = false;
+    if (result.ok) app.quit();
+    else dialog.showErrorBox('服务尚未退出', '本次服务停止失败，清理句柄已保留。请再次退出重试；不要启动另一实例或手动结束未知进程。');
+  });
+});
+app.on('before-quit', () => feishuWorkbench.clear());
 
 app.on('window-all-closed', () => {
-  stopBackend();
   if (process.platform !== 'darwin') app.quit();
+  else stopBackend();
 });

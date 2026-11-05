@@ -7,9 +7,12 @@ const {
   buildPgyInvitePrepareScript,
   buildPgyInviteSendScript,
   isAllowedPgyInviteNavigationUrl,
+  normalizePgyInviteComparableText,
+  normalizePgyInviteDateValue,
   normalizePgyInviteFormUrl,
   normalizePgyInviteTemplate,
   normalizePgyInviteCreatorUrl,
+  pgyInviteFieldValuesEqual,
   resolveInviteTargetFromRows,
   validatePgyInviteTemplate
 } = require('../lib/pgy_invite');
@@ -36,10 +39,13 @@ assert.match(mainSource, /ipcMain\.handle\('invites:prepare'/);
 assert.match(mainSource, /ipcMain\.handle\('invites:sendPrepared'/);
 assert.match(mainSource, /resolveInsideRuns\(payload\?\.runDir/);
 assert.match(mainSource, /resolveInviteTargetFromRows\(preview\?\.rows, payload\?\.rowId\)/);
-assert.match(mainSource, /activateBrowserTab\(PGY_INVITE_TAB_ID\)/);
-assert.match(mainSource, /await inviteView\.webContents\.loadURL\(url\);\s*activateBrowserTab\(PGY_INVITE_TAB_ID, \{ force: true \}\)/);
+assert.match(mainSource, /activateBrowserTab\(PGY_INVITE_TAB_ID, \{ force: true \}\)/);
+const openCreatorSource = mainSource.slice(mainSource.indexOf("ipcMain.handle('invites:openCreator'"), mainSource.indexOf("ipcMain.handle('invites:prepare'"));
+assert.match(openCreatorSource, /await loadPgyInviteOperationUrl\(operation, url, 'creator'\);/);
+assert.match(openCreatorSource, /else if \(inviteView\.webContents\.isLoadingMainFrame\(\)\)/);
+assert.match(openCreatorSource, /}\s*assertPgyInviteContext\(operation\);\s*activateBrowserTab\(PGY_INVITE_TAB_ID, \{ force: true \}\)/);
 assert.match(mainSource, /PGY_INVITE_ADDRESS_READ_ONLY/);
-assert.match(mainSource, /tabId === PGY_INVITE_TAB_ID && !isAllowedPgyInviteNavigationUrl\(url\)/);
+assert.match(mainSource, /tabId === PGY_INVITE_TAB_ID && \(!isAllowedPgyInviteNavigationUrl\(url\) \|\| !permitsPgyInviteNavigation\(webContents, url\)\)/);
 
 assert.strictEqual(
   normalizePgyInviteCreatorUrl('https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/ABC123?source=list'),
@@ -51,6 +57,16 @@ assert.strictEqual(normalizePgyInviteCreatorUrl('https://pgy.xiaohongshu.com/sol
 assert.strictEqual(isAllowedPgyInviteNavigationUrl('https://pgy.xiaohongshu.com/login'), true);
 assert.strictEqual(isAllowedPgyInviteNavigationUrl('http://pgy.xiaohongshu.com/login'), false);
 assert.strictEqual(isAllowedPgyInviteNavigationUrl('https://www.xiaohongshu.com/login'), false);
+assert.strictEqual(normalizePgyInviteComparableText('  图 拉 斯  '), '图 拉 斯');
+assert.strictEqual(normalizePgyInviteDateValue('2026/9/8'), '2026-09-08');
+assert.strictEqual(normalizePgyInviteDateValue('2026年09月08日'), '2026-09-08');
+assert.strictEqual(normalizePgyInviteDateValue('2026-02-30'), '');
+assert.strictEqual(normalizePgyInviteDateValue('2026-09-08 to 2026-09-09'), '');
+assert.strictEqual(pgyInviteFieldValuesEqual('开始日期', '2026-09-08', '2026/9/8'), true);
+assert.strictEqual(pgyInviteFieldValuesEqual('结束日期', '2026-10-31', '2026年10月31日'), true);
+assert.strictEqual(pgyInviteFieldValuesEqual('结束日期', '2026-10-31', '2026-11-01'), false);
+assert.strictEqual(pgyInviteFieldValuesEqual('产品名称', '手机壳', '手机 壳'), false);
+assert.strictEqual(pgyInviteFieldValuesEqual('合作内容介绍', 'line one\nline two', 'line one line two'), false);
 assert.strictEqual(
   normalizePgyInviteFormUrl('https://pgy.xiaohongshu.com/solar/pre-trade/invite-form?id=ABC12345&trackId=discarded'),
   'https://pgy.xiaohongshu.com/solar/pre-trade/invite-form?id=ABC12345'
@@ -121,15 +137,21 @@ assert.match(buildPgyInvitePrepareScript(completeTemplate), /visibleAncestor\(br
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /centerPoint\(brandInput\)[\s\S]*?centerPoint\(brandHintNode\)[\s\S]*?pointRightOfLabel\(brandLabelNode, 130\)[\s\S]*?centerPoint\(brandTrigger \|\| brandContainer\)/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /type: 'open-brand-picker'[\s\S]*?value: template\.brandName/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /optionPoint[\s\S]*?type: 'select-brand'/);
-assert.match(buildPgyInvitePrepareScript(completeTemplate), /selectedBrandNode/);
+assert.match(buildPgyInvitePrepareScript(completeTemplate), /readBrandState\(brandContainer\)/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /brandSearchHint \? brandInput : null/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /fieldRightOfLabel\(root, brandLabelNode\)/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /setFieldValue\(searchInput, template\.brandName, \{ blur: false \}\)/);
+assert.match(buildPgyInvitePrepareScript(completeTemplate), /readBrandState/);
+assert.match(buildPgyInvitePrepareScript(completeTemplate), /dateInputs\.length === 2/);
+assert.match(buildPgyInvitePrepareScript(completeTemplate), /pgyInviteFieldValuesEqual/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /合作内容介绍/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /querySelectorAll\('button'\)[\s\S]*?发起邀约/);
 assert.match(buildPgyInvitePrepareScript(completeTemplate), /finalButton\.scrollIntoView\(\{ block: 'center', inline: 'nearest' \}\)/);
 assert.match(buildPgyInviteSendScript(completeTemplate), /verifyPreparedPgyInviteInPage/);
 assert.match(buildPgyInviteSendScript(completeTemplate), /PGY_INVITE_FORM_CHANGED/);
+assert.match(buildPgyInviteSendScript(completeTemplate), /detailFieldResults\(root, template\)/);
+assert.match(buildPgyInviteSendScript(completeTemplate), /PGY_INVITE_FIELD_UNREADABLE/);
+assert.match(buildPgyInviteSendScript(completeTemplate), /pgyInviteFieldValuesEqual/);
 assert.match(buildPgyInviteOutcomeScript(), /inspectPgyInviteOutcomeInPage/);
 assert.doesNotThrow(() => new Function(`return ${buildPgyInviteEntryInspectScript(completeTemplate)};`));
 assert.doesNotThrow(() => new Function(`return ${buildPgyInvitePrepareScript(completeTemplate)};`));
@@ -165,9 +187,9 @@ assert.match(mainSource, /draft\.fingerprint !== String\(payload\?\.fingerprint/
 assert.match(mainSource, /Date\.now\(\) > draft\.expiresAt/);
 assert.match(mainSource, /currentUrl !== target\.creatorUrl/);
 assert.match(mainSource, /targetUrlDeadline = Date\.now\(\) \+ 8000/);
-assert.match(mainSource, /if \(currentUrl === target\.creatorUrl\) break/);
-assert.match(mainSource, /drivePgyInviteToDetailForm\(inviteView, template\)/);
-assert.match(mainSource, /preparePgyInviteDetailForm\(inviteView, template\)/);
+assert.match(mainSource, /if \(currentUrl === target\.creatorUrl && !inviteView\.webContents\.isLoadingMainFrame\(\)\) break/);
+assert.match(mainSource, /drivePgyInviteToDetailForm\(inviteView, template, operation\)/);
+assert.match(mainSource, /preparePgyInviteDetailForm\(inviteView, template, operation\)/);
 assert.match(mainSource, /retryableEntryCodes\.has\(lastResult\?\.code\)[\s\S]*?await sleep\(250\)[\s\S]*?continue/);
 assert.match(mainSource, /PGY_INVITE_ENTRY_ACTION_NOT_FOUND/);
 assert.match(mainSource, /PGY_INVITE_ENTRY_ACTION_DISABLED/);
@@ -183,10 +205,12 @@ assert.match(mainSource, /webContents\.insertText\(text\)/);
 assert.doesNotMatch(mainSource, /keyCode: 'A', modifiers/);
 assert.match(mainSource, /lastResult\.action\.type === 'open-brand-picker'[\s\S]*?focusPgyInviteFieldAtPoint[\s\S]*?sendTrustedPgyInviteText/);
 assert.match(mainSource, /lastResult\.missingFields\.length === 0[\s\S]*?lastResult\?\.finalAction\?\.found[\s\S]*?await sleep\(350\)[\s\S]*?continue/);
-assert.match(mainSource, /currentCreatorUrl !== url\) await inviteView\.webContents\.loadURL\(url\)/);
-assert.match(mainSource, /settleDeadline = Date\.now\(\) \+ 3000[\s\S]*?normalizePgyInviteCreatorUrl[\s\S]*?return successResult\(\)/);
+assert.match(mainSource, /currentCreatorUrl !== url \|\| !hasPgyInviteCreatorDocument\(inviteView.webContents, url\)\) \{\s*await loadPgyInviteOperationUrl\(operation, url, 'creator'\)/);
+assert.match(mainSource, /await settlePgyInviteNavigation\(operation, deadline\)/);
+assert.match(mainSource, /permit\.settlingKey = pgyInviteNavigationKey\(url\)/);
+assert.doesNotMatch(mainSource, /settleDeadline[\s\S]*?return successResult\(\)/);
 assert.match(mainSource, /currentUrl !== draft\.formUrl/);
-assert.match(mainSource, /sendTrustedPgyInviteClick\(inviteView\.webContents, verified\.finalAction\.point\)/);
-assert.match(mainSource, /pgyInvitePreparedDraft = null;\s*try \{\s*activateBrowserTab\(PGY_INVITE_TAB_ID/);
+assert.match(mainSource, /sendTrustedPgyInviteClick\(inviteView\.webContents, verified\.finalAction\.point, \{/);
+assert.match(mainSource, /pgyInvitePreparedDraft = null;\s*const operation = beginPgyInviteOperation\('send', inviteView\);/);
 
 console.log('pgy_invite_account_isolation.test.js passed');

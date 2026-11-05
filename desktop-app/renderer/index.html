@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>小红书相关信息采集工具</title>
     <link rel="stylesheet" href="./app.css" />
+    <link rel="stylesheet" href="./workbench.css" />
+    <link rel="stylesheet" href="./native-workbench.css" />
   </head>
   <body>
     <div id="app">
@@ -13,11 +15,11 @@
         <!-- 左侧：任务工作台 UI -->
         <div id="console">
           <aside id="sidebar"></aside>
-          <div id="splitterSidebar" class="splitter" title="拖动调整侧边栏宽度"></div>
+          <div id="splitterSidebar" class="splitter" role="separator" aria-label="调整侧边栏宽度" aria-orientation="vertical" tabindex="0" title="拖动调整侧边栏宽度；双击恢复默认"></div>
           <section id="content"></section>
         </div>
 
-        <div id="splitterMain" class="splitter" title="拖动调整左右区域宽度"></div>
+        <div id="splitterMain" class="splitter" role="separator" aria-label="调整工作台与网页区域宽度" aria-orientation="vertical" tabindex="0" title="拖动调整左右区域宽度；双击恢复默认"></div>
 
         <!-- 右侧：网页操作区由主进程内嵌渲染在这块区域 -->
         <div id="browserHost">
@@ -30,39 +32,9 @@
       </div>
     </div>
 
-    <script>
-      (function () {
-        function renderErr(err) {
-          try {
-            var host = document.getElementById('console') || document.body;
-            var box = document.createElement('div');
-            box.style.margin = '12px';
-            box.style.padding = '12px';
-            box.style.borderRadius = '12px';
-            box.style.border = '1px solid rgba(255,123,114,0.35)';
-            box.style.background = 'rgba(255,123,114,0.10)';
-            box.style.color = '#ff7b72';
-            box.style.fontSize = '13px';
-            box.style.whiteSpace = 'pre-wrap';
-            var msg =
-              (err && (err.stack || err.message)) ? (err.stack || err.message) : String(err || 'unknown error');
-            box.textContent =
-              'UI 启动失败（app.js 执行异常）。\\n\\n' +
-              msg +
-              '\\n\\n建议：\\n' +
-              '1) 关闭应用后重新 npm run dev\\n' +
-              '2) 在 desktop-app 目录执行 npm install\\n' +
-              '3) 把终端输出最后 30 行发我';
-            host.prepend(box);
-          } catch (_) {}
-        }
-        window.addEventListener('error', function (e) { renderErr(e.error || e.message); }, true);
-        window.addEventListener('unhandledrejection', function (e) { renderErr(e.reason); }, true);
-        window.__renderAppError = renderErr;
-      })();
-    </script>
+    <script src="./runtime_errors.js"></script>
     <script type="module">
-      import('./app.js').catch((err) => (window.__renderAppError ? window.__renderAppError(err) : null));
+      import('./app.js').catch((err) => (window.__renderAppError ? window.__renderAppError(err, true) : null));
     </script>
   </body>
 </html>

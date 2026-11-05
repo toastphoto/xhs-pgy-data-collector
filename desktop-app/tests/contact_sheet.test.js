@@ -460,6 +460,38 @@ assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达�
 assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人一').contactCollectionError, '公开资料区域尚未出现');
 assert.strictEqual(migratedPreview.rows.find((row) => row.creatorName === '达人二').email, '');
 
+const rawReview = {
+  rowId: legacyTarget.rowId,
+  contactRaw: '  fixture contact\nsecond line  ',
+  contactRawSource: 'fixture source',
+  contactRawCollectedAt: '2026-10-13T00:00:00.000Z',
+  feishuAccountNumber: 'fixture_account'
+};
+const rawPreview = getContactPreview(collisionRunDir, { reviewRows: [rawReview] });
+const rawTarget = rawPreview.rows.find(row => row.rowId === legacyTarget.rowId);
+const { buildContactRowsFromPreviewRows, CONTACT_COLUMNS } = require('../lib/contact_sheet');
+const rawWorkbookRows = buildContactRowsFromPreviewRows([rawTarget]);
+assert.strictEqual(rawWorkbookRows.contactRows[0]['未分类联系方式'], rawReview.contactRaw);
+assert.strictEqual(rawWorkbookRows.contactRows[0]['联系方式原值来源'], rawReview.contactRawSource);
+assert.strictEqual(rawWorkbookRows.contactRows[0]['联系方式原值补录时间'], rawReview.contactRawCollectedAt);
+assert.ok(CONTACT_COLUMNS.includes('未分类联系方式'));
+const rawExported = exportContactRowsWorkbook(collisionRunDir, [rawTarget], { suffix: 'raw-fixture' });
+const rawBook = XLSX.readFile(rawExported.outPath);
+const rawReadback = XLSX.utils.sheet_to_json(rawBook.Sheets['建联表']);
+assert.strictEqual(rawReadback[0]['未分类联系方式'], rawReview.contactRaw);
+assert.strictEqual(rawReadback[0]['联系方式原值来源'], rawReview.contactRawSource);
+assert.strictEqual(rawReadback[0]['联系方式原值补录时间'], rawReview.contactRawCollectedAt);
+for (const field of ['contactRaw', 'contactRawSource', 'contactRawCollectedAt', 'feishuAccountNumber']) {
+  assert.strictEqual(rawTarget[field], rawReview[field], `preview must retain ${field}`);
+}
+assert.strictEqual(rawPreview.rows.find(row => row.rowId !== legacyTarget.rowId).contactRaw, '');
+const { contactApplicationPatch } = require('../lib/feishu_contact_workflow');
+assert.throws(() => contactApplicationPatch(
+  { kind: 'unclassified', value: 'different fixture contact', recordId: '123' },
+  'unclassified', rawTarget,
+  { projectKey: 'fixture_project', workItemTypeKey: 'fixture_type', account: 'fixture_account', checkedAt: rawReview.contactRawCollectedAt }
+), error => error.code === 'FEISHU_LOCAL_CONFLICT', 'fresh preview cannot hide an existing raw conflict');
+
 assert.strictEqual(timestampForFilename(new Date(2026, 5, 30, 9, 8, 7)), '20260630-090807');
 
 console.log('contact_sheet.test.js OK');

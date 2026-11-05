@@ -64,3 +64,22 @@ assert.strictEqual(loaded.reviewRows[0].followupStatus, '不建联');
 assert.strictEqual(loaded.settings.defaultGreeting, 'hello');
 
 console.log('contact_review_store.test.js OK');
+
+require('node:test').test('raw contact: review save/load roundtrip preserves multiline value, provenance and typed fields', () => {
+  const value = '001234\n代理备注  双空格\t原值';
+  const row = { rowId: 'raw-row', contactRaw: value, contactRawSource: '飞书项目 / project/creator / 5',
+    contactRawCollectedAt: '2026-10-13T00:00:00.000Z', email: 'manual@example.test', wechatId: 'manual_wechat', phone: '123456789' };
+  const savedRaw = saveContactReview(tmp, 'raw-roundtrip', { reviewRows: [row] });
+  const restored = loadContactReview(tmp, 'raw-roundtrip').reviewRows[0];
+  assert.strictEqual(savedRaw.reviewRows[0].contactRaw, value); assert.strictEqual(restored.contactRaw, value);
+  assert.strictEqual(restored.contactRawSource, row.contactRawSource); assert.strictEqual(restored.contactRawCollectedAt, row.contactRawCollectedAt);
+  assert.strictEqual(restored.wechatId, row.wechatId); assert.strictEqual(restored.email, row.email); assert.strictEqual(restored.phone, row.phone);
+});
+require('node:test').test('raw contact: invalid raw shapes cannot replace a previously saved review', () => {
+  saveContactReview(tmp, 'raw-protected', { reviewRows: [{ rowId: 'raw-row', contactRaw: 'original', contactRawSource: 'fixture source' }] });
+  const file = getReviewPath(tmp, 'raw-protected'), before = fs.readFileSync(file, 'utf8');
+  for (const contactRaw of [{}, ['value'], 123, 'x\u0000y', 'x'.repeat(4097)]) {
+    assert.throws(() => saveContactReview(tmp, 'raw-protected', { reviewRows: [{ rowId: 'raw-row', contactRaw }] }));
+    assert.strictEqual(fs.readFileSync(file, 'utf8'), before);
+  }
+});

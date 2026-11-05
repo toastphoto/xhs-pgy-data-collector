@@ -27,5 +27,12 @@ tabs.close(XHS_TAB_ID);
 tabs.close(PGY_INVITE_TAB_ID);
 assert.strictEqual(tabs.activeId, COLLECTION_TAB_ID);
 assert.deepStrictEqual(tabs.list().map((tab) => tab.id), [COLLECTION_TAB_ID, AUTOMATION_TAB_ID]);
+assert.throws(() => tabs.close(AUTOMATION_TAB_ID), /cannot be closed/);
+tabs.activate(AUTOMATION_TAB_ID);
+tabs.discard(AUTOMATION_TAB_ID);
+assert.strictEqual(tabs.activeId, COLLECTION_TAB_ID);
+assert.strictEqual(tabs.has(AUTOMATION_TAB_ID), false);
+tabs.add({ id: AUTOMATION_TAB_ID, closable: false });
+assert.throws(() => tabs.close(AUTOMATION_TAB_ID), /cannot be closed/);
 
 console.log('browser_tab_registry.test.js passed');

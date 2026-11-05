@@ -6,6 +6,14 @@ function rowIdOf(element) {
   return text(element?.dataset?.reviewRowId);
 }
 
+function contentTopOf(container, item) {
+  if (container?.getBoundingClientRect && item?.getBoundingClientRect) {
+    return item.getBoundingClientRect().top - container.getBoundingClientRect().top
+      - (Number(container.clientTop) || 0) + (Number(container.scrollTop) || 0);
+  }
+  return Number(item?.offsetTop) || 0;
+}
+
 export function buildReviewViewportKey({ runDir = '', filters = {} } = {}) {
   const normalized = {
     runDir: text(runDir),
@@ -23,7 +31,7 @@ export function captureReviewViewport(container, { activeRowId = '' } = {}) {
   const scrollTop = Math.max(0, Number(container?.scrollTop) || 0);
   const cards = Array.from(container?.children || []).filter((item) => rowIdOf(item));
   const anchor = cards.find((item) => {
-    const top = Number(item.offsetTop) || 0;
+    const top = contentTopOf(container, item);
     const height = Math.max(0, Number(item.offsetHeight) || 0);
     return top + height > scrollTop;
   }) || cards[0] || null;
@@ -31,7 +39,7 @@ export function captureReviewViewport(container, { activeRowId = '' } = {}) {
   return {
     scrollTop,
     anchorRowId: rowIdOf(anchor),
-    anchorOffset: anchor ? (Number(anchor.offsetTop) || 0) - scrollTop : 0,
+    anchorOffset: anchor ? contentTopOf(container, anchor) - scrollTop : 0,
     activeRowId: text(activeRowId)
   };
 }
@@ -44,7 +52,7 @@ export function restoreReviewViewport(container, state = {}) {
     ? cards.find((item) => rowIdOf(item) === anchorRowId)
     : null;
   const requested = anchor
-    ? (Number(anchor.offsetTop) || 0) - (Number(state.anchorOffset) || 0)
+    ? contentTopOf(container, anchor) - (Number(state.anchorOffset) || 0)
     : Math.max(0, Number(state.scrollTop) || 0);
   const maxScroll = Math.max(0, (Number(container.scrollHeight) || 0) - (Number(container.clientHeight) || 0));
   const restored = Math.max(0, Math.min(requested, maxScroll));

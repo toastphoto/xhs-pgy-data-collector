@@ -5,6 +5,26 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     info: () => ipcRenderer.invoke('app:info'),
     focusRenderer: () => ipcRenderer.invoke('app:focusRenderer')
   },
+  feishu: {
+    connect: payload => ipcRenderer.invoke('feishu:connect', payload),
+    status: () => ipcRenderer.invoke('feishu:status'),
+    restoreConnection: payload => ipcRenderer.invoke('feishu:restoreConnection', payload),
+    disconnect: () => ipcRenderer.invoke('feishu:disconnect'),
+    forgetConnection: () => ipcRenderer.invoke('feishu:forgetConnection'),
+    searchMaintainers: (payload) => ipcRenderer.invoke('feishu:searchMaintainers', payload),
+    inspectOperator: (payload) => ipcRenderer.invoke('feishu:inspectOperator', payload),
+    refreshOperator: payload => ipcRenderer.invoke('feishu:refreshOperator', payload),
+    clear: () => ipcRenderer.invoke('feishu:clear'),
+    lookup: payload => ipcRenderer.invoke('feishu:lookup', payload),
+    applyContact: payload => ipcRenderer.invoke('feishu:applyContact', payload),
+    listRecords: () => ipcRenderer.invoke('feishu:listRecords'),
+    archiveDeletedRecords: payload => ipcRenderer.invoke('feishu:archiveDeletedRecords', payload),
+    prepareManualCleanup: payload => ipcRenderer.invoke('feishu:prepareManualCleanup', payload),
+    prepare: payload => ipcRenderer.invoke('feishu:prepare', payload),
+    execute: payload => ipcRenderer.invoke('feishu:execute', payload),
+    reconcile: payload => ipcRenderer.invoke('feishu:reconcile', payload),
+    verifyOwnedAbsence: payload => ipcRenderer.invoke('feishu:verifyOwnedAbsence', payload)
+  },
   backend: {
     info: () => ipcRenderer.invoke('backend:info'),
     onStatus: (cb) => ipcRenderer.on('backend:status', (_e, payload) => cb(payload))
@@ -58,6 +78,7 @@ contextBridge.exposeInMainWorld('desktopAPI', {
     clone: (srcPath, newName) => ipcRenderer.invoke('template:clone', srcPath, newName)
   },
   tasks: {
+    getState: () => ipcRenderer.invoke('tasks:getState'),
     start: (payload) => ipcRenderer.invoke('tasks:start', payload),
     recover: (runDir) => ipcRenderer.invoke('tasks:recover', runDir),
     pause: () => ipcRenderer.invoke('tasks:pause'),

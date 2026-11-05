@@ -35,6 +35,32 @@ function isAllowedPgyInviteNavigationUrl(value) {
   }
 }
 
+function normalizePgyInviteComparableText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizePgyInviteDateValue(value) {
+  const text = normalizePgyInviteComparableText(value);
+  const match = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/)
+    || text.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日$/);
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return '';
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function pgyInviteFieldValuesEqual(label, expected, actual) {
+  if (label === '开始日期' || label === '结束日期') {
+    const expectedDate = normalizePgyInviteDateValue(expected);
+    const actualDate = normalizePgyInviteDateValue(actual);
+    return Boolean(expectedDate && actualDate && expectedDate === actualDate);
+  }
+  return String(actual || '').trim() === String(expected || '').trim();
+}
+
 function resolveInviteTargetFromRows(rows, rowId) {
   const safeRowId = String(rowId || '').trim();
   if (!safeRowId || !Array.isArray(rows)) return null;
@@ -91,10 +117,19 @@ function validatePgyInviteTemplate(value = {}) {
 
 function pageInviteHelpers() {
   const textOf = (node) => String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
+  // Reading fields must survive scrolling, while clicks still require viewport visibility.
+  const isRendered = (node) => {
+    if (!node?.isConnected || node.matches?.('input[type="hidden"]')) return false;
+    for (let current = node; current; current = current.parentElement) {
+      const style = window.getComputedStyle(current);
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true'
+        || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
   const isVisible = (node) => {
-    if (!node || !node.isConnected) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    if (!isRendered(node)) return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0
       && rect.right > 0 && rect.bottom > 0
@@ -126,7 +161,7 @@ function pageInviteHelpers() {
     .filter((node) => textOf(node) === label)
     .sort((a, b) => a.childElementCount - b.childElementCount);
   const labelTextNodes = (root, label) => Array.from(root.querySelectorAll('span, div, p, label'))
-    .filter(isVisible)
+    .filter(isRendered)
     .filter((node) => textOf(node).replace(/\s*\*\s*$/, '').trim() === label)
     .sort((a, b) => a.childElementCount - b.childElementCount);
   const exactTextNodesAnywhere = (root, label) => Array.from(root.querySelectorAll('span, div, p, label, button, a, li, [role="group"], [role="combobox"]'))
@@ -184,7 +219,7 @@ function pageInviteHelpers() {
     return candidates[0] || null;
   };
   const radioInputForLabel = (root, label) => {
-    const textNode = exactTextNodes(root, label)[0] || null;
+    const textNode = labelTextNodes(root, label)[0] || null;
     if (!textNode) return null;
     let current = textNode;
     for (let depth = 0; current && depth < 5; depth += 1) {
@@ -234,8 +269,8 @@ function pageInviteHelpers() {
     const labelNode = labelTextNodes(root, label)[0] || null;
     if (!labelNode) return null;
     let current = labelNode.parentElement;
-    for (let depth = 0; current && depth < 7; depth += 1) {
-      const controls = current.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"]');
+    for (let depth = 0; current && current !== root && depth < 7; depth += 1) {
+      const controls = current.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="combobox"]');
       if (controls.length > 0 && controls.length <= 5) return current;
       if (controls.length > 5) break;
       current = current.parentElement;
@@ -257,26 +292,132 @@ function pageInviteHelpers() {
     return true;
   };
   const readFieldValue = (field) => field?.isContentEditable ? textOf(field) : String(field?.value || '').trim();
+  const readBrandState = (container) => {
+    if (!container) return { found: false, actual: '' };
+    if (container.contains(document.activeElement) && document.activeElement?.matches('input')
+      && isRendered(document.activeElement) && !document.activeElement.readOnly) {
+      return { found: false, actual: '' };
+    }
+    const excluded = '[role="option"], [role="listbox"], [class*="dropdown"], [class*="option"]';
+    const labels = labelTextNodes(container, '品牌名');
+    const nodes = Array.from(container.querySelectorAll('span, div, p'))
+      .filter(isRendered)
+      .filter(node => !labels.some(label => label === node || label.contains(node)))
+      .filter(node => !node.closest(excluded))
+      .filter(node => !Array.from(node.children).some(child => isRendered(child) && textOf(child)))
+      .map(textOf)
+      .filter(text => text && !/^(品牌名\s*\*?|请选择报备品牌|请输入品牌名称\/ID搜索)$/.test(text));
+    const selectedInputs = Array.from(container.querySelectorAll('input, select'))
+      .filter(isRendered)
+      .filter(node => !node.closest(excluded))
+      .filter(node => node.tagName === 'SELECT' || node.readOnly || node.disabled)
+      .map(node => node.tagName === 'SELECT' ? textOf(node.selectedOptions?.[0]) : readFieldValue(node))
+      .filter(Boolean);
+    const candidates = Array.from(new Set([...nodes, ...selectedInputs]));
+    return { found: candidates.length === 1, actual: candidates.join(' | ') };
+  };
+  const brandOptions = (container, searchInput) => {
+    if (!searchInput) return [];
+    const controls = [searchInput, searchInput.closest('[role="combobox"]'), container].filter(Boolean);
+    const linkedIds = controls.flatMap(node => `${node.getAttribute('aria-controls') || ''} ${node.getAttribute('aria-owns') || ''}`.split(/\s+/).filter(Boolean));
+    let roots = linkedIds.map(id => document.getElementById(id)).filter(isVisible);
+    if (!linkedIds.length) {
+      roots = Array.from(container?.querySelectorAll('[role="listbox"]') || []).filter(isVisible);
+      if (!roots.length) {
+        const anchor = searchInput.getBoundingClientRect();
+        roots = Array.from(document.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="select-menu"], [class*="select-popup"], [class*="popper"], [class*="popover"]'))
+          .filter(isVisible).filter(node => {
+            const rect = node.getBoundingClientRect();
+            return rect.right > anchor.left && rect.left < anchor.right
+              && rect.top < anchor.bottom + 120 && rect.bottom > anchor.top - 120;
+          });
+        roots = roots.filter(root => !roots.some(other => other !== root && root.contains(other)));
+        if (roots.length !== 1) return [];
+      }
+    }
+    const choices = [];
+    const nodes = roots.flatMap(root => Array.from(root.querySelectorAll('[role="option"], li, [class*="option"], [class*="select-item"], [class*="dropdown-item"]')));
+    // Class substrings also match plural list wrappers; never click their center.
+    const namedNodes = nodes.filter(node => {
+      const text = textOf(node);
+      return isVisible(node) && text && !/^(ID\s*[:：]|暂无|无搜索|没有|加载|搜索中|请选择|请输入)/i.test(text);
+    });
+    const rows = namedNodes.filter(node => !namedNodes.some(other => other !== node && node.contains(other)));
+    for (const node of rows) {
+      if (!isVisible(node) || node.closest('header') || node.getAttribute('aria-disabled') === 'true'
+        || /disabled/i.test(String(node.className || ''))) continue;
+      if (node.getAttribute('role') !== 'option'
+        && !node.closest('[role="listbox"], [class*="dropdown"], [class*="select-menu"], [class*="select-popup"], [class*="popper"], [class*="popover"]')) continue;
+      // Search highlighting splits names across children; an ID row is metadata.
+      const optionName = String(node.innerText || node.textContent || '').split(/\r?\n/)
+        .map(text => text.trim()).find(text => text && !/^ID\s*[:：]/i.test(text)) || '';
+      const label = String(node.getAttribute('data-label') || optionName)
+        .replace(/\s*ID\s*[:：].*$/i, '').trim();
+      if (!label || label.length > 200 || /^(暂无|无搜索|没有|加载|搜索中|请选择|请输入)/.test(label)
+        || choices.some(choice => choice.label === label)) continue;
+      choices.push({ label, node });
+      if (choices.length >= 20) break;
+    }
+    return choices;
+  };
+  const brandDiagnostics = () => ({
+    inputs: Array.from(document.querySelectorAll('input')).filter(isVisible).slice(0, 4).map(node => ({
+      tag: node.tagName, classes: String(node.className || ''), readOnly: node.readOnly,
+      focused: document.activeElement === node, placeholder: node.getAttribute('placeholder')
+    })),
+    popups: Array.from(document.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="popper"], [class*="popover"], [class*="select"]'))
+      .filter(isVisible).slice(0, 20).map(node => ({
+        tag: node.tagName, classes: String(node.className || ''), role: node.getAttribute('role'),
+        children: Array.from(node.children).slice(0, 4).map(child => ({tag: child.tagName, classes: String(child.className || '')}))
+      }))
+  });
   const inputByPlaceholder = (root, placeholder) => {
     const scope = root || document;
-    const fields = Array.from(scope.querySelectorAll('input, textarea, [contenteditable="true"]'));
-    const direct = fields.find((field) => [
+    const fields = Array.from(scope.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(isRendered);
+    const direct = fields.filter((field) => [
       field.getAttribute('placeholder'),
       field.getAttribute('aria-placeholder'),
       field.getAttribute('data-placeholder'),
       field.getAttribute('aria-label'),
       field.value
     ].some((value) => String(value || '').trim() === placeholder));
-    if (direct) return direct;
-    const hintNode = exactTextNodes(scope, placeholder)[0] || null;
+    if (direct.length) return direct.length === 1 ? direct[0] : null;
+    const hintNode = labelTextNodes(scope, placeholder)[0] || null;
     let current = hintNode?.parentElement || null;
     for (let depth = 0; current && depth < 5; depth += 1) {
-      const nested = Array.from(current.querySelectorAll('input, textarea, [contenteditable="true"]'));
+      const nested = Array.from(current.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(isRendered);
       if (nested.length === 1) return nested[0];
       if (nested.length > 1) break;
       current = current.parentElement;
     }
     return null;
+  };
+  const detailFields = (root) => {
+    const datesContainer = fieldContainer(root, '期望发布时间');
+    const dateInputs = Array.from(datesContainer?.querySelectorAll('input') || []).filter(isRendered);
+    const introContainer = fieldContainer(root, '合作内容介绍');
+    const contactContainer = fieldContainer(root, '联系方式');
+    return {
+      brand: readBrandState(fieldContainer(root, '品牌名')),
+      contact: contactContainer ? inputByPlaceholder(contactContainer, '请输入') : null,
+      product: inputByPlaceholder(root, '请输入产品名称'),
+      intro: Array.from(introContainer?.querySelectorAll('textarea, [contenteditable="true"], input') || []).filter(isRendered)[0] || null,
+      start: inputByPlaceholder(root, '开始日期') || (dateInputs.length === 2 ? dateInputs[0] : null),
+      end: inputByPlaceholder(root, '结束日期') || (dateInputs.length === 2 ? dateInputs[1] : null)
+    };
+  };
+  const detailFieldResults = (root, template) => {
+    const fields = detailFields(root);
+    const channel = optionState(root, template.contactChannel);
+    return [
+      { label: '报备品牌', found: fields.brand.found, expected: template.brandName, actual: fields.brand.actual },
+      { label: '联系方式类型', found: channel.found, expected: template.contactChannel, actual: channel.selected ? template.contactChannel : '' },
+      ...[
+        ['联系方式', fields.contact, template.contactWay], ['产品名称', fields.product, template.productName],
+        ['合作内容介绍', fields.intro, template.intro], ['开始日期', fields.start, template.publishStart],
+        ['结束日期', fields.end, template.publishEnd]
+      ].map(([label, field, expected]) => ({ label, found: Boolean(field), expected, actual: readFieldValue(field) }))
+    ].map(item => ({ ...item, verified: item.found && pgyInviteFieldValuesEqual(item.label, item.expected, item.actual) }));
   };
   const inviteFormRoot = () => {
     if (!/^\/solar\/pre-trade\/invite-form\/?$/i.test(location.pathname)) return null;
@@ -285,6 +426,7 @@ function pageInviteHelpers() {
   };
   return {
     textOf,
+    isRendered,
     isVisible,
     centerPoint,
     visibleAncestor,
@@ -301,6 +443,16 @@ function pageInviteHelpers() {
     fieldContainer,
     setFieldValue,
     readFieldValue,
+    readBrandState,
+    brandChoices: (container, searchInput) => brandOptions(container, searchInput).map(({ label }) => ({ label })),
+    brandDiagnostics,
+    brandOptionPoint: (container, searchInput, label) => {
+      const node = brandOptions(container, searchInput).find(option => option.label === label)?.node;
+      const point = centerPoint(node);
+      return point && node.contains(document.elementFromPoint(point.x, point.y)) ? point : null;
+    },
+    detailFields,
+    detailFieldResults,
     inputByPlaceholder,
     inviteFormRoot
   };
@@ -339,7 +491,7 @@ function inspectPgyInviteEntryInPage(template) {
   return { ok: true, stage: 'entry-dialog', verifiedOptions, action: { type: 'open-detail-form', label: '发起邀约', point } };
 }
 
-async function preparePgyInviteDetailFormInPage(template) {
+async function preparePgyInviteDetailFormInPage(template, brandSelectionConfirmed = true, brandSelectionSettled = true) {
   const helpers = pageInviteHelpers();
   const root = helpers.inviteFormRoot();
   if (!root) return { ok: false, code: 'PGY_INVITE_DETAIL_FORM_NOT_FOUND', error: '没有识别到蒲公英详细邀约表单' };
@@ -357,26 +509,27 @@ async function preparePgyInviteDetailFormInPage(template) {
     || null;
   const brandInput = helpers.inputByPlaceholder(brandContainer || root, '请选择报备品牌')
     || helpers.fieldRightOfLabel(root, brandLabelNode);
+  if (brandSelectionConfirmed && !brandSelectionSettled) {
+    const point = helpers.centerPoint(brandLabelNode);
+    if (!point) return {ok: false, code: 'PGY_INVITE_BRAND_FIELD_NOT_FOUND', error: '品牌选择后未能定位字段标签以核对实际选中值'};
+    return {ok: true, action: {type: 'settle-brand', point}};
+  }
   const brandTrigger = helpers.visibleAncestor(brandInput?.parentElement)
     || helpers.visibleAncestor(brandInput)
     || helpers.visibleAncestor(brandHintNode?.closest('[role="combobox"], [role="button"], [class*="select"], [class*="trigger"], [class*="input"]'))
     || helpers.visibleAncestor(brandHintNode);
-  const brandText = `${helpers.readFieldValue(brandTrigger)} ${helpers.textOf(brandContainer)}`.trim();
-  const selectedBrandNode = template.brandName
-    ? (helpers.exactTextNodes(brandContainer || root, template.brandName)[0] || helpers.exactTextNodes(root, template.brandName)[0] || null)
-    : null;
-  const brandSelected = Boolean(template.brandName && (brandText.includes(template.brandName) || selectedBrandNode));
+  const brandState = helpers.readBrandState(brandContainer);
+  const brandSelected = brandSelectionConfirmed && brandState.found
+    && pgyInviteFieldValuesEqual('报备品牌', template.brandName, brandState.actual);
   if (!brandSelected) {
-    const optionNode = helpers.exactTextNodes(document, template.brandName)
-      .find((node) => !brandContainer?.contains(node) && !node.closest('header')) || null;
-    const optionClickable = optionNode?.closest('[role="option"], li, button, [class*="option"], [class*="item"]') || optionNode;
-    const optionPoint = helpers.centerPoint(optionClickable);
+    const brandSearchHint = helpers.textOf(document.body).includes('请输入品牌名称/ID搜索');
+    const searchInput = helpers.inputByPlaceholder(document, '请输入品牌名称/ID搜索')
+      || (brandInput && !brandInput.readOnly && document.activeElement === brandInput ? brandInput : null)
+      || (brandSearchHint ? brandInput : null);
+    const optionPoint = helpers.brandOptionPoint(brandContainer, searchInput, template.brandName);
     if (optionPoint) {
       return { ok: true, stage: 'detail-form', action: { type: 'select-brand', label: template.brandName, point: optionPoint }, agency };
     }
-    const brandSearchHint = helpers.textOf(document.body).includes('请输入品牌名称/ID搜索');
-    const searchInput = helpers.inputByPlaceholder(document, '请输入品牌名称/ID搜索')
-      || (brandSearchHint ? brandInput : null);
     if (!searchInput) {
       const point = helpers.centerPoint(brandInput)
         || helpers.centerPoint(brandHintNode)
@@ -391,11 +544,11 @@ async function preparePgyInviteDetailFormInPage(template) {
       helpers.setFieldValue(searchInput, template.brandName, { blur: false });
       await new Promise((resolve) => setTimeout(resolve, 650));
     }
-    const searchedOptionNode = helpers.exactTextNodes(document, template.brandName)
-      .find((node) => !brandContainer?.contains(node) && !node.closest('header')) || null;
-    const searchedOptionClickable = searchedOptionNode?.closest('[role="option"], li, button, [class*="option"], [class*="item"]') || searchedOptionNode;
-    const point = helpers.centerPoint(searchedOptionClickable);
-    if (!point) return { ok: false, code: 'PGY_INVITE_BRAND_NOT_FOUND', error: `邀约账号的报备品牌列表中没有找到“${template.brandName}”`, agency };
+    const point = helpers.brandOptionPoint(brandContainer, searchInput, template.brandName);
+    if (!point) return {
+      ok: true, stage: 'detail-form', waitingForBrand: true,
+      brandCandidates: helpers.brandChoices(brandContainer, searchInput), brandDiagnostics: helpers.brandDiagnostics(), agency
+    };
     return { ok: true, stage: 'detail-form', action: { type: 'select-brand', label: template.brandName, point }, agency };
   }
 
@@ -406,34 +559,21 @@ async function preparePgyInviteDetailFormInPage(template) {
     return { ok: true, stage: 'detail-form', action: { type: 'select-contact-channel', label: template.contactChannel, point }, agency };
   }
 
-  const contactContainer = helpers.fieldContainer(root, '联系方式');
-  const contactInput = helpers.inputByPlaceholder(contactContainer || root, '请输入');
-  const productInput = helpers.inputByPlaceholder(root, '请输入产品名称');
-  const introContainer = helpers.fieldContainer(root, '合作内容介绍');
-  const introInput = introContainer?.querySelector('textarea, [contenteditable="true"], input') || root.querySelector('textarea');
-  const startInput = helpers.inputByPlaceholder(root, '开始日期');
-  const endInput = helpers.inputByPlaceholder(root, '结束日期');
+  const fields = helpers.detailFields(root);
   const desired = [
-    ['联系方式', contactInput, template.contactWay],
-    ['产品名称', productInput, template.productName],
-    ['合作内容介绍', introInput, template.intro],
-    ['开始日期', startInput, template.publishStart],
-    ['结束日期', endInput, template.publishEnd]
+    ['联系方式', fields.contact, template.contactWay],
+    ['产品名称', fields.product, template.productName],
+    ['合作内容介绍', fields.intro, template.intro],
+    ['开始日期', fields.start, template.publishStart],
+    ['结束日期', fields.end, template.publishEnd]
   ];
-  desired.forEach((entry) => {
-    if (entry[1] && helpers.readFieldValue(entry[1]) !== entry[2]) helpers.setFieldValue(entry[1], entry[2]);
+  desired.forEach(([label, field, expected]) => {
+    const actual = helpers.readFieldValue(field);
+    if (field && !pgyInviteFieldValuesEqual(label, expected, actual)) helpers.setFieldValue(field, expected);
   });
   await new Promise((resolve) => setTimeout(resolve, 250));
-  const fieldResults = desired.map(([label, field, expected]) => ({
-    label,
-    found: Boolean(field),
-    expected,
-    actual: helpers.readFieldValue(field),
-    verified: Boolean(field) && helpers.readFieldValue(field) === expected
-  }));
-  fieldResults.unshift({ label: '报备品牌', found: Boolean(brandTrigger || brandContainer), expected: template.brandName, actual: template.brandName, verified: brandSelected });
-  fieldResults.unshift({ label: '联系方式类型', found: contactState.found, expected: template.contactChannel, actual: contactState.selected ? template.contactChannel : '', verified: contactState.selected });
-  const missingFields = fieldResults.filter((item) => !item.verified).map((item) => item.label);
+  let fieldResults = helpers.detailFieldResults(root, template);
+  let missingFields = fieldResults.filter((item) => !item.verified).map((item) => item.label);
   const finalButton = helpers.exactClickable(root, '发起邀约')
     || Array.from(root.querySelectorAll('button')).find((node) => helpers.textOf(node) === '发起邀约')
     || null;
@@ -441,6 +581,8 @@ async function preparePgyInviteDetailFormInPage(template) {
     finalButton.scrollIntoView({ block: 'center', inline: 'nearest' });
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
+  fieldResults = helpers.detailFieldResults(root, template);
+  missingFields = fieldResults.filter((item) => !item.verified).map((item) => item.label);
   const finalEnabled = Boolean(finalButton && !finalButton.disabled && finalButton.getAttribute('aria-disabled') !== 'true');
   const readyToSend = missingFields.length === 0 && Boolean(finalButton) && finalEnabled;
   return {
@@ -456,47 +598,47 @@ async function preparePgyInviteDetailFormInPage(template) {
   };
 }
 
-function verifyPreparedPgyInviteInPage(template) {
+async function verifyPreparedPgyInviteInPage(template) {
   const helpers = pageInviteHelpers();
   const root = helpers.inviteFormRoot();
   if (!root) return { ok: false, code: 'PGY_INVITE_DETAIL_FORM_NOT_FOUND', error: '详细邀约表单已经关闭，请重新准备邀约' };
-  const brandContainer = helpers.fieldContainer(root, '品牌名');
-  const brandHintNode = helpers.exactTextNodes(brandContainer || root, '请选择报备品牌')[0]
-    || helpers.exactTextNodes(root, '请选择报备品牌')[0]
-    || helpers.exactTextNodesAnywhere(brandContainer || root, '请选择报备品牌')[0]
-    || helpers.exactTextNodesAnywhere(root, '请选择报备品牌')[0]
-    || null;
-  const brandInput = helpers.inputByPlaceholder(brandContainer || root, '请选择报备品牌');
-  const brandTrigger = helpers.visibleAncestor(brandInput) || helpers.visibleAncestor(brandHintNode);
-  const contactContainer = helpers.fieldContainer(root, '联系方式');
-  const values = [
-    ['报备品牌', template.brandName, `${helpers.readFieldValue(brandTrigger)} ${helpers.textOf(brandContainer)}`.trim()],
-    ['联系方式类型', template.contactChannel, helpers.optionState(root, template.contactChannel).selected ? template.contactChannel : ''],
-    ['联系方式', template.contactWay, helpers.readFieldValue(helpers.inputByPlaceholder(contactContainer || root, '请输入'))],
-    ['产品名称', template.productName, helpers.readFieldValue(helpers.inputByPlaceholder(root, '请输入产品名称'))],
-    ['合作内容介绍', template.intro, helpers.readFieldValue(helpers.fieldContainer(root, '合作内容介绍')?.querySelector('textarea, [contenteditable="true"], input') || root.querySelector('textarea'))],
-    ['开始日期', template.publishStart, helpers.readFieldValue(helpers.inputByPlaceholder(root, '开始日期'))],
-    ['结束日期', template.publishEnd, helpers.readFieldValue(helpers.inputByPlaceholder(root, '结束日期'))]
-  ];
-  const fieldResults = values.map(([label, expected, actual]) => ({
-    label,
-    expected,
-    actual,
-    verified: label === '报备品牌' ? actual.includes(expected) : actual === expected
-  }));
+  const findFinalButton = () => {
+    const candidates = Array.from(root.querySelectorAll('button, [role="button"]'))
+      .filter(helpers.isRendered)
+      .filter(node => helpers.textOf(node) === '发起邀约');
+    return candidates.length === 1 ? candidates[0] : null;
+  };
+  let finalButton = findFinalButton();
+  if (finalButton && !helpers.isVisible(finalButton)) {
+    finalButton.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  const fieldResults = helpers.detailFieldResults(root, template);
   const invalidFields = fieldResults.filter((item) => !item.verified).map((item) => item.label);
-  if (invalidFields.length) return { ok: false, code: 'PGY_INVITE_FORM_CHANGED', error: `发送前校验失败：${invalidFields.join('、')} 已变化`, fieldResults };
-  const finalButton = helpers.exactClickable(root, '发起邀约');
-  if (!finalButton || finalButton.disabled || finalButton.getAttribute('aria-disabled') === 'true') {
+  if (invalidFields.length) {
+    const unreadable = fieldResults.filter(item => !item.found).map(item => item.label);
+    const changed = fieldResults.filter(item => item.found && !item.verified).map(item => item.label);
+    return {
+      ok: false, code: unreadable.length ? 'PGY_INVITE_FIELD_UNREADABLE' : 'PGY_INVITE_FORM_CHANGED',
+      error: `发送前校验失败：${[unreadable.length ? `未能读取 ${unreadable.join('、')}` : '', changed.length ? `${changed.join('、')} 与本次模板不一致` : ''].filter(Boolean).join('；')}。尚未点击发送，请重新准备。`,
+      fieldResults
+    };
+  }
+  finalButton = findFinalButton();
+  const point = helpers.centerPoint(finalButton);
+  const topNode = point ? document.elementFromPoint(point.x, point.y) : null;
+  if (!finalButton || !point || !finalButton.contains(topNode) || finalButton.disabled || finalButton.getAttribute('aria-disabled') === 'true') {
     return { ok: false, code: 'PGY_INVITE_FINAL_ACTION_UNAVAILABLE', error: '平台的最终“发起邀约”按钮不存在或不可用', fieldResults };
   }
-  return { ok: true, ready: true, fieldResults, finalAction: { label: '发起邀约', point: helpers.centerPoint(finalButton) } };
+  return { ok: true, ready: true, fieldResults, finalAction: { label: '发起邀约', point } };
 }
 
 function inspectPgyInviteOutcomeInPage() {
   const helpers = pageInviteHelpers();
-  const bodyText = helpers.textOf(document.body);
-  const successText = bodyText.match(/邀约成功|已发起邀约|发送成功/)?.[0] || '';
+  const successText = Array.from(document.querySelectorAll('[role="alert"], [role="status"], [class*="message"], [class*="toast"], [class*="notification"]'))
+    .filter(helpers.isVisible)
+    .map(helpers.textOf)
+    .find(text => /^(邀约成功|已发起邀约|发送成功)[！!。.]?$/.test(text)) || '';
   return {
     ok: true,
     successText,
@@ -513,17 +655,23 @@ function buildPgyInviteEntryInspectScript(value) {
   })()`;
 }
 
-function buildPgyInvitePrepareScript(value) {
+function buildPgyInvitePrepareScript(value, { brandSelectionConfirmed = true, brandSelectionSettled = true } = {}) {
   const template = normalizePgyInviteTemplate(value);
   return `(() => {
+    const normalizePgyInviteComparableText = ${normalizePgyInviteComparableText.toString()};
+    const normalizePgyInviteDateValue = ${normalizePgyInviteDateValue.toString()};
+    const pgyInviteFieldValuesEqual = ${pgyInviteFieldValuesEqual.toString()};
     const pageInviteHelpers = ${pageInviteHelpers.toString()};
-    return (${preparePgyInviteDetailFormInPage.toString()})(${JSON.stringify(template)});
+    return (${preparePgyInviteDetailFormInPage.toString()})(${JSON.stringify(template)}, ${brandSelectionConfirmed === true}, ${brandSelectionSettled === true});
   })()`;
 }
 
 function buildPgyInviteSendScript(value) {
   const template = normalizePgyInviteTemplate(value);
   return `(() => {
+    const normalizePgyInviteComparableText = ${normalizePgyInviteComparableText.toString()};
+    const normalizePgyInviteDateValue = ${normalizePgyInviteDateValue.toString()};
+    const pgyInviteFieldValuesEqual = ${pgyInviteFieldValuesEqual.toString()};
     const pageInviteHelpers = ${pageInviteHelpers.toString()};
     return (${verifyPreparedPgyInviteInPage.toString()})(${JSON.stringify(template)});
   })()`;
@@ -542,9 +690,12 @@ module.exports = {
   buildPgyInvitePrepareScript,
   buildPgyInviteSendScript,
   isAllowedPgyInviteNavigationUrl,
+  normalizePgyInviteComparableText,
+  normalizePgyInviteDateValue,
   normalizePgyInviteFormUrl,
   normalizePgyInviteTemplate,
   normalizePgyInviteCreatorUrl,
+  pgyInviteFieldValuesEqual,
   resolveInviteTargetFromRows,
   validatePgyInviteTemplate
 };

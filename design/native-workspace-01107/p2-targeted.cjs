@@ -1,0 +1,54 @@
+const fs=require('fs'),path=require('path'),Module=require('module');
+const original='C:/Users/feibo/Documents/Codex/2026-06-25/s/projects/xhs-pgy-data-collector/desktop-app/tests/pgy_invite_flow.electron.test.js';
+const source=fs.readFileSync(original,'utf8');let code=source.slice(0,source.indexOf("  if (process.env.PGY_VIEW_LIFECYCLE_TEST"));
+code=code.replace("assert.equal(setup.version, require('../package.json').version);","assert.equal(setup.version, process.env.EXPECTED_VERSION || require('../package.json').version);");
+code+=`
+  const out=process.env.P2_OUT;fs.mkdirSync(out,{recursive:true});const checks=[],errors=[];
+  page.on('pageerror',e=>errors.push(e.message));
+  const resize=async width=>{await electronApp.evaluate(({BrowserWindow},width)=>{const w=BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().includes('/renderer/index.html'));w.setSize(width,1000);w.show();w.focus();},width);await page.waitForTimeout(250);};
+  const zoom=async z=>{await electronApp.evaluate(({BrowserWindow},z)=>BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().includes('/renderer/index.html')).webContents.setZoomFactor(z),z);await page.waitForTimeout(250);};
+  const width=()=>page.locator('#splitterMain').getAttribute('aria-valuenow').then(Number);
+  const drag=async x=>{const box=await page.locator('#splitterMain').boundingBox();await page.mouse.move(box.x+box.width/2,box.y+120);await page.mouse.down();await page.mouse.move(x,box.y+120,{steps:15});await page.mouse.up();await page.waitForTimeout(250);return width();};
+  const saved=()=>page.evaluate(()=>JSON.parse(localStorage.getItem('pgy-workspace-layout-v1'))?.consoleWidth);
+  const equal=(name,actual,expected)=>checks.push({name,actual,expected,ok:Math.abs(actual-expected)<=1});
+  await resize(1400);await zoom(1);
+  const initial=await width(),chosen=await drag(900);
+  equal('drag ends at900',chosen,900);equal('stored drag width',await saved(),chosen);
+  await resize(1100);await page.screenshot({path:path.join(out,'compact-1100.png')});
+  const names=await page.locator('#sidebar .nav-item').evaluateAll(nodes=>nodes.map(n=>({label:n.querySelector('.nav-label').textContent,name:n.getAttribute('aria-label'),title:n.title,iconHidden:n.querySelector('.nav-icon').getAttribute('aria-hidden')})));
+  checks.push({name:'six stable accessible names and tooltips',ok:names.length===6&&names.every(n=>n.name===n.label&&n.title.includes(n.label)&&n.iconHidden==='true'),actual:names});
+  if(names.every(n=>n.name))for(const n of names)assert.equal(await page.getByRole('button',{name:n.label,exact:true}).count(),1);
+  await resize(1400);equal('1400 shrink1100 restore',await width(),chosen);await page.screenshot({path:path.join(out,'restored-1400.png')});
+  await page.reload();await page.waitForSelector('#splitterMain[aria-valuenow]');equal('wide reload',await width(),chosen);
+  await resize(840);equal('narrow clamp leaves preference',await saved(),chosen);await page.reload();await page.waitForSelector('#splitterMain[aria-valuenow]');await resize(1400);equal('reload while narrow then restore',await width(),chosen);
+  for(const z of [.75,1,1.25]){
+    await resize(1600);await zoom(z);const picked=await drag(850);
+    equal('zoom '+z+' saved normalized width',await saved(),picked);
+    await resize(1100);await resize(1600);equal('zoom '+z+' shrink restore',await width(),picked);
+    await page.reload();await page.waitForSelector('#splitterMain[aria-valuenow]');equal('zoom '+z+' reload',await width(),picked);
+    const edge=await page.locator('#splitterMain').evaluate(n=>n.getBoundingClientRect().right);
+    const bounds=await electronApp.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().includes('/renderer/index.html')).getBrowserViews().map(v=>v.getBounds()));
+    checks.push({name:'zoom '+z+' native alignment',ok:bounds.length>0&&bounds.every(b=>Math.abs(b.x-Math.round(edge*z))<=1),bounds,edge});
+    await page.screenshot({path:path.join(out,'zoom-'+z+'.png')});
+  }
+  await zoom(1);await resize(1600);await drag(700);
+  const compact=await page.locator('#sidebar .nav-item').evaluateAll(nodes=>nodes.map(n=>({label:n.getAttribute('aria-label'),title:n.title,hidden:getComputedStyle(n.querySelector('.nav-text')).display==='none'})));
+  checks.push({name:'wide window compact-workspace accessible names',ok:compact.length===6&&compact.every(n=>n.hidden&&n.label&&n.title.includes(n.label)),actual:compact});
+  for(const n of compact)if(n.label){const button=page.getByRole('button',{name:n.label,exact:true});await button.focus();assert.equal(await button.evaluate(n=>n===document.activeElement),true);}
+  await page.screenshot({path:path.join(out,'compact-wide-window.png')});
+  fs.writeFileSync(path.join(out,'navigation-aria.txt'),await page.locator('#sidebar').ariaSnapshot());
+  await resize(1400);
+  const normalized=await drag(1380);equal('out of bounds drag saved normalized',await saved(),normalized);
+  await resize(1600);equal('out of bounds preference restore',await width(),normalized);
+  await page.locator('#splitterMain').focus();await page.keyboard.press('ArrowLeft');const keyboard=await width();await resize(1100);await resize(1600);equal('keyboard commit preserved',await width(),keyboard);
+  await page.evaluate(async runDir=>{const {store}=await import('./state/store.js');store.set({view:'exports',exports:{selectedRunDir:runDir}});},runDir);await page.waitForFunction(()=>document.querySelectorAll('.contact-review-card').length===3);
+  const handle=await electronApp.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().includes('/renderer/index.html')).getNativeWindowHandle().readUInt32LE());
+  const capture=require('child_process').execFileSync('C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',path.resolve('review-01106/extracted/capture-test-window.ps1'),'-WindowHandle',String(handle),'-OutputPath',path.join(out,'specific-test-window.png')],{encoding:'utf8',windowsHide:true}).trim();
+  const result={ok:checks.every(c=>c.ok)&&errors.length===0,version:setup.version,initial,chosen,localOnly:true,checks,errors,capture};
+  fs.writeFileSync(path.join(out,'result.json'),JSON.stringify(result,null,2));fs.writeFileSync(reportPath,JSON.stringify({ok:result.ok,out},null,2));
+  console.log(JSON.stringify({version:setup.version,ok:result.ok,failed:checks.filter(c=>!c.ok)},null,2));
+  if(process.env.EXPECT_OLD!=='1')assert.equal(result.ok,true);
+})();
+`;
+code=code.replace(/\}\)\(\);\s*$/,source.slice(source.indexOf('})().catch(async error')));
+const mod=new Module(original,module);mod.filename=original;mod.paths=Module._nodeModulePaths(path.dirname(original));mod._compile(code,original);

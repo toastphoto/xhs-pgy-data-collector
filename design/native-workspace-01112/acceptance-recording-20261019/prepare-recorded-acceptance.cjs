@@ -1,0 +1,18 @@
+const fs=require('fs'),crypto=require('crypto'),assert=require('assert/strict');
+const root='C:/Users/feibo/Documents/Codex/2026-06-25/s/projects/xhs-pgy-data-collector/desktop-app',asar=require(root+'/node_modules/@electron/asar'),archive=root+'/dist-formal-01112-review/win-unpacked/resources/app.asar';
+assert.equal(crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex'),'dac62f7ffd178f7aa4f0d97ce14f249d5484f159b4be6c12cbd59d734512256c');
+const lib=asar.extractFile(archive,require('path').normalize('lib/pgy_risk.js')).toString();const moduleObj={exports:{}};require('vm').runInNewContext(lib,{module:moduleObj});
+fs.writeFileSync('acceptance-risk-patterns.json',JSON.stringify(moduleObj.exports.PGY_RISK_PATTERNS,null,2));
+let s=fs.readFileSync('formal-acceptance.cjs','utf8');
+s=s.replace("const fs=require('fs')", "if(process.env.PGY_ENABLE_REVIEWED_ACCEPTANCE!=='1')throw Error('REVIEW_ONLY_NOT_ACTIVATED');\nconst fs=require('fs')");
+s=s.replace("   if(request.checkLogin){", "   if(request.checkLogin){\n    assertInstalled('0.1.112');\n    const probeRecorder=require('./acceptance-probe-record.cjs').createRecorder({file:home+'/'+request.id+'-probe-evidence.jsonl',patterns:require('./acceptance-risk-patterns.json')});");
+const a=s.indexOf("    await p.evaluate(()=>window.desktopAPI.browser.openCollection",s.indexOf('if(request.checkLogin)'));
+const b=s.indexOf('    result.rolesHaveDistinctSessions=',a);assert(a>=0&&b>a);
+s=s.slice(0,a)+`    await probeRecorder.runNavigation(()=>p.evaluate(()=>window.desktopAPI.browser.openCollection('https://pgy.xiaohongshu.com/solar/pre-trade/note/kol')),'collection');await delay(2000);
+    const collection=await probeRecorder.runProbe(()=>p.evaluate(()=>window.desktopAPI.pgy.checkLogin()),{role:'collection',stage:'check-login'});
+    result.collectionLoggedIn=collection.loggedIn;result.collectionRisk=collection.riskDetected;
+    await probeRecorder.runNavigation(()=>p.evaluate(()=>window.desktopAPI.invites.openAccount()),'invite');await delay(2000);
+    const invite=await probeRecorder.runProbe(()=>p.evaluate(()=>window.desktopAPI.invites.checkLogin()),{role:'invite',stage:'check-login'});
+    result.inviteLoggedIn=invite.loggedIn;result.inviteRisk=invite.riskDetected;
+`+s.slice(b);
+fs.writeFileSync('formal-acceptance-recorded.cjs',s);console.log('Review-only script prepared against fixed112; not executed or installed');

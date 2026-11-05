@@ -1,9 +1,19 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 function cleanStr(value) {
   if (value === undefined || value === null) return '';
   return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function rawReviewText(value, max, multiline = false) {
+  if (value == null) return '';
+  if (typeof value !== 'string' || value.length > max
+    || (multiline ? /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/ : /[\x00-\x1f\x7f-\x9f]/).test(value)) {
+    throw Object.assign(new Error('未分类联系方式字段无效，未保存'), { code: 'CONTACT_REVIEW_FIELDS_INVALID' });
+  }
+  return value;
 }
 
 function ensureDir(dir) {
@@ -49,10 +59,14 @@ function normalizeReviewRows(rows) {
       email: cleanStr(row?.email),
       wechatId: cleanStr(row?.wechatId),
       phone: cleanStr(row?.phone),
+      contactRaw: rawReviewText(row?.contactRaw, 4096, true),
+      contactRawSource: rawReviewText(row?.contactRawSource, 512),
+      contactRawCollectedAt: rawReviewText(row?.contactRawCollectedAt, 64),
       xhsProfileUrl: cleanStr(row?.xhsProfileUrl),
       xhsProfileSourceCreatorUrl: cleanStr(row?.xhsProfileSourceCreatorUrl),
       contactSource: cleanStr(row?.contactSource),
       contactCollectedAt: cleanStr(row?.contactCollectedAt),
+      feishuAccountNumber: cleanStr(row?.feishuAccountNumber),
       contactCollectionStatus: cleanStr(row?.contactCollectionStatus),
       contactCollectionCode: cleanStr(row?.contactCollectionCode),
       contactCollectionError: cleanStr(row?.contactCollectionError),
@@ -92,17 +106,14 @@ function normalizeSettings(settings) {
 
 function loadContactReview(storeDir, runDir) {
   const reviewPath = getReviewPath(storeDir, runDir);
-  if (!fs.existsSync(reviewPath)) {
-    return {
-      runKey: makeRunKey(runDir),
-      runDir: String(runDir || ''),
-      reviewRows: [],
-      settings: normalizeSettings(),
-      updatedAt: ''
-    };
-  }
   try {
     const obj = JSON.parse(fs.readFileSync(reviewPath, 'utf-8'));
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !Array.isArray(obj.reviewRows)
+      || obj.reviewRows.some(row => !row || typeof row !== 'object' || Array.isArray(row)
+        || typeof row.rowId !== 'string' || !cleanStr(row.rowId))
+      || (obj.settings !== undefined && (!obj.settings || typeof obj.settings !== 'object' || Array.isArray(obj.settings)))) {
+      throw new Error('invalid review document');
+    }
     return {
       runKey: makeRunKey(runDir),
       runDir: String(obj?.runDir || runDir || ''),
@@ -110,19 +121,19 @@ function loadContactReview(storeDir, runDir) {
       settings: normalizeSettings(obj?.settings),
       updatedAt: cleanStr(obj?.updatedAt)
     };
-  } catch (_) {
-    return {
-      runKey: makeRunKey(runDir),
-      runDir: String(runDir || ''),
-      reviewRows: [],
-      settings: normalizeSettings(),
-      updatedAt: ''
-    };
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return { runKey: makeRunKey(runDir), runDir: String(runDir || ''),
+        reviewRows: [], settings: normalizeSettings(), updatedAt: '' };
+    }
+    throw Object.assign(new Error('复核文件读取失败，已保留原文件，请核对或恢复备份后重试'), { code: 'CONTACT_REVIEW_READ_FAILED' });
   }
 }
 
 function saveContactReview(storeDir, runDir, payload = {}) {
   const reviewPath = getReviewPath(storeDir, runDir);
+  // Never replace an unreadable review with an inferred empty document.
+  loadContactReview(storeDir, runDir);
   const saved = {
     runKey: makeRunKey(runDir),
     runDir: String(runDir || ''),
@@ -130,7 +141,14 @@ function saveContactReview(storeDir, runDir, payload = {}) {
     settings: normalizeSettings(payload.settings),
     updatedAt: new Date().toISOString()
   };
-  fs.writeFileSync(reviewPath, JSON.stringify(saved, null, 2), 'utf-8');
+  const temporary = `${reviewPath}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(saved, null, 2), { encoding: 'utf-8', flag: 'wx' });
+    fs.renameSync(temporary, reviewPath);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') { try { fs.unlinkSync(temporary); } catch (_) {} }
+    throw error;
+  }
   return saved;
 }
 

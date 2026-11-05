@@ -9,6 +9,7 @@ This directory is the repository-local memory layer for future AI/helper threads
 - `DECISIONS.md`: important decisions, reasons, impact, and when to revisit them.
 - `HANDOFF_TEMPLATE.md`: short copyable template for starting a new continuation thread.
 - `LEARNINGS.md`: concise pitfalls, user corrections, and the correct reusable practice.
+- `INVITE_REVIEW_2026-09-08.md`: invitation defects, regression evidence, Windows 0.1.55 artifact and live-validation boundaries.
 - `PRODUCT_ARCHITECTURE_ROADMAP.md`: durable product-chain direction, external RPA/plugin assessment, and staged refactor plan.
 - `UX_REDESIGN_PLAN.md`: product-level UI/UX blueprint for the Electron workbench, including progressive disclosure, flow-first navigation, bulk-action rules, and list/detail patterns.
 - `PGY_ANTI_BOT_SAFETY_AUDIT.md`: Pugongying anti-bot/risk-control safety audit, conservative operation rules, and live-validation checklist.

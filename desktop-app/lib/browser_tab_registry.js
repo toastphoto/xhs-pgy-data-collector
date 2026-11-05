@@ -41,6 +41,14 @@ class BrowserTabRegistry {
     const tab = this._tabs.get(safeId);
     if (!tab) return null;
     if (!tab.closable) throw new Error(`tab cannot be closed: ${safeId}`);
+    return this.discard(safeId);
+  }
+
+  // Internal lifecycle cleanup; user-initiated close still checks closable.
+  discard(id) {
+    const safeId = String(id || '');
+    const tab = this._tabs.get(safeId);
+    if (!tab) return null;
     this._tabs.delete(safeId);
     if (this._activeId === safeId) {
       this._activeId = this._tabs.has(COLLECTION_TAB_ID)

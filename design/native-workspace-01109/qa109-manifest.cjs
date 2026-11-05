@@ -1,0 +1,7 @@
+﻿const fs=require('fs'),crypto=require('crypto'),path=require('path'),assert=require('assert/strict');
+const app='C:/Users/feibo/Documents/Codex/2026-06-25/s/projects/xhs-pgy-data-collector/desktop-app',asar=require(path.join(app,'node_modules/@electron/asar'));
+const hash=b=>crypto.createHash('sha256').update(b).digest('hex');const old=path.join(app,'dist-coexist-qa-01108-release/win-unpacked/resources/app.asar'),next=path.join(app,'dist-coexist-qa-01109/win-unpacked/resources/app.asar');
+const changes=[];for(const f of asar.listPackage(next)){let x=path.normalize(f.replace(/^[/\\]/,''));if(asar.statFile(next,x).files)continue;try{if(hash(asar.extractFile(old,x))!==hash(asar.extractFile(next,x)))changes.push(x.replace(/\\/g,'/'));}catch{changes.push(x.replace(/\\/g,'/'));}}
+assert.deepEqual(changes.sort(),['browser_preload.js','package.json']);const installer=path.join(app,'dist-coexist-qa-01109/PGY-Workbench-QA-0.1.109-setup.exe');const formal='C:/Users/feibo/AppData/Local/Programs/content-analyzer-desktop/resources/app.asar';
+const r={version:'0.1.109',changesFrom108:changes,installerBytes:fs.statSync(installer).size,installerSHA256:hash(fs.readFileSync(installer)),asarSHA256:hash(fs.readFileSync(next)),formal105SHA256:hash(fs.readFileSync(formal)),sourceBranch:'design/toast-2-native-01105',sourceHead:'0342968',dirtyWorktreePreserved:true};assert.equal(r.formal105SHA256,'38d1ae79bddd7f88214ef6c9571db8a24a1198859a2206d3671eff93f5385960');fs.writeFileSync('QA109-MANIFEST.json',JSON.stringify(r,null,2));console.log(JSON.stringify(r));
+

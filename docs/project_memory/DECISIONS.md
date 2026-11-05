@@ -1,6 +1,357 @@
 # Decisions
 
-Last reviewed: 2026-09-04. No new product decision was required; the stable operating consequences of existing decisions were promoted to `AGENTS.md`.
+## 2026-11-05: Separate Bitable Edition, Explicit Selected Sync
+
+User requests a separate Bitable branch, preserving the Project edition and unrelated product functionality. User confirmed selecting creators in the software before batch synchronization; neither collection nor later enrichment automatically writes cloud data. Preserve local results and independent invitation/export selection. New edition must not initialize/restore the old Project connection; do not reuse Project credentials or roles as Bitable credentials/person IDs. No silent old-cloud migration or profile copying. Detailed schema, independent package identity, authorization, concurrency and acceptance proposals remain in [the plan](BITABLE_BRANCH_PLAN_2026-11-05.md), not implemented facts. Reevaluate when sync scope, team concurrency, baseline or authorization is decided; no business code or branch was changed in this planning turn.
+
+## 2026-10-26: Verify The Tester And Its Side Effects
+
+- Native process exit0 requires a completed-stage assertion. Required skips must be detected in both TAP `# skipped` and Node spec `ℹ skipped` output. Inspect Python entrypoints before choosing direct execution or unittest discovery; renderer fixtures must import current dependencies (including `enhanceWorkspace`) and select the intended workflow tab, not remove new behavior to make old fixtures pass.
+- Inspect the actual 7za view of an NSIS installer: it may expose the payload directly or an outer `$PLUGINSDIR/app-64.7z`. Support both layouts without inferring missing files from a single assumed structure. Preserve failed reports, repair harness causes and create a new complete run; never edit an old failure into success.
+- Evidence: [tester receipt](RELEASE_TESTER_2026-10-23.md) and the retained local report `tmp/release-tests/20261023-151927-f25120e0/report.json` were reread on October26: historical69 automatic groups passed, five installed/live gates pending, delivery blocked. This review did not rerun product tests or establish current release readiness. Reevaluate after test-runner, archive-tool, dependency, UI workflow or runtime changes.
+- A script named safety probe is not necessarily read-only. Static inspection confirms `probe_pgy_runtime_safety.py` defaults to port8010 and posts to `/api/crawl/start` even after config assertion failures; `prepare_pgy_live_validation.py` invokes it. Keep both out of memory reviews/default automatic discovery. Running them requires separately authorized side effects and an isolated target; expected403 is not a no-write guarantee. Reevaluate if these scripts' behavior changes.
+
+## 2026-10-26: Recovery Must Be Stoppable Without A Worker
+
+- A restored paused queue has no active loop to consume a stop request. Accept recovery only when Stop without Resume preserves completed output, persists terminal state before releasing the active-run boundary, and allows later new collection under the existing cooldown. Persistence failures and restarts must remain recoverable/retryable; do not discard data or relax collection limits to unlock the UI.
+- Make the old task discoverable at the task entry, not only through history. Exercise the actual recovery controls and shipped CSS at relevant window widths; passing clicks did not catch an inherited grid squeezing text/buttons. Evidence: [recovery receipt](TASK_RECOVERY_2026-10-23.md), including the failed candidate and corrected exact-artifact checks. Reevaluate after runner persistence, task UI or packaging changes. Installed/live acceptance is still separate, so the recovery learning remains active.
+
+2026-10-23：用户要求每改版经过统一测试器。采用源码/精确包内运行/安装/真实业务分层门槛，白名单离线回归，必需跳过不算通过；精确安装包、源码与证据哈希绑定，不按版本号或旧记录日期自动放行。`deliver` 仅在全门槛通过后复制全新交付目录，原打包命令仍只产候选。测试器不默认安装、登录、发信或写云端。新增产品功能、平台DOM/安装渠道/测试运行时变化时扩展清单并重评；不能承诺零bug。详见[使用规则](../RELEASE_TESTER.md)。
+
+2026-10-19：本轮用户明确授权固定105/112本机数据备份与升级回退，允许在私有用户目录保管正式数据恢复点，不含QA迁移、云端写入或发送。先离线复制并校验恢复试读，平台风险标记优先停；112遇风险后已回退105，人工核实后再继续既有授权范围，不据本地服务通过宣称登录/业务通过。
+
+2026-10-19：邀约账号入口回退仅绑定当前open-account/check-login操作、account许可和已验证HTTPS公共首页（承载登录界面，无userinfo/query/hash）。其他路径须另行核实，不能放开达人/表单/发送稳定锁；导航代次和准备凭证失效继续生效。验证分别记录独立未登录首开与真实默认QA登录保留，见源design/native-workspace-01110。
+
+## 2026-10-19: Explicit Local Coexist QA Channel
+
+- Owner requested progress without waiting solely for an external VM. A build-time-only QA channel may run on this host only after appId/exe/GUID/menu/uninstall/userData/session/single-instance/backend-port/data roots and owned process cleanup are separately verified. A different directory alone remains insufficient. No account/runtime switch or production-profile copy.
+- QA installer/uninstaller must refuse a live or unknown QA process result instead of force-killing the shared QA main/supervisor image; exact running-refusal and closed install/uninstall cycles were verified.
+- Normal package behavior stays behind absence of QA buildFlavor. QA installation results do not authorize or prove formal upgrade installation, real login, IME or live unsent preparation. Default-path QA NSIS cycle passed; custom /D path did not and is not the delivered acceptance route. See [precise scope](../../design/native-workspace-01108/HANDOFF-QA-01108.md).
+
+## 2026-10-19: Brand Selection Requires A Committed Named Option
+
+- Keep candidate extraction and click inside the same associated popup. Class substring matches may include plural list wrappers: exclude wrappers containing named child options, but do not discard a valid row just because it has empty avatar or ID-only children.
+- Search text, even a readonly echo, is not selection evidence. Verify the actual committed value after search dismissal. Only a rendered editable active search can block that readback; hidden/readonly former inputs cannot. Keep exact brand/recipient binding and final-send approval.
+- Evidence: installed0.1.105 real two-person unsent batch passed after0.1.97-104 live failures; see [receipt](INVITE_BRAND_REAL_ACCEPTANCE_2026-10-16.md). If a regression fixture omits a required nickname, fix the fixture rather than weakening business requirements.
+- Reevaluate on PGY picker DOM/interaction changes. Two preparations do not prove real sending, all brands, larger batches or other machines. Original failed evidence is retained.
+
+## 2026-10-19: Artifact Identity And Installer Isolation Are Separate
+
+- Version and HEAD alone cannot identify a dirty worktree. Freeze runtime file hashes, compare exact ASAR contents and distinguish delivered UI overlays from experimental source. Renderer-only screenshots do not prove native BrowserView pixels; label separate captures instead of composing apparent native evidence.
+- A different NSIS destination is not isolation when appId, shortcuts and uninstall keys are shared. Verify a separate test OS/account and shared process/port behavior before installation; do not create environments or change accounts during memory maintenance.
+- Evidence and limits: [0.1.107 handoff](../../design/native-workspace-01107/HANDOFF-01107.md) and [final materials](../../design/native-workspace-01107/FINAL-INSTALL-01107.md). Exact candidate checks passed, but installation/service/real IME/system DPI/login/live preparation remain open. Reevaluate on installer identity or packaging changes.
+
+## 2026-10-19: Persist Layout Preference, Not A Temporary Clamp
+
+- Commit final normalized drag values on pointer end/cancel/lost capture/blur through the same path as keyboard changes. Keep preferred width separate from viewport clamps, including narrow-window reload.
+- Compact navigation needs stable accessible names and hints in both media-query and container-compact paths. Verify actual pointer/reload/zoom and native boundaries on the exact artifact, not only geometry functions.
+- Evidence:0.1.106 red and0.1.107 exact23-check green in the linked native handoff. This is artifact-level evidence only; installed/IME/live gates remain unresolved. Reevaluate when layout persistence, compact modes or Electron scaling changes.
+
+## 2026-10-16: Explicit Unquoted Platform Prices Become Zero
+
+- User explicitly requested `暂未报价` default0, not a blocked row. Normalize that and equivalent `暂无报价`/`未报价` in the shared quote parser for image/video, creation/bulk and supplementation; preserve numeric versus text field types.
+- This does not authorize clearing existing data automatically or treating missing/paused/malformed values as zero. Preview touched fields and preserve existing dispatch/readback rules. Reevaluate if the platform adds other explicit availability states. See [acceptance](INVITE_BRAND_REAL_ACCEPTANCE_2026-10-16.md).
+
+## 2026-10-15: Brand Search Is Asynchronous And Ambiguity Needs A Choice
+
+- Preparation owns bounded waiting for a committed but loading exact target; do not introduce collection-account viewing or cookie copying as an invitation prerequisite. The original user incident still requires real evidence.
+- Exact brand names auto-select after search results arrive. Nonexact results pause without sending or ending the batch; operator selects a canonical candidate, which is freshly prepared and reused for later batch recipients. Do not guess the first row or treat entered search text as selected brand evidence.
+- Scope extraction and click to the same associated popup, support direct-text option nodes, merge nested root matches but reject separate ambiguous roots. Stop/edit/replacement revokes pending choices. See [candidate and verification](INVITE_BRAND_WAIT_2026-10-15.md).
+
+## 2026-10-15: Same-Batch Unsent Progress Is Separate From Contact Completion
+
+- Add explicit unsent-next/final-complete only after successful preparation, preserving batch identity, cooldown and human final-send boundary. Do not require stopping/restarting to preview consecutive creators.
+- Never treat preparation as sent/manual completion: retain checkbox/followup, drop renderer prepared-send payload, count prepared-unsent separately. Unknown send results still require outcome review; failed preparation cannot be relabeled as prepared.
+- Two real consecutive preparations were accepted in installed0.1.95; final send was forbidden and untested. Reevaluate if multi-tab draft retention or unattended prepare-only batches are requested. See [receipt](INVITE_UNSENT_BATCH_2026-10-15.md).
+
+## 2026-10-15: Creator Preparation Owns Its Bounded Recovery
+
+- Collection viewing is optional, not an invitation warm-up requirement. Keep separate partitions; preparation/batch owns opening and waiting. Never solve this by copying cookies or requiring users to repeat three clicks.
+- Carry actual document proof across calls; a failed load cannot be accepted next time merely because the address matches. One exact-target, normal-resolved creator reload can recover before preparation, only after bounded risk reads; aborts and sends never auto-retry.
+- Human send confirmation and unknown-outcome protection remain. Review the live navigation evidence if the actual state does not meet the exact recovery condition; do not expand to same-domain navigation guesses. See [receipt](INVITE_DOCUMENT_RECOVERY_2026-10-15.md).
+
+## 2026-10-15: Production Enrichment Uses Field Deltas, Not Test Ownership
+
+- User approved existing-record supplementation without excessive gates. Use independent `enrich`, exact platform/account/maintainer matching, selected-row batch preview/confirmation and targeted readback.
+- Compare only touched cloud fields before writing; creator/updater/timestamps, unrelated notes, display name and workflow are not an enrichment approval baseline. Blank values do not erase data; contacts append. Preserve original contact date and assignment.
+- Exact pending unknown records require readonly resolution, not re-dispatch. Test mutation/cleanup authority remains separate. See [scope and remaining live gates](FEISHU_ENRICHMENT_2026-10-15.md).
+
+## 2026-10-15: Save Feedback Must Not Replace The Focused Composer
+
+- Keep invitation/review before Feishu handoff. Update save status in place while the composer owns focus, including errors; preserve ordinary derived refresh elsewhere. Do not stop saving or hide failure to retain focus.
+- Recompute execution recipients and validate run/channel at action time. Template changes revoke old drafts and batch confirmation through local control updates, never by waiting for an autosave repaint.
+- Reevaluate if the renderer adopts keyed components or other background rerenders must preserve active composition. Current fix proves autosave continuity, not every possible native IME/background transition. See [evidence](COMPOSER_INPUT_LAYOUT_2026-10-15.md).
+
+## 2026-10-15: Initial Search Departure Is Not Target Authorization
+
+- Explicit creator loads may capture the exact invitation search route as a departing source, in addition to creator/form identities. Allow query/hash updates only while that document remains current before commit/settling. Do not change the general navigation key or account settling policy.
+- Recipient selection remains persisted-row based and target commit/read/risk/send checks remain independent. Search query changes cannot authorize a recipient; missing commit still fails. Reevaluate with sanitized event phase/source evidence if another starting route is reported, not a blanket same-domain exception. See [receipt](INVITE_SEARCH_HANDOFF_2026-10-15.md).
+
+## 2026-10-15: Scroll Anchors Belong To The Scroll Owner
+
+- Use list-relative card geometry, not ancestor-relative offsetTop. Preserve stable row/visible offset; ignore retired-node scroll events and let newer manual scrolling cancel pending frame recovery.
+- Growing preceding cards can legitimately change raw scrollTop. Reevaluate geometry/scaling if transforms or virtualization are added. See [evidence](INVITE_SCROLL_REPAIR_2026-10-15.md).
+
+## 2026-10-15: Production Creation Is Not Renamed Test Ownership
+
+- Human approved nickname-only formal creation and automatic contact-establishment time, but explicitly declined Feishu configuration changes. Default new UI to production, retain explicit marked test mode, and never retroactively strip test provenance.
+- Bind production to the same platform/account/maintainer dedup key. Persist explicit mode; exclude production from every test mutation/cleanup/history path. No acknowledged ID means no nickname-only reconciliation or blind retry.
+- Generate the recognized date field immediately before dispatch and verify numeric millisecond readback. Empty contact is separate from placeholder validity: omit only for known optional metadata, keep required_mode1 and all other mandatory checks. Unknown date precision is a live acceptance gate, not grounds for timezone guesses or loose comparison.
+- Reevaluate when the platform provides documented date precision or field-specific required-check control, or production editing/deletion becomes an explicitly scoped requirement. See [evidence](FEISHU_PRODUCTION_2026-10-15.md).
+
+## 2026-10-15: Invitation Navigation Has A Departing-Document Phase
+
+- A new load request does not prove the old document has exited. Exact local Electron red evidence reproduced the second-creator failure when old-form history changed before target commit. Track commit and a captured canonical source; permit only its same-document updates during owned creator/form handoffs, never during reads/sends or after commit/settling.
+- Retain the pinned target form across source cleanup. Explicit load completion/ERR_ABORTED needs actual commit, not URL coincidence. Preserve all wrong-target, snapshot, risk, timeout and approval guards. Reevaluate with sanitized live phase evidence if the platform navigation contract changes; no blanket in-page exception. See [receipt](INVITE_NAVIGATION_HANDOFF_2026-10-15.md).
+
+## 2026-10-14: Current Cleanup Approval Is Not An Initial Baseline
+
+- Unassigned role owners may be explicit null under the existing supported contract. Preserve null in manual fingerprints; normalize only arrays. Missing owners reject, and null versus [] remains a real representation change. Independent review's rejection counterexample drove the final0.1.86 repair.
+
+- Actual readonly role arrays permuted with identical assignments. Fresh manual DELETE reviews normalize only the typed role_owners role/owner sets, rejecting ambiguous/malformed collections and preserving all other fields, array order and audit changes. Existing v1/v2 stored baselines stay strict and are never restamped; current cleanup approval is independent of update authority. Source0.1.86 tests pass, installed/live reacceptance pending.
+
+- Keep cloud DELETE distinct from hiding terminal dropdown history. Local archive validates exact target/entry identities and deletion or external-absence evidence, sets visibility only, preserves audit and sends no cloud request. Actual0.1.85 archived five entries without reducing the eight-entry manifest.
+- A verified, acknowledged own AI-test object with an old blocked baseline may receive a separate manual DELETE preview, not general mutation authority. Require exact creator, target, marker/batch, sent values, maintainer and explicit initial workflow; expose the full current fields and changed updater to the reviewer. Obtain fresh exact-object approval, recheck the complete current version and persist a separate review receipt. Never replace the original baseline, grant update, accept unknown creation, or silently retry an unknown DELETE.
+- Scope is cleanup of journal-owned test objects, not deleting or modifying old real records. Actual final0.1.86 passed three separate manual DELETE/exact-absence runs, archive3 and normal-restart empty-picker persistence; audit8 entries retained and no authority restored. This does not accept update or automatic initialization proof. Reevaluate on platform lifecycle semantics or actual cleanup failure. See [receipt](FEISHU_TARGET_RECORD_CLEANUP_2026-10-14.md).
+
+## 2026-10-14: Initialization Times Do Not Prove An External Edit
+
+- Actual authorized0.1.79 rejected TIMESTAMPS_UNEQUAL; actual0.1.80 then rejected TIMESTAMPS_REVERSED. Equality and ordering were both unsupported application assumptions. Source0.1.81+ uses audit timestamps only for positive integer shape, never initialization ownership/intervention inference; retain actor, acknowledged identity, marker, fields/owners, initial state/default checks and later record-version comparisons.
+- Actual0.1.82 readonly workflow diagnostic showed only HISTORY_MISSING alongside explicit initial/unarchived flags and valid status audit. Source0.1.83 accepts an omitted history property under those affirmative conditions; present nonempty/malformed history stays rejected. Missing optional evidence is not affirmative evidence of advancement. Current diagnostics must not be presented as first-readback evidence or unlock historical blocked records.
+- No elapsed-time tolerance or clock-based ownership inference. Do not grant legacy blocked objects a fresh baseline from current data. Reevaluate on live repaired baseline/CRUD evidence; source tests and old create success do not close software DELETE or current-maintainer binding gates. See [captured repair](FEISHU_CRUD_REPAIR_2026-10-14.md).
+
+## 2026-10-14: Name Choice Is Not Temporary Mutation Authority
+
+- Human questioned why a person's name needs a time check. Keep exact project member identity and explicit assignee choice separate from fresh action/preview authority. A name does not expire; a selected member must not silently change, while a stale preview must not submit after an identity, role, target or data change.
+- Live CHECK_TIME_FUTURE1ms is an application timing false rejection, not a Feishu permission requirement. The five-minute inspection lease was our design, not a documented platform rule about names. Source0.1.78 removes cross-process wall comparisons with a conservative request-start/remaining-duration bound; backend expiry and other guards remain intact.
+- Persisted-choice and preparation-time revalidation are separate from0.1.78. Source0.1.79 implements them with a separate encrypted target/actor-scoped preference, no saved approvals, and exact identity/role revalidation on explicit preview. Only choice survives expiry/restart; plans/tokens do not. Actual0.1.79 twice restored the same preference and connection; explicit readonly batch preview after more than five minutes succeeded without person reselection. See [scope and evidence](FEISHU_MAINTAINER_CHOICE_2026-10-14.md). Reevaluate on target/member/role changes; cloud mutation and other members remain independent gates.
+
+## 2026-10-14: Maintainer Samples Must Be Eligible In The Target
+
+- Human restricted positive acceptance to people appearing in the connected project's actual selectable `现维护经纪人` range. Verify the exact project, work-item type, role/field and unique member identity before testing attribution. General name search, activation status, existing assignments and old roster screenshots cannot establish current selectable eligibility.
+- Keep eligible assignee, authenticated API actor/plugin permissions and review validity separate. Name matching is not an authorization proof; people outside the verified range are not positive samples, and missing matches do not authorize broader permission requests. This refines sampling, not a claim that the current implementation already enforces the complete eligible range.
+- Retain earlier timing failures as observations; do not count unverified samples as eligible coverage or reclassify frontend invalid-deadline errors as permission denials. Reevaluate when project member ranges, role rules or platform metadata change; reread live eligibility before new marked test writes.
+
+## 2026-10-13: Batch Review Time Is Not A Fresh Read Lease
+
+- Installed0.1.75 manual batch review repeatedly exceeded a five-minute read-preview lease; restarting the query discarded all source/type choices. Do not extend TTL or infer contact type to compensate.
+- After explicit local batch confirmation, serially re-query each selected account and require exactly the reviewed record/value/kind/identity variant. Apply only with the new token while run, creator, account, selection and approval remain unchanged. Changed sources, incomplete reads, stop and connection changes cannot authorize a local write. Existing local conflicts/backend TTL and separate cloud/maintainer authority stay strict.
+- This renewal applies only to readonly contact previews for the approved local values; it never renews a cloud write plan or role confirmation. Actual0.1.79 applied three explicitly unclassified originals after manual review exceeded five minutes; file and restarted UI preserved raw3/typed0. Reevaluate when contact response semantics, review identity or lease policy changes; typed enrichment remains separate.
+
+## 2026-10-13: Explicit Current Page Origin
+
+- Historical feedback expects an instruction naming the current page to begin there. Preserve unqualified global ranks, but parse explicit current-page wording as a separate origin and require a verified visible paginator. Carry the origin through renderer/IPC/page reader/manual checkpoint and show the starting page in results. Conflicting current-page/first-page wording is rejected.
+- Same ordered-page evidence, single-batch limit and rank40 manual cooldown apply. Failed reads restore their original page even when a clicked next page has not yet passed validation; risk stops perform no recovery navigation. Source behavioral regressions pass; installed acceptance is pending at this checkpoint.
+- Reevaluate when command semantics, page metadata or current-page UI changes. This is a new explicit scope, not permission to reinterpret unqualified global ranks or bypass risk checks.
+## 2026-10-13: Unclassified Contact Is Not A Typed Contact
+
+- Human explicitly selected preservation of the original generic contact value. Do not infer WeChat, phone or email, or claim classified local backfill acceptance from generic cloud field success.
+- The authorized installed three-record cloud test used unchanged returned values only in generic contact fields. Missing contacts remained rejected. Reevaluate classification only with explicit source metadata or operator review; retain source evidence and keep typed application separate.
+- New source permits an explicit unclassified choice to save contactRaw/contactRawSource/contactRawCollectedAt, separate from typed fields. Reject different existing originals; preserve literal whitespace/newlines. Only an empty typed contact draft may fall back to the raw original for generic Feishu creation. Preview and renderer adapters must retain the same fields. Source tests pass; the repaired installed round trip remains pending.
+
+## 2026-10-12: Readonly Retirement Does Not Grant Mutation Authority
+
+- Decision: permit exact readonly external-absence checks for unique verified journal-owned records even when cleanup eligibility is blocked. Keep update/delete disabled and handler-guarded; selection alone grants no mutation. Capture mode, connection, target and entry identity, checking before dispatch and after awaits, including obsolete create handlers after local save.
+- Reason/evidence: the selector hid legitimate readonly retirement after independently approved normal-page deletion; red regressions also reproduced stale handlers crossing into mutation. Source repair and isolated Chrome/native keyboard coverage are documented in [batch evidence](FEISHU_BATCH_SCALE_2026-10-10.md). Source passing is not installed/live acceptance or application DELETE.
+- Decision: save only whitelisted rejection categories from the FIRST cleanup eligibility readback, never private response/audit/person/field values. Unknown old reasons remain unknown; later detail cannot supply a new stamp or relax ownership. Missing diagnostic evidence does not establish missing remote fields, an actor edit or insufficient permissions.
+- Impact: journal selection, readonly retirement, mutation callbacks and safe diagnostics. Keep pending installation, live rejection-category and software-cleanup gates open. Reevaluate on exact-detail absence semantics, journal schema or platform audit/workflow contract changes; preserve legacy baselines and independent creation/readback/cleanup gates.
+
+## 2026-10-12: Native Option State Is The Browser Fixture Oracle
+
+- A minimal Chrome reproduction showed Playwright isDisabled retargeting an option nested in a label to its enabled select. Check native option.disabled and :disabled plus keyboard navigation; programmatic selectOption may select disabled options and does not prove human selectability.
+- This changes fixture interpretation, not application permissions. Evidence is the dated LEARNINGS entry and blocked-readonly real-Chrome regression. Recheck when browser/automation versions change rather than generalizing the discrepancy to other controls.
+
+## 2026-10-10: Successful Create Readback Does Not Prove Cleanup Ownership
+
+- Sent-field and maintainer readback may be verified while cleanup eligibility stays blocked. Normal create, like unknown reconciliation, must not adopt a first-observed snapshot containing unproven external data as its cleanup baseline.
+- Require explicit API actor creation/update origin, identical valid audit times, official explicit initial workflow flags/state/history and matching workflow audit, expected sent values, and supported typed metadata defaults or allowed empty fields. Missing evidence or unexpected data/roles/status sets cleanupBlocked with no cleanup stamp. Static metadata must not be required to predict dynamic creation timestamps. Preserve legacy v1 and unknown protections.
+- Preserve session-only target-scoped reading preferences independently of authority. Refresh/reconcile/run changes may retain history/settings visibility, never renew a maintainer lease, restore a write plan or persist credentials.
+- Reevaluate only with verified live platform origin/default/workflow contracts. Current live official initial-workflow shape and software-cleanup acceptance remain unverified; do not claim automatic cleanup from fixture positives. See [dated review](FEISHU_CREATE_PROVENANCE_2026-10-10.md).
+
+## 2026-10-10: External Absence Is Not Baseline Approval Or A Repeated Delete
+
+- Live exact legacy-test detail returned HTTP400 with numeric API30005 after separately approved normal-page deletion. Missing-record handling accepts only API30005 or HTTP400/API30005 in exact detail-read paths, not general HTTP errors, search results or mutation dispatch outcomes. Permissions, timeout, malformed replies and other statuses remain uncertain.
+- Add explicit readonly verifyOwnedAbsence for one unique verified journal entry, exact entryId/recordId/current target and persisted AI title/batch. Recheck session, generation and unchanged entry after awaits. Save a cloned latest journal only after clear absence; keep identity and legacy hash, with externalAbsenceVerified provenance. No DELETE, baseline adoption or retirement of unknown results; these still use reconciliation.
+- UI distinguishes externally absent from software-cleaned records, removes retired mutation selection, invalidates old plans and refreshes submission history. Expiry invalidates unsubmitted previews/counts/errors and gives recovery locally; original submitted/unknown identities and results remain. No automatic authority renewal.
+- Reevaluate on API status/error semantics or journal schema change. Source/fixture passing does not prove installed persistence or marked positive cloud batch/quote readback. Canonical key order tolerance never permits changed values, owner, time or writer.
+
+## 2026-10-10: Readonly Batch Preview Defers, Never Assumes, Write Approval
+
+- Installed0.1.67 blocked readonly cloud dedup unless the cleanup/notification safety attestation was checked. Keep the attestation unchecked when cleanup is unverified. Explicit boolean deferred preparation still validates values, person, scope, complete dedup and short-lived plan; it creates no remote record or journal entry.
+- Internally bind deferred approval to the plan. Executing that plan requires exact fresh safetyConfirmed=true before journal/network business work; a denied token is consumed. Original legacy preparation and update/delete gates remain unchanged. The UI permits readonly preview without the write checkbox; checking it preserves current reviewed plans, revoking it invalidates them. Final confirmation, saved-row/person recheck, repeat dedup and unknown-result protection remain mandatory.
+- Check captured plan identity and safety/configuration again after a single-create save await. Revoking then rechecking cannot revive the old operation; batch revisions also cannot be revived. Red regression and independent review established the prior single-path stale callback and its repair, not a live cloud mutation.
+- Reevaluate when approval transport or action ownership changes. Source/fixture passing is not installed/live acceptance, cleanup capability, atomic multi-computer dedup or notification suppression.
+
+## 2026-10-10: Separate Target Ownership From Unassigned Roles And Version Record Stamps
+
+- Live duplicate lookup rejected a third record because an unrelated role had explicit null owners. Only that non-target null representation is accepted; role IDs/uniqueness, complete pagination/scope/account/platform and the unique nonempty target maintainer remain mandatory. Missing/malformed owners are not generalized to empty; another role never substitutes for current maintainer.
+- New verified record baselines use version2 recursive object-key canonicalization, preserving every value and array order, timestamps, writer and field types. Old unversioned baselines stay strict version1; do not upgrade an unmatched digest using the current record. Ephemeral preview stamps use version2 only after the persisted ownership check succeeds.
+- Reevaluate on platform schema changes. Current old test cleanup mismatch has no original full snapshot, so representation drift cannot be distinguished from real changes and automatic cleanup remains blocked. Source tests are not proof of a live cleanup or batch write.
+
+## 2026-10-09: Notification Permission Is Not Invitation Or Unrestricted Cleanup
+
+- User explicitly permits Feishu new-record notifications; reviewed create UI states that impact rather than asserting no notifications. No invitation or software node advancement; cloud record scope still previewed and confirmed.
+- Unknown-result reconciliation must not adopt external unedited fields/roles/status or enable cleanup without no-intervention evidence. Such create records can read back successfully while remaining cleanup-blocked and visibly unavailable for automatic mutation. Never loosen protection merely to make a test cleanup green.
+- Reevaluate notifications before production or new workflows; exact cloud cleanup remains action-time scoped. Read-before-create is not an atomic cross-computer uniqueness guarantee.
+
+## 2026-10-09: Bulk Cloud Writes Retain Submitted Identity And Uncertainty
+
+- Bulk creation is distinct from local library contact backfill. Common maintainer/source apply to a frozen selected queue; each row has an independent expiring preview and a final eligible-only confirmation. No automatic dispatch after preparing. Stop waits for the current bounded write/readback then prevents the next row.
+- Results belong to the submitted account/name/maintainer snapshot, not a mutable current list position. Preserve a separate submission history and recover journal unknowns on connection restore; show original ownership after personnel changes. Unknowns expose read-only reconciliation, never automatic repeat creates.
+- Platform quote inputs accept exact yuan values only; blank is missing, not zero. Only unique configured number/text platform fields are allowed, never nonreported costs/rebates. Live metadata/type/unit/readback remains a release gate, not proved by the UI label.
+- Editing identity cancels old query authority at click and dispatch, not just cosmetic confirmation. Expired previews disable new controls and give feedback for stale clicks. Reevaluate on schema/API limits and live acceptance; source/fixtures are not a delivered installer. See [goal report](FEISHU_BULK_SYNC_2026-10-09.md).
+
+## 2026-10-09: Business Dedup Includes Current Maintainer
+
+- User confirms same homepage account/same current maintainer skips new registration, different maintainer permits another record. Scope by project/type/platform; nickname and quotes are not identity keys. Registration does not prove invitation success.
+- Compare stable selected member identities in the confirmed maintainer role, not API actor/name text. Ownerless, malformed and partial results block writing; never turn query failure into no match.
+- Recheck exact remote matches immediately before dispatch, preserve local unknown-result journal guards, and allow bounded independent row previews without weakening expiry/person refresh/single-use checks. Client checks alone do not guarantee atomic dedup across computers.
+- Source milestone/tests complete, not installed acceptance or bulk UI. Reevaluate if business permits multiple contracts per same maintainer/account or platform schema/concurrency changes. See [goal report](FEISHU_BULK_SYNC_2026-10-09.md).
+
+## 2026-10-09: Batch Lookup Is Reviewed Local Backfill, Not Bulk Cloud Mutation
+
+- Use explicit multi-selection, exact homepage account-number confirmation and the existing serialized single-row API. Keep a 50-row ceiling, short-lived independent run/row previews, source/type review and fresh identity/contact guards. Never auto-apply on selection or query, guess a conflicting source, replace local values or widen endpoints/permissions for batching.
+- One confirmation applies only checked eligible local patches and reports per-row persistence. Stop is effective after the current bounded operation/save. Roll back failed local patches without undoing newer operator edits, so later saves cannot silently persist reported failures.
+- This affects the Team Library Backfill UI and local review store, not existing Feishu records or test-cloud write approvals. Reevaluate on API limits, identity/schema changes, persistence conflicts and real batch acceptance. Source/fixture tests pass; installed/live acceptance remains open. See [evidence](FEISHU_BATCH_BACKFILL_2026-10-09.md).
+
+## 2026-10-08: Explicit Enterprise-Public Non-Store Release
+
+- After the blank specified-space selector blocked verification, user proposed Public and explicitly confirmed the disclosed enterprise-wide/non-store release of EXISTING17 groups. This supersedes the single-space plan below, not all future permissions or unrestricted business operations.
+- Verified enterprise plugin and store publication are separate controls; official documentation bounds enterprise plugins to their tenant. Do not conflate Public usage with market distribution, and never choose it just because it is a default or a selector failed. Wider installation scope still requires exact approval.
+- October8 observation:0.0.2 Published/share lists17 but target installation still0.0.1. October9 reloaded statistics now confirm installed0.0.2 and real maintainer/role lookup passes. Publication, installation/data authorization, effective interface permissions and business acceptance remain separate; assignment/CRUD/cleanup are not proved by this lookup. Keep endpoint allowlists, marked test-only writes, human previews and exact cleanup.
+- Reevaluate least privilege and distribution before production, adding capabilities or other recipients. Current main flow does not require all attached mutation rights; their availability is not permission to use them. See [dated evidence](FEISHU_ACCEPTANCE_2026-10-08.md).
+
+## 2026-10-08: Bounded Existing Permission Set At User Request
+
+- User rejects the proposed five-group minimum after the fourteen-addition powers were shown, requesting all available rights for future use. Limit this choice to the original test plugin's CURRENT seventeen groups and original specified-space/internal/non-store release, not arbitrary future permissions, public sharing or the newer identity. This is a release plan/consent, NOT a completed release or business-action authorization.
+- Broader configuration/user/comment/view mutation rights are not necessary for the current main flow and carry risk. Keep client endpoint allowlists, human previews, marked test-only writes, no changes to real existing records and exact approved cleanup; grant availability must not trigger implementation/use automatically.
+- Reevaluate least privilege before production or scope/recipient changes; new powers need separate precise approval. Empty target labels are not safe release evidence: the prepared 0.0.2 is unsubmitted pending destination verification. See [current evidence](FEISHU_ACCEPTANCE_2026-10-08.md).
+
+## 2026-10-08: Preserve Connection And Separate Acceptance Evidence
+
+- Weekly consolidation promotes the authorized encrypted-connection and manual-maintainer rules into AGENTS. Do not interpret a missing business sample as a reason to request credentials again, or silently replace the chosen maintainer with the API actor.
+- Cross-process encryption tests must use normal app.quit with the same isolated profile and retain Local State; app.exit can skip state flush. The recorded Windows test failed with forced exit and passed after normal shutdown. This is a persistence-test requirement, not a Feishu-permission diagnosis. See [evidence](FEISHU_CONNECTION_PERSISTENCE_2026-09-30.md).
+- [Installed evidence](FEISHU_ACCEPTANCE_2026-10-08.md) separately accepts restored schema and an empty-manifest guard. Negative person-search evidence does not accept a real member/role; no local cleanup object does not establish cloud deletion capability. Preserve write, notification and action-time confirmation gates.
+- Scope is repository guidance/test methodology only. Reevaluate on encryption/profile lifecycle changes or contradictory live evidence. Saved-profile upgrades, positive person/role/contact and live CRUD remain open; their learning entries are retained. This weekly review performed no account operation or new live acceptance.
+
+## 2026-09-30: Remember The Authorized Connection Locally
+
+- Explicit user correction supersedes the historical session-only/no-persistence design: remember successful Feishu connection by default, encrypt only in the local user's Electron safeStorage, restore authentication/schema without repeating entry.
+- Never embed actual credentials in source or installers, expose them back to renderer, fall back to plaintext, persist API tokens or auto-run business writes. Disconnect retains the profile while pausing automatic restore; forget deletes the exact config only after confirmation. Preserve Electron userData/Local State during upgrade.
+- Failed restore must not silently loop or overwrite the saved profile. Authentication renewal invalidates business confirmation. API actor remains distinct from the manually selected maintainer.
+- Reevaluate on encryption availability, profile/account migration, rotation or permission changes. Genuine-account normal installed-app restart was verified on 2026-09-30 without typing or reconnect clicks (connected/saved/27 fields); saved-profile upgrade and CRUD remain separate gates. See [evidence](FEISHU_CONNECTION_PERSISTENCE_2026-09-30.md).
+
+## 2026-09-30: Manually Choose The Current Maintainer
+
+- User correction supersedes mandatory connected-actor name lookup/self-confirmation below. Let the user enter a maintainer's full name and explicitly choose the matching Feishu person; connection User Key remains solely the API actor and need not equal the business assignee.
+- Search only that name in the connected project using the official user/search contract. Keep stable person keys in main-process session memory; expose opaque candidate tokens and minimal labels. Reject indistinguishable same-name candidates; never default to the first candidate, even with a single result.
+- New-follow-up preview, short-lived choice authority, fresh member/role checks, role_owners injection and strict readback remain required. Lookup/update do not reassign existing team records. Typed names are not authentication or ordinary text role values.
+- Reevaluate on live search/role eligibility or permission evidence and schema drift. Local tests and packaging do not establish actual assignment or full CRUD acceptance. See [manual-selection evidence](FEISHU_MANUAL_MAINTAINER_2026-09-30.md).
+
+## 2026-09-30: Review And Read Back The Current-Maintainer Role
+
+Historical actor-selection default superseded by the manual-selection decision above; the remaining write/readback boundaries still apply.
+
+- Resolve the exact connected user and unique live maintainer role separately from contact lookup; do not treat user details as proof of account ownership. Require manual person confirmation and bind create authority to the session/target/live snapshot.
+- Set only the maintainer on new follow-ups using role_owners and role_mode:1; preserve other default roles, never mutate a matched library record or silently reassign during an ordinary update.
+- Include owner readback in success and uncertain-result reconciliation; record creation alone cannot establish assignment success. Missing/ambiguous/changed/inactive identities fail closed without broad searches or automatic correction.
+- Official contracts and local regressions support implementation, not real acceptance. Reevaluate after user/role permission checks, authenticated per-colleague identity design, target notification/default configuration or API drift. See [evidence](FEISHU_MAINTAINER_BINDING_2026-09-30.md).
+
+## 2026-09-30: Current Maintainer Is A Business Assignment, Not The API Actor
+
+Historical per-colleague/default-to-actor proposal superseded by explicit user-selected business assignment above.
+
+- Confirmed requirement: the user's intended person field is `现维护经纪人`, not created_by/updated_by. Each colleague needs their own operator identity; proposed new-follow-up assignment defaults to that colleague after explicit identity review.
+- Boundary: lookup/local contact fill must not overwrite the existing team's maintainer or copy that assignment into a new follow-up. Assignment and API actor remain separate concepts; a supplied User Key/name is not proof of account ownership.
+- Mapping evidence: current real create form shows `现维护经纪人` as a role-bound control and again inside `角色与人员`; `商务经纪/达人运营` is a separate control. The saved 27-field metadata contains role_owners rather than a standalone same-named field. Do not alias the multi_user business field, write plain display names, change the creator role or hardcode a person/role key. Verify API role configuration and write/readback format before implementing assignment.
+- Evidence limit: initial browser reads timed out; a longer bounded read succeeded and the unfilled create form was inspected then canceled without saving. Role UI semantics are verified, but current-user identity and API role assignment/write acceptance are not; no permissions changed.
+
+## 2026-09-30: Explicit Feishu Operations And Run-Scoped Authority
+
+- Decision: keep create/update/test cleanup as visible mode tabs; clear identity, target and safety checks when changing runs, preserving only the connection session.
+- Reason: actual native UI hid operations and showed disabled controls as actionable; stale per-run confirmation is misleading even when backend ownership checks remain effective.
+- Scope: renderer layout/state and existing status IPC only; no relaxed mutation guards, persistent credentials or automatic sync.
+- Reevaluate: after current visual/new-artifact/real-workflow acceptance or an approved batch synchronization design. Do not infer real CRUD acceptance from mode-switch tests.
+
+## 2026-09-30: Full Main-Product Flow With Separate Record Ownership
+
+- Decision: connect lookup, confirmed local fill, new follow-up, update and cleanup in the main product; library matches supply data but never become automatic mutation targets. Same creator in a different run may produce a separately confirmed follow-up; duplicate/uncertain submission for the same run/row is blocked.
+- Reason: user corrected a read-only scope reduction. Existing library data must not be overwritten merely because it matched.
+- Scope: single-creator test-mode actions, current preview/confirmation, first-create marker/batch and durable private manifest. Only verified software-created records may update/delete; remote changes halt mutation. Credential session is ephemeral and official API transport is bounded without retry.
+- Reevaluate: actual target schema/default automation or live API evidence contradicts the prepared contracts; explicit production/batch scope approval. Offline tests, a diagnostic hit and dir packaging do not establish live CRUD or installed delivery. See [evidence](FEISHU_WORKBENCH_INTEGRATION_2026-09-30.md).
+
+## 2026-09-30: Bound Legacy Account-Number LF Compatibility
+
+- Decision: the single-creator diagnostic queries platform AND an OR of two exact identity texts (canonical account number, canonical plus one terminal LF). Response identities must belong to that set; do not trim arbitrary whitespace or change leading zeros. Preserve conflicts across both variants.
+- Evidence: a real canonical query returned zero while the corresponding visible record has one terminal LF in its account-number DOM text. API raw value and causality await real repro; compatibility is not live acceptance.
+- Scope: opt-in pure-query mapping, enabled by the local diagnostic; no fuzzy/nickname/contains lookup, retries, full-library scan or record cleanup. Empty results cannot claim identity verification.
+- Reassess: contradictory live API evidence, index/scope mismatch or another documented legacy format. Diagnose instead of widening by guesswork.
+
+## 2026-09-30: Resolve Contact Lookup From The Target's Live Metadata
+
+- Decision: resolve unique exact business field names/types and the scoped Xiaohongshu option label/value from the same target work-item type's meta. Read select responses as objects, query option IDs as lists. Reject ambiguous/disabled/missing options; do not guess codes or widen configuration permissions.
+- Reason: official metadata and field-format documentation establish these contracts; the earlier scalar fixture was wrong. Existing confirmed account-number semantics remain unchanged.
+- Scope: one-shot local read-only query/preview; token remains in memory for that run only, private contacts display locally while persisted evidence excludes values/identities/record IDs. No product sync or write acceptance implied.
+- Reassess: actual API schema/response contradicts documentation or target configuration changes; stop and inspect bounded evidence rather than guessing fallback identities.
+
+## 2026-09-28: Match Visible XHS Account Numbers
+
+- User confirmed the Feishu XHS ID field contains the profile's displayed account number, not its internal URL ID.
+- Treat it as text, preserving leading zeros. Require exact platform plus account number; no nickname or PGY/profile-ID fallback.
+- The read client uses one bounded official search request, returns proposals only, and performs no writes or automatic pagination/retries.
+- Reevaluate individual legacy records if live evidence reveals mixed namespaces. Actual platform option/readback mapping remains unverified; offline tests are not live acceptance.
+
+Last reviewed: 2026-09-23 (approved plugin grants verified; no business API call).
+
+## 2026-09-23: Prepare CRUD Permissions Without Authorizing Real-Record Writes
+
+- Applied update: user confirmed the complete disclosed groups; exactly those three were enabled through Batch Acquire and survived reload. Corrected and reload-verified the test name/description while preserving marker/batch. Scope approval is complete for these groups; publication, data authorization and actual business operations are separate and remain pending. See the applied result in the review below.
+- User decision: include create, update and delete along with the previously discussed read permission. Supersedes the read-only target configuration, not the unwired read-only module's existing implementation boundary.
+- Evidence: the [live permission review](FEISHU_PERMISSION_REVIEW_2026-09-23.md) found create inside the broad write group; that group also covers workflow changes, attachments and other operations. The delete group also covers attachments, subtasks and work logs. All three groups remain not enabled.
+- Impact: disclose these extra platform powers before action-time grant confirmation; request no unrelated management/configuration groups. Scope data separately through administrator authorization. Any eventual writes require the existing AI-test marker, exact manifest and operation-specific approval; granting deletion is not permission to delete real records.
+- Reevaluate when the user confirms the actual bundled groups, the platform changes grouping, or production operation scope is explicitly approved. Rename the old read-only test identity after expansion, preserve its marker/batch, and do not claim client enforcement or live CRUD until implemented and verified.
+
+## 2026-09-21: Separate Feishu Authorization Setup From Product Acceptance
+
+- Consolidated decision: prepare any approved internal test through explicit gates for identity/configuration, actual permission group, specified-space release without store listing, administrator installation/data authorization, and live client acceptance. Do not default to owner transfer or infer permission from a request to publish when ready.
+- Evidence: the [September 15 real UI report](FEISHU_PLUGIN_SETUP_2026-09-15.md) found an empty owner-managed debug selector but a selectable target space in the release form. It also showed a broader indivisible read group and unsafe-for-this-test public/store defaults. These are dated observations, not fresh account checks or completed release approval.
+- Impact: disclose the full read group, constrain actual data and client calls, and confirm each consequential action. API-only test setup need not invent a frontend artifact. Reopen or reload required configuration to distinguish persisted values from editor-only text; keep credential-bearing page inspection scoped.
+- Open gates: details persistence, read-group approval, publication, installation and real API acceptance remain unresolved. No grant, transfer, release or implementation change is authorized by this memory review.
+- Reevaluate when the platform permission grouping or release/debug workflow changes, or a fresh authorized live check supplies contradictory evidence. Preserve the latest failed acceptance until a matching successful check replaces it.
+
+## 2026-09-14: Keep Metadata Preparation Read-Only And Unwired
+
+- Decision: introduce a standalone main-process metadata reader, with a fixed official origin, explicit target/credentials, strict plugin-mode user permissions, bounded reads, no redirects and no retries. Preserve old envelope behavior.
+- Why: target keys and browser login do not supply API authorization; offline preparation must not silently enable writes or reuse account Cookies. Error payloads can expose secrets and cannot be forwarded verbatim.
+- Boundary: this is tested source preparation, not a configured credential store, live metadata response, sync button or creation/cleanup permission. See [evidence](FEISHU_METADATA_READER_2026-09-14.md).
+- Reevaluate once real authorized metadata and secure per-user credential setup are available, before application wiring or support for additional hosts.
+
+## 2026-09-14: Mark And Bound All Prelaunch Feishu Test Writes
+
+- User decision: every prelaunch test object must be visibly marked AI test and removable after testing. Apply the [prelaunch policy](FEISHU_PRELAUNCH_TEST_POLICY.md) before real writes.
+- Implementation boundary: marker and unique batch accompany creation; retain an exact protected manifest. No tests modify real records, and cleanup requires destination/manifest/marker/batch agreement, a preview and action-time confirmation.
+- Reevaluate only on explicit production approval. UI marker candidates and the official deletion endpoint were inspected; actual marking/deletion capability and API authorization remain unverified. Documented policy is not an implemented write guard or permission to create/send/delete.
+
+## 2026-09-14: One Resource Export With Explicit Column Semantics
+
+- Decision: the top resource action exports the checked columns; settings live directly below it in a collapsed section. Explicit selections preserve even empty headers, while omitted selections retain legacy default pruning. Invalid/empty explicit selections fail instead of exporting everything.
+- Why: the previous top action ignored checks, both paths pruned unavailable fields, and the resource mapper missed documented summary/metric aliases. Preserve numeric zero; never infer structured metrics from freeform outreach notes or invent missing measurements.
+- Impact: await the workbook writer before reporting success; freeze run/columns per request, prevent repeated clicks, and expose retryable column-load failures. No change to raw-detail/contact exports, account partitions, collection/calibration or invitation send gates.
+- Reevaluate when: raw collection schemas or the resource-column contract change. Real XLSX round trips and isolated DOM tests do not establish installed-app or colleague-data acceptance.
+
+## 2026-09-10: Bound Owned Navigation And Convert Native Geometry
+
+- Decision: only the current operation's canonical creator/form may finish same-document initialization inside a 750 ms quiet window, bounded by 3 seconds of settling and 25 seconds for the full owned URL load. Recoverable aborted loads use the same gate; other load errors fail. Full reloads, different targets and any navigation after reads still invalidate preparation. Diagnostics contain operation/reason/event type, not account or creator data.
+- Why: immediate post-load checks can reject initialization; the old error fallback skipped readiness, and a never-resolving load held the operation lock indefinitely. These gaps are reproduced locally; the precise live platform trace remains unconfirmed.
+- Impact: no change to account partitions, protected collection page, per-recipient confirmation, strict current-field readback, or uncertain-send reconciliation. Width persistence stays CSS pixels; main-process BrowserView rectangles use only the trusted renderer zoom, never a supplied zoom/device scale.
+- Reevaluate when: real installed acceptance provides contradictory event/geometry evidence, PGY changes its route identity, or Electron changes navigation/zoom behavior. A built installer is not live acceptance.
+
+## 2026-09-08: Current Form Evidence And Owned Invitation Operations
+
+- Decision: prepare and send share one current-value reader; only calendar-valid equivalent dates normalize. Every pending operation owns its immutable recipient/template context, WebContents and navigation generation. After input dispatch, an unreadable outcome remains unconfirmed until the operator reconciles it.
+- Why: offscreen labels and replaced hints produced false changes, stale-value fallbacks could approve the wrong content, and delayed replies could attach to another recipient or invite a duplicate retry.
+- Impact: conservative serial preparation, explicit per-recipient send confirmation, distinct unreadable/changed diagnostics, operation-specific busy/stop states, and independent DOM/IPC/batch/artifact fixtures. Account partitions and collection/calibration logic remain unchanged.
+- Reevaluate when: platform form semantics or Electron navigation lifecycle changes. Real-account acceptance remains separate from synthetic fixture success.
 
 ## 2026-09-02: Preserve Successful Batch Position And Reuse The Mail Workspace
 
@@ -648,6 +999,13 @@ Update on 2026-08-12: exact navigation-context equality was too strict after a v
 - Why: PGY retained the prior page's light-background token after page two became active, while the saved nickname selector now included location and tags after the nickname. The first defect misreported page two as page one and prevented restoration; the second rejected all valid ID-bearing rows.
 - Impact: page transitions and restoration use the actual selected control, current creator information blocks can authorize sanitized response rows, and unbounded prefix collisions still fail. Successful candidate capture also clears stale response failures; only known list routes may report schema mismatch.
 - Reevaluate when: PGY changes its selected-page tokens, nickname ceases to lead the calibrated information block, virtualizes partial rows, or provides an official ordered export. Complete ordered identity and fail-closed collision handling remain required.
+
+## 2026-09-04: Treat Splitters As Persistent Workspace Controls
+
+- Decision: implement both vertical splitters with Pointer Events and pointer capture, give them a visible 14 px hit area, and persist only clamped console/sidebar widths in renderer local storage. Keep the browser at least 320 px, the console at least 620 px, the content area at least 360 px, and re-clamp both renderer and native BrowserView bounds after window resizing.
+- Why: the old code still existed, but a 10 px transparent mouse-only target, conflicting CSS/JavaScript limits, and unconditional startup reset made the feature unreliable and made successful dragging disappear on restart.
+- Impact: operators can resize the sidebar, middle workbench, and browser allocation by mouse, pointer, or keyboard; double-click restores defaults; the next launch restores the prior usable layout. Collection, calibration, account partitions, and automation selectors remain outside this change.
+- Reevaluate when: Electron BrowserView is replaced, the minimum supported window width changes, or a product redesign introduces additional horizontal panes. Any replacement must retain direct manipulation, keyboard access, bounded widths, and reload persistence.
 
 ## 2026-09-07: Separate Outreach Composers And Keep Personal Templates Local
 

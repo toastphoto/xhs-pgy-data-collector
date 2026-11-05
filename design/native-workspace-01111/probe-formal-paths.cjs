@@ -1,0 +1,9 @@
+const fs=require('fs'),os=require('os'),path=require('path'),cp=require('child_process');
+const root='C:/Users/feibo/Documents/Codex/2026-06-25/s/projects/xhs-pgy-data-collector/desktop-app',asar=require(root+'/node_modules/@electron/asar');
+const temp=fs.mkdtempSync(path.join(os.tmpdir(),'pgy-path-probe-'));
+const meta=JSON.parse(asar.extractFile('C:/Users/feibo/AppData/Local/Programs/content-analyzer-desktop/resources/app.asar','package.json'));
+meta.main='probe.cjs';delete meta.build;fs.writeFileSync(temp+'/package.json',JSON.stringify(meta));
+fs.writeFileSync(temp+'/probe.cjs',`const {app}=require('electron'),fs=require('fs'),path=require('path');const userData=app.getPath('userData'),sessionData=app.getPath('sessionData');const defaults={API_HOST:'127.0.0.1',API_PORT:'8010',DATA_DIR:path.join(userData,'content-analyzer/data'),OUTPUT_DIR:path.join(userData,'content-analyzer/output'),LOG_DIR:path.join(userData,'content-analyzer/logs')};const resolved=Object.fromEntries(Object.entries(defaults).map(([k,v])=>[k,process.env[k]||v]));fs.writeFileSync(process.env.PGY_PATH_OUTPUT,JSON.stringify({installedMetadataVersion:app.getVersion(),userData,sessionData,resolved,overrides:Object.keys(defaults).filter(k=>!!process.env[k]),userDataExists:fs.existsSync(userData),sessionDataExists:fs.existsSync(sessionData),profileContentsRead:false,method:'Electron path resolution using installed105 metadata before ready; no product main loaded; historical running process environment unavailable'},null,2));app.exit(0);`);
+const env={...process.env,PGY_PATH_OUTPUT:path.resolve('FORMAL105-PATHS-LOCAL.json')};delete env.ELECTRON_RUN_AS_NODE;
+cp.execFileSync(root+'/node_modules/electron/dist/electron.exe',[temp],{env,windowsHide:true,timeout:20000});
+const result=JSON.parse(fs.readFileSync('FORMAL105-PATHS-LOCAL.json'));console.log(JSON.stringify(result));

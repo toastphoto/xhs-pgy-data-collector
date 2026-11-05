@@ -229,7 +229,7 @@ class TaskRunner {
   _emitState() {
     this._writeTaskState();
     try {
-      this.deps.sendState(JSON.parse(JSON.stringify(this.state)));
+      this.deps.sendState(this.getState());
     } catch (err) {
       try {
         console.error(`[TaskRunner] sendState failed: ${String(err?.message || err)}`);
@@ -392,6 +392,37 @@ class TaskRunner {
     return result.ok ? Number(result.lastFinishedAt || 0) : 0;
   }
 
+  getState() {
+    const state = JSON.parse(JSON.stringify(this.state));
+    state.unfinishedRun = null;
+    state.cooldownUntil = 0;
+    state.recoveryError = '';
+    if (state.running) return state;
+    const cooldown = this._readCooldownState();
+    if (!cooldown.ok) {
+      state.recoveryError = '无法读取上次任务状态，请保留结果目录并重试。';
+      return state;
+    }
+    if (!cooldown.activeRunId) {
+      state.cooldownUntil = cooldown.lastFinishedAt ? cooldown.lastFinishedAt + SAFE_RUN_COOLDOWN_MS : 0;
+      return state;
+    }
+    const info = { runId: cooldown.activeRunId, runDir: cooldown.activeRunDir, taskName: '', updatedAt: '', total: null, processed: null };
+    state.unfinishedRun = info;
+    try {
+      if (!info.runDir || !isPathInside(this.deps.getRunsDir(), info.runDir)) throw new Error('invalid path');
+      const saved = JSON.parse(fs.readFileSync(path.join(info.runDir, TASK_STATE_FILE), 'utf8'));
+      if (saved.runId !== info.runId || !Array.isArray(saved.queue)) throw new Error('invalid task');
+      info.taskName = String(saved.signingTask?.taskName || '');
+      info.updatedAt = String(saved.updatedAt || '');
+      info.total = saved.queue.length;
+      info.processed = saved.queue.filter(item => ['ok', 'fail', 'skipped'].includes(item?.status)).length;
+    } catch (_) {
+      info.error = '旧任务详情暂时无法读取；恢复时会显示具体原因。';
+    }
+    return state;
+  }
+
   _writeCooldownState(payload) {
     const cooldownPath = this._getCooldownPath();
     if (!cooldownPath) return false;
@@ -498,12 +529,14 @@ class TaskRunner {
         return false;
       });
     const hasUnfinished = rawQueue.some((item) => ['pending', 'running', 'paused'].includes(String(item?.status || '')));
+    const pendingFinalization = payload?.recoveryPending === true
+      || (['completed', 'stopped_by_user'].includes(payload?.finishReason) && Number(payload?.finishedAt) > 0);
     if (
       Number(payload?.schemaVersion || 0) < TASK_STATE_SCHEMA_VERSION
       || !runId
       || !templatePath
       || invalidQueue
-      || !hasUnfinished
+      || (!hasUnfinished && !pendingFinalization)
     ) {
       return {
         ok: false,
@@ -517,6 +550,9 @@ class TaskRunner {
     const cooldownState = this._readCooldownState();
     if (!cooldownState.ok) {
       return { ok: false, code: 'PGY_COOLDOWN_STATE_INVALID', error: '无法确认恢复任务的冷却边界' };
+    }
+    if (!hasUnfinished && !cooldownState.activeRunId) {
+      return { ok: false, code: 'PGY_TASK_ALREADY_FINISHED', error: '任务已经结束，无需恢复' };
     }
     if (cooldownState.activeRunId && cooldownState.activeRunId !== runId) {
       return {
@@ -600,7 +636,7 @@ class TaskRunner {
   }
 
   async start(payload) {
-    if (this.state.running) return { ok: false, error: '任务正在运行中' };
+    if (this.state.running || this._loopPromise) return { ok: false, error: '任务正在运行中或正在收尾，请稍后重试' };
 
     const templatePath = String(payload?.templatePath || '').trim();
     if (!templatePath) return { ok: false, error: '未选择模板（请先到「采集模板」里选择/保存一个模板）' };
@@ -822,6 +858,11 @@ class TaskRunner {
     this.state.stopReason = reason === 'user' ? '用户停止整批任务' : String(reason || '停止整批任务');
     this.state.pausePending = false;
     this.state.pauseRequestedAt = null;
+    // Recovery has no loop to consume the request; it is already at a safe point.
+    if (this._recoveryPending && !this._loopPromise && !this.state.currentId) {
+      this._stopRunIfRequested(null);
+      return this._finishRun();
+    }
     this._wakeControlWaiters('stop');
     if (this._pauseGateResolve) {
       const resolve = this._pauseGateResolve;
@@ -1176,6 +1217,10 @@ class TaskRunner {
     }
 
     if (this._stopRequested) this._stopRunIfRequested(null);
+    this._finishRun();
+  }
+
+  _finishRun() {
     const stoppedByUser = this._stopRequested;
     const finishedAt = Date.now();
     this.state.running = false;
@@ -1195,8 +1240,21 @@ class TaskRunner {
     this._skipRequested = false;
     this._stopRequested = false;
     this._recoveryPending = false;
-    this._writeLastFinishedAt(finishedAt);
+    // Commit the terminal queue before releasing the active-run boundary.
+    if (!this._writeTaskState() || !this._writeLastFinishedAt(finishedAt)) {
+      this.state.running = true;
+      this.state.paused = true;
+      this.state.pauseReason = '结束状态保存失败，请重试停止；已采集结果保留。';
+      this.state.recoveryPending = true;
+      this.state.finishReason = '';
+      this.state.finishedAt = null;
+      this._recoveryPending = true;
+      this._emitState();
+      return { ok: false, code: 'PGY_TASK_FINISH_PERSIST_FAILED', error: this.state.pauseReason };
+    }
+    this.state.persistenceError = null;
     this._log(stoppedByUser ? 'warn' : 'info', stoppedByUser ? '任务已由用户安全停止' : '任务队列已完成');
+    return { ok: true, pending: false, stopped: stoppedByUser };
   }
 }
 

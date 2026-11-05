@@ -1,0 +1,7 @@
+const fs=require('fs'),path=require('path'),crypto=require('crypto'),assert=require('assert/strict');
+const root='C:/Users/feibo/Documents/Codex/2026-06-25/s/projects/xhs-pgy-data-collector/desktop-app',asar=require(root+'/node_modules/@electron/asar');
+const old=root+'/dist-coexist-qa-01109/win-unpacked/resources/app.asar',next=root+'/dist-coexist-qa-01110/win-unpacked/resources/app.asar';const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
+const changes=[];const files=f=>asar.listPackage(f).map(x=>path.normalize(x.replace(/^[/\\]/,''))).filter(x=>!asar.statFile(f,x).files);const before=files(old),after=files(next);assert.deepEqual(before,after);
+for(const p of after)if(hash(asar.extractFile(old,p))!==hash(asar.extractFile(next,p)))changes.push(p.replace(/\\/g,'/'));
+assert.deepEqual(changes.sort(),['main.js','package.json']);assert.equal(asar.extractFile(next,'main.js').toString(),fs.readFileSync(root+'/main.js','utf8'));
+const exe=root+'/dist-coexist-qa-01110/PGY-Workbench-QA-0.1.110-setup.exe';const result={version:'0.1.110',changesFrom109:changes,sourceMatchesAsar:true,installerBytes:fs.statSync(exe).size,installerSHA256:hash(fs.readFileSync(exe)),asarSHA256:hash(fs.readFileSync(next)),formal105SHA256:hash(fs.readFileSync('C:/Users/feibo/AppData/Local/Programs/content-analyzer-desktop/resources/app.asar'))};fs.writeFileSync('QA110-MANIFEST.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));

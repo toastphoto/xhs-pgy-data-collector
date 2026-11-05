@@ -18,6 +18,7 @@ import {
   upsertOutreachTemplate
 } from '../state/outreach_templates.mjs';
 import { createAdvancedSection } from '../ui/components.js';
+import { renderFeishuWorkbench } from './feishu.js';
 
 let _runs = [];
 let _selectedRunDir = '';
@@ -28,6 +29,8 @@ let _checked = new Set();
 let _query = '';
 let _colsLoadedOnce = false;
 let _activeGroup = '';
+let _resourceColumnsOpen = false;
+let _resourceExportBusy = false;
 let _contactGroupTag = '';
 let _contactProjectName = '';
 let _contactGreeting = '你好，我们想和您沟通一下{{项目名称}}合作，方便的话可以通过一下好友吗？';
@@ -57,6 +60,11 @@ let _contactLoadedRunDir = '';
 let _contactSaveTimer = null;
 let _contactPendingSave = null;
 let _contactSaveInFlight = null;
+const _contactFailedSaveRuns = new Set();
+const _contactReviewReadErrors = new Map();
+let _contactRunGeneration = 0;
+let _contactPreviewRequest = 0;
+let _contactReviewEditGeneration = 0;
 let _contactRunSwitchTarget = '';
 let _contactSearch = '';
 let _contactStatusFilter = 'all';
@@ -67,12 +75,16 @@ let _contactChannelFilter = 'all';
 let _contactBatchFollowupStatus = '待建联';
 let _contactBatchChannel = '蒲公英邀约';
 const _contactReviewViewportStates = createReviewViewportStateRegistry();
+const _contactReviewReadingStates = new Map();
+const _contactReviewReadingNodes = new Map();
+let _contactReviewFocus = null;
 let _contactBulkActionsOpen = false;
 let _autoPreviewRequestedRunDir = '';
 let _contactSaveStatus = '';
 let _lastContactExportPath = '';
 let _contactExportState = { status: 'idle', message: '', outPath: '' };
 let _xhsContactListenerBound = false;
+let _xhsContactScope = null;
 const _autoEnrichmentStartedRuns = new Set();
 let _xhsContactState = {
   running: false,
@@ -97,6 +109,9 @@ let _emailHandoffState = {
 };
 let _pgyInviteAccountState = { status: 'unknown', message: '邀约账号尚未检测。' };
 const _pgyInviteDraftStates = new Map();
+let _pgyInviteOperation = null;
+let _pgyInviteRevision = 0;
+let _pgyInviteBatchSequence = 0;
 let _pgyInviteBatchState = {
   status: 'idle',
   rowIds: [],
@@ -117,9 +132,12 @@ function setMsg(s) {
   store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
 }
 
-function setContactSaveStatus(s) {
+function setContactSaveStatus(s, { refresh = true } = {}) {
   _contactSaveStatus = s || '';
-  store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  for (const node of document.querySelectorAll('[data-contact-save-status]')) node.textContent = _contactSaveStatus;
+  if (refresh && !document.activeElement?.closest('.contact-composer')) {
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  }
 }
 
 async function refreshRuns() {
@@ -142,19 +160,18 @@ async function refreshRuns() {
   }
 }
 
-async function ensureColumnsLoaded() {
-  if (_colsLoadedOnce) return;
+async function ensureColumnsLoaded(force = false) {
+  if (_colsLoadedOnce && !force) return;
   _colsLoadedOnce = true;
   try {
     const r = await window.desktopAPI.exports.getResourceColumns();
-    if (r?.ok) {
-      _columns = Array.isArray(r.columns) ? r.columns : [];
-      _groups = Array.isArray(r.groups) ? r.groups : [];
-    }
+    if (!r?.ok || !Array.isArray(r.columns) || !r.columns.length) throw new Error(r?.error || '没有可用的导出列');
+    _columns = r.columns;
+    _groups = Array.isArray(r.groups) ? r.groups : [];
     const p = await window.desktopAPI.exports.loadColumnPreset();
+    if (!p?.ok) throw new Error(p?.error || '上次列设置读取失败');
     const preset = p?.ok && Array.isArray(p.selectedColumns) ? p.selectedColumns.map(String) : [];
     const known = p?.ok && Array.isArray(p.knownColumns) ? p.knownColumns.map(String) : [];
-    const presetSet = new Set(preset);
     const knownSet = new Set(known);
 
     // 规则：
@@ -163,13 +180,16 @@ async function ensureColumnsLoaded() {
     if (!preset.length) {
       _checked = new Set(_columns);
     } else {
-      _checked = new Set(preset);
+      _checked = new Set(preset.filter((column) => _columns.includes(column)));
       _columns.forEach((c) => {
         if (!knownSet.has(c)) _checked.add(c); // 新增列默认勾选
       });
     }
-  } catch (_) {
-    // ignore
+  } catch (error) {
+    _columns = [];
+    _groups = [];
+    _checked.clear();
+    setMsg(`导出列加载失败：${error?.message || String(error)}。请点击“刷新结果”重试。`);
   }
 }
 
@@ -197,7 +217,8 @@ function getContactReviewViewportKey() {
   });
 }
 
-function applyXhsContactUpdate(update = {}) {
+function applyXhsContactUpdate(update = {}, scope) {
+  if (!xhsContactScopeCurrent(scope)) return false;
   const rowId = String(update.rowId || '');
   if (!rowId) return false;
   const review = _contactReviewMap.get(rowId);
@@ -219,10 +240,17 @@ function applyXhsContactUpdate(update = {}) {
   return true;
 }
 
+function xhsContactScopeCurrent(scope) {
+  return !!scope && !!_xhsContactScope && scope.runDir === _xhsContactScope.runDir
+    && scope.jobId === _xhsContactScope.jobId && _selectedRunDir === scope.runDir
+    && _contactRunGeneration === _xhsContactScope.generation;
+}
+
 function ensureXhsContactProgressListener() {
   if (_xhsContactListenerBound || !window.desktopAPI?.contacts?.onXhsProgress) return;
   _xhsContactListenerBound = true;
   window.desktopAPI.contacts.onXhsProgress((payload = {}) => {
+    if (!xhsContactScopeCurrent(payload)) return;
     if (payload.type === 'item_start' && payload.rowId) {
       _contactReviewViewportStates.setActiveRow(
         getContactReviewViewportKey(),
@@ -230,7 +258,7 @@ function ensureXhsContactProgressListener() {
         document.querySelector('.contact-review-list')
       );
     }
-    if (payload.type === 'item_result' && payload.update) applyXhsContactUpdate(payload.update);
+    if (payload.type === 'item_result' && payload.update) applyXhsContactUpdate(payload.update, payload);
     _xhsContactState = {
       ..._xhsContactState,
       running: typeof payload.running === 'boolean' ? payload.running : _xhsContactState.running,
@@ -280,6 +308,7 @@ function ensureXhsContactProgressListener() {
 }
 
 async function startXhsContactRows(targets, scopeLabel = '当前筛选', options = {}) {
+  if (_xhsContactState.running) return { ok: false, code: 'XHS_CONTACT_JOB_RUNNING' };
   if (!targets.length) {
     setMsg(`${scopeLabel}中没有已选达人。`);
     return { ok: false, code: 'NO_SELECTED_CREATORS' };
@@ -290,6 +319,13 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
     );
     if (!confirmed) return { ok: false, canceled: true };
   }
+  let jobId;
+  try { jobId = window.crypto?.randomUUID?.(); } catch (_) {}
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(jobId || '')) {
+    setMsg('无法建立补采任务标识，未启动补采。'); return { ok: false, code: 'XHS_SCOPE_UNAVAILABLE' };
+  }
+  const scope = Object.freeze({ runDir: _selectedRunDir, jobId, generation: _contactRunGeneration });
+  _xhsContactScope = scope;
   _xhsContactState = {
     running: true,
     paused: false,
@@ -305,10 +341,19 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
     lastCode: '',
     message: '补采任务正在启动'
   };
-  const result = await window.desktopAPI.contacts.enrichXhsBatch({
-    runDir: _selectedRunDir,
-    rows: buildExportRowsFromContactRows(targets)
-  });
+  let result;
+  try {
+    result = await window.desktopAPI.contacts.enrichXhsBatch({ runDir: scope.runDir, jobId,
+      rows: buildExportRowsFromContactRows(targets) });
+  } catch (_) {
+    result = { ok: false, code: 'XHS_CONTACT_FAILED', runDir: scope.runDir, jobId, error: '补采请求失败，请核对任务状态' };
+  }
+  if (!xhsContactScopeCurrent(scope)) return { ok: false, code: 'XHS_SCOPE_CHANGED' };
+  if (!xhsContactScopeCurrent(result)) {
+    _xhsContactState.running = false; _xhsContactState.phase = 'failed'; _xhsContactScope = null;
+    setMsg('补采响应归属无法核实，未回填或保存，请核对任务状态。');
+    return { ok: false, code: 'XHS_SCOPE_CHANGED' };
+  }
   if (!result?.ok) {
     _xhsContactState.running = false;
     _xhsContactState.phase = 'failed';
@@ -317,10 +362,20 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
       _xhsContactState.message = result.riskText || result.error || '安全验证';
     }
     setMsg(`小红书补采失败：${result?.error || 'unknown error'}`);
+    _xhsContactScope = null;
     return result;
   }
-  (Array.isArray(result.updates) ? result.updates : []).forEach(applyXhsContactUpdate);
-  await saveContactReviewNow();
+  (Array.isArray(result.updates) ? result.updates : []).forEach(update => applyXhsContactUpdate(update, scope));
+  let saved;
+  try { saved = await saveContactReviewNow(); }
+  catch (_) { saved = { ok: false }; }
+  if (!xhsContactScopeCurrent(scope)) return { ok: false, code: 'XHS_SCOPE_CHANGED' };
+  if (!saved?.ok) {
+    _xhsContactState.running = false; _xhsContactState.phase = 'failed'; _xhsContactScope = null;
+    setContactSaveStatus('补采内容保存失败，改动仍在当前页面；请重试保存复核');
+    setMsg('补采内容保存失败，未确认完成；请先成功保存复核再切换结果。');
+    return { ok: false, code: 'CONTACT_REVIEW_SAVE_FAILED' };
+  }
   _xhsContactState = {
     ..._xhsContactState,
     running: false,
@@ -335,6 +390,7 @@ async function startXhsContactRows(targets, scopeLabel = '当前筛选', options
   setMsg(result.canceled
     ? `小红书补采已停止：停止前处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`
     : `小红书补采完成：处理 ${result.updates?.length || 0} 人，找到联系方式 ${result.found || 0} 人，失败 ${result.failed || 0} 人。`);
+  _xhsContactScope = null;
   return result;
 }
 
@@ -421,6 +477,10 @@ function buildExportRowsFromContactRows(rows) {
       email: review.email || row.email || '',
       wechatId: review.wechatId || '',
       phone: review.phone || '',
+      contactRaw: review.contactRaw || '',
+      contactRawSource: review.contactRawSource || '',
+      contactRawCollectedAt: review.contactRawCollectedAt || '',
+      feishuAccountNumber: review.feishuAccountNumber || '',
       xhsProfileUrl: review.xhsProfileUrl || row.xhsProfileUrl || '',
       xhsProfileSourceCreatorUrl: review.xhsProfileSourceCreatorUrl || row.xhsProfileSourceCreatorUrl || '',
       contactSource: review.contactSource || '',
@@ -704,9 +764,15 @@ function createOutreachTemplateManager(method, fieldDefinitions) {
     status.textContent = _outreachTemplateStatus;
   });
 
+  function nextTemplateName(base) {
+    const names = new Set(getOutreachChannel(_outreachTemplateLibrary, channelKey).templates.map((item) => item.name));
+    let name = base;
+    for (let suffix = 2; names.has(name); suffix += 1) name = `${base} ${suffix}`;
+    return name;
+  }
+
   addButton.addEventListener('click', () => {
-    const name = window.prompt('请输入新模板名称：', '新模板');
-    if (!String(name || '').trim()) return;
+    const name = nextTemplateName('新模板');
     const id = createOutreachTemplateId(channelKey);
     const empty = { id, name: String(name).trim(), isDefault: false, subject: '', body: '' };
     _outreachTemplateLibrary = upsertOutreachTemplate(_outreachTemplateLibrary, channelKey, empty);
@@ -719,8 +785,7 @@ function createOutreachTemplateManager(method, fieldDefinitions) {
 
   saveAsButton.addEventListener('click', () => {
     const selected = getSelectedOutreachTemplate(_outreachTemplateLibrary, channelKey);
-    const name = window.prompt('另存为新模板：', `${nameInput.value || selected?.name || '模板'} 副本`);
-    if (!String(name || '').trim()) return;
+    const name = nextTemplateName(`${String(nameInput.value || selected?.name || '模板').trim()} 副本`);
     const id = createOutreachTemplateId(channelKey);
     _outreachTemplateLibrary = upsertOutreachTemplate(
       _outreachTemplateLibrary,
@@ -818,20 +883,33 @@ function getPgyInviteSettings() {
 }
 
 function invalidatePgyInviteDrafts() {
-  _pgyInviteDraftStates.clear();
+  _pgyInviteRevision += 1;
+  clearPgyInviteDraftReadiness();
   if (isPgyInviteBatchActive()) {
     _pgyInviteBatchState = {
       ..._pgyInviteBatchState,
-      status: 'stopped',
+      status: _pgyInviteOperation ? 'stopping' : 'stopped',
       stopRequested: true,
-      message: '邀约内容已修改，原批量队列已停止。请重新检查后再启动。'
+      message: _pgyInviteOperation
+        ? '邀约内容已修改，正在结束原操作；请核对已有发送结果后再启动。'
+        : '邀约内容已修改，原批量队列已停止；请核对已有发送结果后再启动。'
     };
+    for (const panel of document.querySelectorAll('.pgy-invite-batch-panel')) {
+      panel.className = `pgy-invite-batch-panel ${_pgyInviteBatchState.status}`;
+      panel.querySelector('.pgy-invite-batch-copy span').textContent = _pgyInviteBatchState.message;
+      const rows = getContactSelectedRows(), scope = contactReviewRunScope();
+      panel.querySelector('.pgy-invite-batch-actions').replaceChildren(makeSoftButton(
+        `蒲公英批量邀约（${rows.length}）`, () => {
+          if (contactReviewRunCurrent(scope) && _contactComposerMethod === '蒲公英邀约') return startPgyInviteBatch(getContactSelectedRows());
+        },
+        { primary: true, disabled: !rows.length || Boolean(_pgyInviteOperation) || _xhsContactState.running }
+      ));
+    }
   }
   document.querySelectorAll('.pgy-invite-row-status, .contact-pgy-action.send').forEach((node) => node.remove());
 }
 
-function getPgyInviteTemplateErrors() {
-  const template = getPgyInviteSettings();
+function getPgyInviteTemplateErrors(template = getPgyInviteSettings()) {
   const missing = [
     ['报备品牌', template.brandName],
     ['联系方式', template.contactWay],
@@ -863,81 +941,212 @@ function getPgyInviteDraftState(rowId) {
   return _pgyInviteDraftStates.get(getPgyInviteDraftKey(rowId)) || null;
 }
 
-async function preparePgyInviteForRow(row, rowId) {
-  const templateErrors = getPgyInviteTemplateErrors();
-  if (templateErrors.length) {
-    const message = `固定邀约模板不完整：${templateErrors.join('；')}`;
-    setPgyInviteDraftState(rowId, { status: 'error', message });
-    setMsg(message);
-    return { ok: false, code: 'PGY_INVITE_TEMPLATE_INCOMPLETE', error: message };
+async function exportSelectedResourceColumns() {
+  if (_resourceExportBusy) return;
+  const runDir = _selectedRunDir;
+  const selectedColumns = _columns.filter((column) => _checked.has(column));
+  if (!runDir) return setMsg('请先选择采集结果');
+  if (!selectedColumns.length) return setMsg('请至少勾选 1 个导出列');
+  _resourceExportBusy = true;
+  setMsg('正在写入达人资源表...');
+  try {
+    const preset = await window.desktopAPI.exports.saveColumnPreset(selectedColumns);
+    if (!preset?.ok) throw new Error(preset?.error || '导出列设置保存失败');
+    const result = await window.desktopAPI.exports.exportResourceRun({
+      runDir, selectedColumns, mode: 'slim'
+    });
+    if (!result?.ok) throw new Error(result?.error || '导出失败');
+    const empty = Array.isArray(result.emptyColumns) ? result.emptyColumns : [];
+    const emptySummary = empty.slice(0, 8).join('、') + (empty.length > 8 ? `等 ${empty.length} 列` : '');
+    const warning = empty.length ? `\n暂无数据的列（已保留）：${emptySummary}` : '';
+    setMsg(`导出成功：\n${result.outPath}\n达人 ${result.creators} 位，导出 ${result.exportedCols ?? selectedColumns.length} 列${warning}`);
+  } catch (error) {
+    setMsg(`导出失败：${error?.message || String(error)}`);
+  } finally {
+    _resourceExportBusy = false;
+    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
   }
-  setPgyInviteDraftState(rowId, { status: 'preparing', message: '正在打开达人、进入详细邀约表单并逐项填写...' });
-  const opened = await window.desktopAPI.invites.openCreator({ runDir: _selectedRunDir, rowId });
-  if (!opened?.ok) {
-    const message = `邀约账号打开达人失败：${opened?.error || 'unknown error'}`;
-    setPgyInviteDraftState(rowId, { status: 'error', message });
-    setMsg(message);
-    return { ...opened, ok: false, error: message };
-  }
-  const prepared = await window.desktopAPI.invites.prepare({
-    runDir: _selectedRunDir,
-    rowId,
-    template: getPgyInviteSettings()
-  });
-  if (!prepared?.ok) {
-    const message = `邀约准备失败：${prepared?.error || 'unknown error'}`;
-    setPgyInviteDraftState(rowId, { status: 'error', message });
-    setMsg(message);
-    return { ...prepared, ok: false, error: message };
-  }
-  const message = `邀约已准备：${prepared.creatorName || row.creatorName || '该达人'}；报备品牌、联系方式、产品、合作内容和发布时间均已填写并回读一致。请核对右侧后再确认发送。`;
-  setPgyInviteDraftState(rowId, { status: 'ready', message, prepared });
-  setMsg(message);
-  return { ...prepared, ok: true };
 }
 
-async function sendPreparedPgyInviteForRow(row, rowId) {
-  const state = getPgyInviteDraftState(rowId);
-  const prepared = state?.prepared;
-  if (state?.status !== 'ready' || !prepared?.token || !prepared?.fingerprint) {
-    setMsg('请先点击“准备邀约”，并等待模板校验通过。');
-    return { ok: false, code: 'PGY_INVITE_CONFIRMATION_REQUIRED', error: '请先准备邀约' };
+function clearPgyInviteDraftReadiness() {
+  for (const [key, state] of _pgyInviteDraftStates) {
+    if (state.status !== 'submitted' && state.status !== 'sent') _pgyInviteDraftStates.delete(key);
   }
-  const template = prepared.template || {};
-  const confirmed = window.confirm(
-    `确认向“${prepared.creatorName || row.creatorName || '该达人'}”发起真实蒲公英邀约？\n\n`
-    + `合作诉求：${template.cooperationGoal || '-'}\n`
-    + `合作模式：${template.cooperationMode || '-'}\n`
-    + `建联方式：${template.contactMethod || '-'}\n`
-    + `代理商：${template.agency || '由蒲公英账号带入'}\n`
-    + `报备品牌：${template.brandName || '-'}\n`
-    + `披露方式：${template.contactChannel || '-'}\n`
-    + `联系方式：${template.contactWay || '-'}\n`
-    + `产品名称：${template.productName || '-'}\n`
-    + `发布时间：${template.publishStart || '-'} 至 ${template.publishEnd || '-'}\n`
-    + `合作内容：${template.intro || '-'}\n\n确认后软件只会点击一次详细表单底部的“发起邀约”按钮。`
-  );
-  if (!confirmed) return { ok: false, canceled: true };
-  setPgyInviteDraftState(rowId, { ...state, status: 'sending', message: '正在执行已确认的邀约...' });
-  const sent = await window.desktopAPI.invites.sendPrepared({
+}
+
+function isPgyInviteBusy() {
+  return Boolean(_pgyInviteOperation) || isPgyInviteBatchActive();
+}
+
+function capturePgyInviteContext(row = null, batchId = 0) {
+  const template = getPgyInviteSettings();
+  return {
     runDir: _selectedRunDir,
-    rowId,
-    token: prepared.token,
-    fingerprint: prepared.fingerprint
-  });
-  if (!sent?.ok) {
-    const message = `邀约发送失败：${sent?.error || 'unknown error'}`;
-    setPgyInviteDraftState(rowId, { status: 'error', message });
-    setMsg(message);
-    return { ...sent, ok: false, error: message };
+    rowId: String(row?.rowId || ''),
+    creatorUrl: String(row?.creatorUrl || ''),
+    revision: _pgyInviteRevision,
+    template,
+    templateKey: JSON.stringify(template),
+    batchId
+  };
+}
+
+function matchesPgyInviteContext(context, checkTemplate = true, checkBatch = true) {
+  if (!context || context.runDir !== _selectedRunDir) return false;
+  if (checkBatch && context.batchId && context.batchId !== _pgyInviteBatchState.id) return false;
+  if (context.rowId && !_contactPreviewRows.some((row) => (
+    String(row.rowId) === context.rowId && String(row.creatorUrl || '') === context.creatorUrl
+  ))) return false;
+  return !checkTemplate || (context.revision === _pgyInviteRevision
+    && context.templateKey === JSON.stringify(getPgyInviteSettings()));
+}
+
+function canContinuePgyInviteOperation(operation) {
+  return _pgyInviteOperation === operation && matchesPgyInviteContext(operation)
+    && (!operation.batchId || !_pgyInviteBatchState.stopRequested);
+}
+
+function pgyInviteContextChanged() {
+  return { ok: false, canceled: true, code: 'PGY_INVITE_CONTEXT_CHANGED', error: '邀约上下文已变化或已请求停止，请重新核对。' };
+}
+
+function formatPgyInviteFailure(result) {
+  const display = (value) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 80) || '（空）';
+  const details = (Array.isArray(result?.fieldResults) ? result.fieldResults : [])
+    .filter((field) => ['报备品牌', '开始日期', '结束日期'].includes(field.label) && !field.verified)
+    .slice(0, 3)
+    .map((field) => `${field.label}：预期“${display(field.expected)}”，实际“${field.found ? display(field.actual) : '未能读取'}”`);
+  return [result?.error || 'unknown error', ...details].join('；');
+}
+
+async function runPgyInviteOperation(kind, row, batchId, action) {
+  if (_pgyInviteOperation || _xhsContactState.running || (isPgyInviteBatchActive() && batchId !== _pgyInviteBatchState.id)) {
+    return { ok: false, code: 'PGY_INVITE_BUSY', error: '请等待当前邀约或补采操作结束。' };
   }
-  const confirmedSuccess = sent.outcome === 'success-confirmed';
-  const message = confirmedSuccess
-    ? `蒲公英已明确返回邀约成功：${sent.creatorName || row.creatorName || '该达人'}。`
-    : `已按确认点击一次“发起邀约”：${sent.creatorName || row.creatorName || '该达人'}。平台未返回可识别的成功文案，请查看右侧页面确认最终状态。`;
-  setPgyInviteDraftState(rowId, { status: confirmedSuccess ? 'sent' : 'submitted', message });
-  setMsg(message);
-  return { ...sent, ok: true, confirmedSuccess };
+  if (batchId && (batchId !== _pgyInviteBatchState.id || _pgyInviteBatchState.stopRequested)) return pgyInviteContextChanged();
+  const operation = { ...capturePgyInviteContext(row, batchId), kind };
+  _pgyInviteOperation = operation;
+  store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+  try {
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    return await action(operation);
+  } catch (error) {
+    const requiresReview = kind === 'send';
+    const message = requiresReview
+      ? `发送结果未知，请先核对右侧平台结果：${error?.message || String(error)}`
+      : `邀约操作失败：${error?.message || String(error)}`;
+    if (matchesPgyInviteContext(operation, false)) {
+      if (operation.rowId) setPgyInviteDraftState(operation.rowId, {
+        status: requiresReview ? 'submitted' : 'error', message, context: operation
+      });
+      setMsg(message);
+    }
+    return { ok: false, requiresReview, error: message };
+  } finally {
+    if (_pgyInviteOperation === operation) {
+      const key = `${operation.runDir}::${operation.rowId}`;
+      const draft = _pgyInviteDraftStates.get(key);
+      if (draft?.context === operation && draft.status === 'preparing') _pgyInviteDraftStates.delete(key);
+      if (draft?.context === operation && draft.status === 'sending') {
+        _pgyInviteDraftStates.set(key, { ...draft, status: 'submitted', message: '发送期间上下文已变化，请人工核对原达人的结果。' });
+      }
+      _pgyInviteOperation = null;
+      store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    }
+  }
+}
+
+async function preparePgyInviteForRow(row, rowId, batchId = 0) {
+  if (getPgyInviteDraftState(rowId)?.status === 'submitted') {
+    return { ok: false, requiresReview: true, error: '上次发送结果尚未核对，不能重新准备。' };
+  }
+  return runPgyInviteOperation('prepare', row, batchId, async (operation) => {
+    const templateErrors = getPgyInviteTemplateErrors(operation.template);
+    if (templateErrors.length) {
+      const message = `固定邀约模板不完整：${templateErrors.join('；')}`;
+      setPgyInviteDraftState(rowId, { status: 'error', message });
+      setMsg(message);
+      return { ok: false, code: 'PGY_INVITE_TEMPLATE_INCOMPLETE', error: message };
+    }
+    clearPgyInviteDraftReadiness();
+    setPgyInviteDraftState(rowId, { status: 'preparing', context: operation, message: '正在打开达人、进入详细邀约表单并逐项填写...' });
+    const opened = await window.desktopAPI.invites.openCreator({ runDir: operation.runDir, rowId });
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    if (!opened?.ok) {
+      const message = `邀约账号打开达人失败：${opened?.error || 'unknown error'}`;
+      setPgyInviteDraftState(rowId, { status: 'error', message });
+      setMsg(message);
+      return { ...opened, ok: false, error: message };
+    }
+    const prepared = await window.desktopAPI.invites.prepare({ runDir: operation.runDir, rowId, template: operation.template });
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    if (!prepared?.ok) {
+      const brandCandidates = prepared?.code === 'PGY_INVITE_BRAND_SELECTION_REQUIRED'
+        ? (prepared.brandCandidates || []).map(item => String(item?.label || '').trim()).filter(Boolean).slice(0, 20) : [];
+      const message = brandCandidates.length ? '请选择本次报备品牌，确认后继续准备。'
+        : `邀约准备失败：${formatPgyInviteFailure(prepared)}`;
+      setPgyInviteDraftState(rowId, brandCandidates.length
+        ? { status: 'brand_selection', message: '请选择本次报备品牌，确认后继续准备。', brandCandidates, context: operation }
+        : { status: 'error', message });
+      setMsg(message);
+      return { ...prepared, ok: false, error: message };
+    }
+    const message = `邀约已准备：${prepared.creatorName || row.creatorName || '该达人'}；报备品牌、联系方式、产品、合作内容和发布时间均已填写并回读一致。请核对右侧后再确认发送。`;
+    setPgyInviteDraftState(rowId, { status: 'ready', message, prepared, context: operation });
+    setMsg(message);
+    return { ...prepared, ok: true };
+  });
+}
+
+async function sendPreparedPgyInviteForRow(row, rowId, batchId = 0) {
+  return runPgyInviteOperation('send', row, batchId, async (operation) => {
+    const state = getPgyInviteDraftState(rowId);
+    const prepared = state?.prepared;
+    if (state?.status !== 'ready' || !prepared?.token || !prepared?.fingerprint || !matchesPgyInviteContext(state.context)) {
+      setMsg('请先点击“准备邀约”，并等待模板校验通过。');
+      return { ok: false, code: 'PGY_INVITE_CONFIRMATION_REQUIRED', error: '请先准备邀约' };
+    }
+    const template = prepared.template || {};
+    const confirmed = window.confirm(
+      `确认向“${prepared.creatorName || row.creatorName || '该达人'}”发起真实蒲公英邀约？\n\n`
+      + `合作诉求：${template.cooperationGoal || '-'}\n`
+      + `合作模式：${template.cooperationMode || '-'}\n`
+      + `建联方式：${template.contactMethod || '-'}\n`
+      + `代理商：${template.agency || '由蒲公英账号带入'}\n`
+      + `报备品牌：${template.brandName || '-'}\n`
+      + `披露方式：${template.contactChannel || '-'}\n`
+      + `联系方式：${template.contactWay || '-'}\n`
+      + `产品名称：${template.productName || '-'}\n`
+      + `发布时间：${template.publishStart || '-'} 至 ${template.publishEnd || '-'}\n`
+      + `合作内容：${template.intro || '-'}\n\n确认后软件只会点击一次详细表单底部的“发起邀约”按钮。`
+    );
+    if (!confirmed) return { ok: false, canceled: true };
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    setPgyInviteDraftState(rowId, { ...state, context: operation, status: 'sending', message: '正在执行已确认的邀约...' });
+    const sent = await window.desktopAPI.invites.sendPrepared({
+      runDir: operation.runDir,
+      rowId,
+      token: prepared.token,
+      fingerprint: prepared.fingerprint
+    });
+    // A dispatched send may finish after stop/edit. Retain only its original recipient's outcome.
+    if (!matchesPgyInviteContext(operation, false)) return pgyInviteContextChanged();
+    if (!sent?.ok) {
+      const message = `邀约发送失败：${formatPgyInviteFailure(sent)}`;
+      const requiresReview = sent?.clicked === true || sent?.requiresReview === true;
+      setPgyInviteDraftState(rowId, { status: requiresReview ? 'submitted' : 'error', message, context: operation });
+      setMsg(message);
+      return { ...sent, ok: false, requiresReview, error: message };
+    }
+    const confirmedSuccess = sent.outcome === 'success-confirmed';
+    const message = confirmedSuccess
+      ? `蒲公英已明确返回邀约成功：${sent.creatorName || row.creatorName || '该达人'}。`
+      : `已按确认点击一次“发起邀约”：${sent.creatorName || row.creatorName || '该达人'}。平台未返回可识别的成功文案，请查看右侧页面确认最终状态。`;
+    setPgyInviteDraftState(rowId, { status: confirmedSuccess ? 'sent' : 'submitted', message, context: operation });
+    if (confirmedSuccess) markPgyInviteBatchRowHandled(row, 'sent');
+    setMsg(message);
+    return { ...sent, ok: true, confirmedSuccess, message };
+  });
 }
 
 function setPgyInviteBatchState(patch) {
@@ -947,11 +1156,74 @@ function setPgyInviteBatchState(patch) {
 
 function getPgyInviteBatchCurrentRow() {
   const rowId = _pgyInviteBatchState.rowIds[_pgyInviteBatchState.currentIndex];
-  return _contactPreviewRows.find((row) => String(row?.rowId || '') === String(rowId || '')) || null;
+  const target = _pgyInviteBatchState.targets?.find((row) => String(row.rowId) === rowId);
+  if (_pgyInviteBatchState.runDir !== _selectedRunDir) return null;
+  return _contactPreviewRows.find((row) => String(row?.rowId || '') === String(rowId || '')
+    && target?.creatorUrl === row.creatorUrl) || null;
 }
 
 function isPgyInviteBatchActive() {
-  return ['preparing', 'awaiting_confirmation', 'sending', 'checking_result', 'cooldown', 'error', 'stopping'].includes(_pgyInviteBatchState.status);
+  return ['starting', 'preparing', 'awaiting_brand', 'awaiting_confirmation', 'sending', 'checking_result', 'cooldown', 'error', 'stopping'].includes(_pgyInviteBatchState.status);
+}
+
+async function continuePgyInviteWithBrand(row, rowId, label, batchId = 0) {
+  const draft = getPgyInviteDraftState(rowId);
+  if (_pgyInviteOperation || _xhsContactState.running || draft?.status !== 'brand_selection'
+    || !draft.brandCandidates?.includes(label) || !matchesPgyInviteContext(draft.context)
+    || draft.context.batchId !== batchId || draft.context.rowId !== String(rowId)
+    || draft.context.creatorUrl !== row?.creatorUrl) return;
+  if (batchId ? _pgyInviteBatchState.status !== 'awaiting_brand' || _pgyInviteBatchState.stopRequested
+    : isPgyInviteBatchActive()) return;
+  _contactPgyBrandName = label;
+  _pgyInviteRevision += 1;
+  clearPgyInviteDraftReadiness();
+  scheduleContactReviewSave();
+  if (batchId) {
+    setPgyInviteBatchState({ ...capturePgyInviteContext(null, batchId), status: 'preparing',
+      message: '已确认报备品牌，正在继续当前达人。' });
+    await prepareCurrentPgyInviteBatchItem();
+  } else {
+    await preparePgyInviteForRow(row, rowId);
+  }
+}
+
+function createPgyInviteBrandChoice(row, rowId, batchId = 0) {
+  const draft = getPgyInviteDraftState(rowId);
+  if (draft?.status !== 'brand_selection') return null;
+  const controls = document.createElement('div');
+  controls.className = 'pgy-invite-batch-actions';
+  const select = document.createElement('select');
+  select.className = 'tpl-input';
+  select.style.maxWidth = '100%';
+  select.setAttribute('aria-label', '选择报备品牌');
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = '请选择正确的报备品牌';
+  select.appendChild(placeholder);
+  for (const label of draft.brandCandidates || []) {
+    const option = document.createElement('option');
+    option.value = label;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  const confirm = makeSoftButton('使用此品牌并继续', async () => {
+    if (getPgyInviteDraftState(rowId) !== draft) return;
+    await continuePgyInviteWithBrand(row, rowId, select.value, batchId);
+  }, { disabled: true });
+  select.addEventListener('change', () => { confirm.disabled = !select.value; });
+  controls.appendChild(select);
+  controls.appendChild(confirm);
+  return controls;
+}
+
+function settlePgyInviteBatchContext(batch, outcomeMessage = '') {
+  if (batch.id !== _pgyInviteBatchState.id) return false;
+  if (_pgyInviteBatchState.stopRequested || !matchesPgyInviteContext(batch)) {
+    clearPgyInviteDraftReadiness();
+    setPgyInviteBatchState({ status: 'stopped', stopRequested: true, message: `批量邀约已停止。${outcomeMessage}` });
+    return false;
+  }
+  return true;
 }
 
 function markPgyInviteBatchRowHandled(row, resultStatus) {
@@ -968,6 +1240,9 @@ function markPgyInviteBatchRowHandled(row, resultStatus) {
 }
 
 async function prepareCurrentPgyInviteBatchItem() {
+  if (_pgyInviteOperation || !['preparing', 'cooldown', 'error'].includes(_pgyInviteBatchState.status)) return;
+  const batch = _pgyInviteBatchState;
+  if (!settlePgyInviteBatchContext(batch)) return;
   const row = getPgyInviteBatchCurrentRow();
   if (!row) {
     setPgyInviteBatchState({ status: 'error', message: '当前批次达人已经不在名单中，请停止后重新选择。' });
@@ -978,15 +1253,15 @@ async function prepareCurrentPgyInviteBatchItem() {
     status: 'preparing',
     message: `正在自动打开并准备：${row.creatorName || '该达人'}`
   });
-  const prepared = await preparePgyInviteForRow(row, rowId);
-  if (_pgyInviteBatchState.stopRequested) {
-    setPgyInviteBatchState({ status: 'stopped', message: '批量邀约已停止；当前未发送任何未经确认的邀约。' });
-    return;
-  }
+  const prepared = await preparePgyInviteForRow(row, rowId, batch.id);
+  if (!settlePgyInviteBatchContext(batch)) return;
   if (!prepared?.ok) {
     setPgyInviteBatchState({
-      status: 'error',
-      message: `第 ${_pgyInviteBatchState.currentIndex + 1} 位准备失败：${prepared?.error || 'unknown error'}`
+      status: prepared?.code === 'PGY_INVITE_BRAND_SELECTION_REQUIRED' ? 'awaiting_brand'
+        : (prepared?.requiresReview ? 'checking_result' : 'error'),
+      message: prepared?.code === 'PGY_INVITE_BRAND_SELECTION_REQUIRED'
+        ? '品牌搜索已有结果，请选择正确品牌后继续当前批次。'
+        : `第 ${_pgyInviteBatchState.currentIndex + 1} 位准备失败：${prepared?.error || 'unknown error'}`
     });
     return;
   }
@@ -997,55 +1272,87 @@ async function prepareCurrentPgyInviteBatchItem() {
 }
 
 async function advancePgyInviteBatch(resultStatus, resultMessage) {
+  if (!['sent', 'manual', 'skipped', 'unsent'].includes(resultStatus)) return;
+  const allowed = resultStatus === 'sent' ? ['sending']
+    : (resultStatus === 'skipped' ? ['error']
+      : (resultStatus === 'unsent' ? ['awaiting_confirmation'] : ['awaiting_confirmation', 'checking_result']));
+  if (_pgyInviteOperation || !allowed.includes(_pgyInviteBatchState.status)) return;
+  const batch = _pgyInviteBatchState;
+  if (!settlePgyInviteBatchContext(batch)) return;
   const currentRow = getPgyInviteBatchCurrentRow();
-  markPgyInviteBatchRowHandled(currentRow, resultStatus);
-  const results = [
-    ..._pgyInviteBatchState.results,
-    {
-      rowId: String(currentRow?.rowId || ''),
-      creatorName: currentRow?.creatorName || '',
-      status: resultStatus,
-      message: resultMessage || ''
+  if (!currentRow) {
+    setPgyInviteBatchState({ status: 'error', message: '当前达人已变化，请停止后重新选择。' });
+    return;
+  }
+  const advanced = await runPgyInviteOperation('advance', currentRow, batch.id, async (operation) => {
+    if (resultStatus !== 'unsent') markPgyInviteBatchRowHandled(currentRow, resultStatus);
+    setPgyInviteDraftState(currentRow.rowId, {
+      status: resultStatus === 'unsent' ? 'unsent' : (resultStatus === 'skipped' ? 'error' : 'sent'),
+      message: resultMessage, context: operation
+    });
+    const results = [
+      ..._pgyInviteBatchState.results,
+      {
+        rowId: String(currentRow?.rowId || ''),
+        creatorName: currentRow?.creatorName || '',
+        status: resultStatus,
+        message: resultMessage || ''
+      }
+    ];
+    const nextIndex = _pgyInviteBatchState.currentIndex + 1;
+    if (nextIndex >= _pgyInviteBatchState.rowIds.length) {
+      const sent = results.filter((item) => item.status === 'sent').length;
+      const manual = results.filter((item) => item.status === 'manual').length;
+      const skipped = results.filter((item) => item.status === 'skipped').length;
+      const unsent = results.filter((item) => item.status === 'unsent').length;
+      setPgyInviteBatchState({
+        status: 'completed',
+        currentIndex: nextIndex,
+        results,
+        stopRequested: false,
+        message: `本批次已结束：明确成功 ${sent} 位，人工处理 ${manual} 位，跳过 ${skipped} 位，已准备未发送 ${unsent} 位。`
+      });
+      return;
     }
-  ];
-  const nextIndex = _pgyInviteBatchState.currentIndex + 1;
-  if (nextIndex >= _pgyInviteBatchState.rowIds.length) {
-    const sent = results.filter((item) => item.status === 'sent').length;
-    const manual = results.filter((item) => item.status === 'manual').length;
-    const skipped = results.filter((item) => item.status === 'skipped').length;
     setPgyInviteBatchState({
-      status: 'completed',
+      status: 'cooldown',
       currentIndex: nextIndex,
       results,
-      stopRequested: false,
-      message: `本批次已结束：明确成功 ${sent} 位，人工处理 ${manual} 位，跳过 ${skipped} 位。`
+      message: resultStatus === 'unsent'
+        ? '当前达人已准备但未发送，安全间隔后继续准备下一位。'
+        : '上一位已处理，安全间隔后准备下一位达人。'
     });
-    return;
-  }
-  setPgyInviteBatchState({
-    status: 'cooldown',
-    currentIndex: nextIndex,
-    results,
-    message: '上一位已处理，安全间隔后准备下一位达人。'
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    return { ok: true, next: canContinuePgyInviteOperation(operation) };
   });
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  if (_pgyInviteBatchState.stopRequested) {
-    setPgyInviteBatchState({ status: 'stopped', message: '批量邀约已停止。' });
-    return;
-  }
-  await prepareCurrentPgyInviteBatchItem();
+  if (!settlePgyInviteBatchContext(batch)) return;
+  if (advanced?.next) await prepareCurrentPgyInviteBatchItem();
+  else if (advanced?.ok === false) setPgyInviteBatchState({ status: 'error', message: advanced.error });
 }
 
 async function sendCurrentPgyInviteBatchItem() {
+  if (_pgyInviteOperation) return;
+  const batch = _pgyInviteBatchState;
   const row = getPgyInviteBatchCurrentRow();
   if (!row || _pgyInviteBatchState.status !== 'awaiting_confirmation') return;
+  if (!settlePgyInviteBatchContext(batch)) return;
   setPgyInviteBatchState({ status: 'sending', message: `等待人工确认：${row.creatorName || '该达人'}` });
-  const sent = await sendPreparedPgyInviteForRow(row, String(row.rowId || ''));
+  const sent = await sendPreparedPgyInviteForRow(row, String(row.rowId || ''), batch.id);
+  if (batch.id !== _pgyInviteBatchState.id) return;
+  if ((_pgyInviteBatchState.stopRequested || !matchesPgyInviteContext(batch)) && matchesPgyInviteContext(batch, false)) {
+    if (sent?.confirmedSuccess || sent?.requiresReview || sent?.ok) {
+      setPgyInviteBatchState({ results: [..._pgyInviteBatchState.results, {
+        rowId: row.rowId, creatorName: row.creatorName,
+        status: sent.confirmedSuccess ? 'sent' : 'submitted', message: sent.message || sent.error || ''
+      }] });
+    }
+  }
+  if (!settlePgyInviteBatchContext(batch, sent?.message || sent?.error || '')) return;
   if (sent?.canceled) {
     setPgyInviteBatchState({ status: 'awaiting_confirmation', message: '已取消发送。当前达人仍停留在右侧，等待人工确认。' });
     return;
   }
-  if (!sent?.ok) {
+  if (!sent?.ok && !sent?.requiresReview) {
     setPgyInviteBatchState({ status: 'error', message: sent?.error || '当前达人邀约发送失败。' });
     return;
   }
@@ -1060,7 +1367,10 @@ async function sendCurrentPgyInviteBatchItem() {
 }
 
 async function startPgyInviteBatch(rows) {
-  const targets = (Array.isArray(rows) ? rows : []).filter((row) => row?.rowId && row?.creatorUrl);
+  if (isPgyInviteBusy() || _xhsContactState.running) return;
+  const targets = (Array.isArray(rows) ? rows : []).filter((row) => row?.rowId && row?.creatorUrl)
+    .map((row) => ({ ...row, rowId: String(row.rowId) }))
+    .filter((row, index, all) => all.findIndex((item) => item.rowId === row.rowId || item.creatorUrl === row.creatorUrl) === index);
   if (!targets.length) {
     setMsg('请先在蒲公英邀约界面勾选需要邀约的达人。');
     return;
@@ -1074,13 +1384,25 @@ async function startPgyInviteBatch(rows) {
     setMsg(`请先完善蒲公英邀约信息：${templateErrors.join('；')}`);
     return;
   }
-  const login = await window.desktopAPI.invites.checkLogin();
+  if (targets.some((row) => getPgyInviteDraftState(row.rowId)?.status === 'submitted')) {
+    setMsg('所选达人包含发送结果未知的邀约，请先逐人核对结果。');
+    return;
+  }
+  const id = ++_pgyInviteBatchSequence;
+  const batch = {
+    ...capturePgyInviteContext(null, id), id, targets,
+    status: 'starting', rowIds: targets.map((row) => row.rowId), currentIndex: 0,
+    results: [], message: '正在检测邀约账号。', stopRequested: false
+  };
+  _pgyInviteBatchState = batch;
+  const login = await runPgyInviteOperation('login', null, id, () => window.desktopAPI.invites.checkLogin());
+  if (!settlePgyInviteBatchContext(batch)) return;
   if (!login?.ok || !login?.loggedIn || login?.riskDetected) {
     _pgyInviteAccountState = login?.riskDetected
       ? { status: 'risk', message: `邀约账号需要人工处理安全验证：${login?.riskText || '请查看右侧页面'}` }
       : { status: 'waiting', message: login?.error || '请先打开并登录蒲公英邀约账号。' };
     setMsg(_pgyInviteAccountState.message);
-    store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
+    setPgyInviteBatchState({ status: 'stopped', message: _pgyInviteAccountState.message });
     return;
   }
   const names = targets.slice(0, 10).map((row) => row.creatorName || '未命名达人').join('、');
@@ -1089,31 +1411,81 @@ async function startPgyInviteBatch(rows) {
     `确认启动蒲公英批量邀约？\n\n${names}${targets.length > 10 ? '……' : ''}\n${remaining}\n\n`
     + '软件会逐人自动打开并准备邀约；每一位真正发送前都必须由你人工确认。遇到登录、验证或页面异常会立即停下。'
   );
-  if (!confirmed) return;
+  if (!settlePgyInviteBatchContext(batch)) return;
+  if (!confirmed) {
+    setPgyInviteBatchState({ status: 'stopped', message: '已取消启动批量邀约。' });
+    return;
+  }
   targets.forEach((row) => {
     const review = ensureReviewRow(row);
     if (review) review.contactChannel = '蒲公英邀约';
   });
   scheduleContactReviewSave();
-  _pgyInviteBatchState = {
-    status: 'preparing',
-    rowIds: targets.map((row) => String(row.rowId)),
-    currentIndex: 0,
-    results: [],
-    message: '正在准备第 1 位达人。',
-    stopRequested: false
-  };
+  setPgyInviteBatchState({ status: 'preparing', message: '正在准备第 1 位达人。' });
   await prepareCurrentPgyInviteBatchItem();
 }
 
 function stopPgyInviteBatch() {
   if (!isPgyInviteBatchActive()) return;
-  const isPreparing = ['preparing', 'sending', 'cooldown'].includes(_pgyInviteBatchState.status);
+  const isPreparing = _pgyInviteOperation?.batchId === _pgyInviteBatchState.id;
+  clearPgyInviteDraftReadiness();
   setPgyInviteBatchState({
     stopRequested: true,
     status: isPreparing ? 'stopping' : 'stopped',
     message: isPreparing ? '停止请求已收到，将在当前安全点停止。' : '批量邀约已停止。'
   });
+}
+
+async function openPgyInviteForRow(row, rowId) {
+  return runPgyInviteOperation('open', row, 0, async (operation) => {
+    clearPgyInviteDraftReadiness();
+    const result = await window.desktopAPI.invites.openCreator({ runDir: operation.runDir, rowId });
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    if (!result?.ok) setMsg(`邀约账号打开达人失败：${result?.error || 'unknown error'}`);
+    else setMsg(`已在邀约账号打开 ${row.creatorName || '该达人'}。当前仅打开页面，不会填写或发送邀约。`);
+    return result;
+  });
+}
+
+async function updatePgyInviteAccount(checkOnly = false) {
+  return runPgyInviteOperation('account', null, 0, async (operation) => {
+    if (!checkOnly) clearPgyInviteDraftReadiness();
+    const result = await (checkOnly ? window.desktopAPI.invites.checkLogin() : window.desktopAPI.invites.openAccount());
+    if (!canContinuePgyInviteOperation(operation)) return pgyInviteContextChanged();
+    const ready = Boolean(result?.ok && result?.loggedIn && !result?.riskDetected);
+    _pgyInviteAccountState = checkOnly
+      ? (ready ? { status: 'ready', message: '邀约账号已登录，可以从名单打开达人链接。' }
+        : (result?.riskDetected
+          ? { status: 'risk', message: `邀约账号需要人工处理安全验证：${result?.riskText || '请查看右侧页面'}` }
+          : { status: result?.ok ? 'waiting' : 'error', message: result?.error || '邀约账号尚未登录，请在右侧完成登录。' }))
+      : (result?.ok ? { status: 'opened', message: '邀约账号标签已打开。请在右侧登录第二个蒲公英账号。' }
+        : { status: 'error', message: `邀约账号打开失败：${result?.error || 'unknown error'}` });
+    setMsg(_pgyInviteAccountState.message);
+    return result;
+  });
+}
+
+async function reviewPgyInviteOutcome(row, confirmedSent) {
+  if (_pgyInviteOperation) return;
+  const batch = _pgyInviteBatchState;
+  const inBatch = isPgyInviteBatchActive();
+  if (inBatch && (batch.status !== 'checking_result' || getPgyInviteBatchCurrentRow()?.rowId !== row.rowId)) return;
+  const state = getPgyInviteDraftState(row.rowId);
+  if (state?.status !== 'submitted' || !matchesPgyInviteContext(state.context, false, false)) return;
+  const confirmed = window.confirm(`确认已在蒲公英核对“${row.creatorName || '该达人'}”的发送结果为“${confirmedSent ? '已成功发出' : '未发出'}”？\n\n只有确认未发出，才能重新准备邀约。`);
+  if (!confirmed || _pgyInviteOperation || getPgyInviteDraftState(row.rowId) !== state
+    || !matchesPgyInviteContext(state.context, false, false)
+    || (inBatch && (batch.id !== _pgyInviteBatchState.id || _pgyInviteBatchState.status !== 'checking_result'))) return;
+  if (confirmedSent) {
+    if (inBatch) await advancePgyInviteBatch('manual', '人工核对确认已发出');
+    else {
+      markPgyInviteBatchRowHandled(row, 'sent');
+      setPgyInviteDraftState(row.rowId, { ...state, status: 'sent', message: '人工核对确认已发出。' });
+    }
+  } else {
+    setPgyInviteDraftState(row.rowId, null);
+    if (inBatch) setPgyInviteBatchState({ status: 'error', message: '人工核对确认未发出，可以重新准备当前达人。' });
+  }
 }
 
 function getEmailTemplateSettings() {
@@ -1166,6 +1538,30 @@ function clearReviewSelected(review) {
   resetEmailHandoff();
 }
 
+async function applyFeishuContactPatch(runDir, rowId, patch) {
+  if (runDir !== _selectedRunDir) return { ok: false, code: 'FEISHU_LOCAL_CHANGED' };
+  const review = _contactReviewMap.get(rowId);
+  if (!review) return { ok: false, code: 'FEISHU_ROW_MISSING' };
+  for (const field of ['wechatId', 'email', 'phone', 'contactRaw']) {
+    if (patch[field] && review[field] && patch[field] !== review[field]) return { ok: false, code: 'FEISHU_LOCAL_CONFLICT' };
+  }
+  const before = Object.fromEntries(Object.keys(patch).map(key => [key, review[key]]));
+  Object.assign(review, patch);
+  _xiaomifengApprovalCheck = null;
+  resetEmailHandoff();
+  let saved;
+  try { saved = await saveContactReviewNow(); }
+  catch (_) { saved = { ok: false, code: 'FEISHU_LOCAL_SAVE_FAILED' }; }
+  if (!saved?.ok) {
+    // A later row must not accidentally persist a patch reported as failed.
+    for (const key of Object.keys(patch)) {
+      if (review[key] === patch[key]) review[key] = before[key];
+    }
+    return { ok: false, code: saved?.code || 'FEISHU_LOCAL_SAVE_FAILED' };
+  }
+  return saved;
+}
+
 function ensureReviewRow(row) {
   const id = String(row?.rowId || '');
   if (!id) return null;
@@ -1180,10 +1576,15 @@ function ensureReviewRow(row) {
       email: row?.email || '',
       wechatId: row?.wechatId || '',
       phone: row?.phone || '',
+      contactRaw: typeof row?.contactRaw === 'string' ? row.contactRaw : '',
+      contactRawSource: typeof row?.contactRawSource === 'string' ? row.contactRawSource : '',
+      contactRawCollectedAt: typeof row?.contactRawCollectedAt === 'string' ? row.contactRawCollectedAt : '',
+      feishuAccountNumber: row?.feishuAccountNumber || '',
       xhsProfileUrl: row?.xhsProfileUrl || '',
       xhsProfileSourceCreatorUrl: row?.xhsProfileSourceCreatorUrl || '',
       contactSource: row?.contactSource || '',
       contactCollectedAt: row?.contactCollectedAt || '',
+      feishuAccountNumber: row?.feishuAccountNumber || '',
       contactCollectionStatus: row?.contactCollectionStatus || '',
       contactCollectionCode: row?.contactCollectionCode || '',
       contactCollectionError: row?.contactCollectionError || '',
@@ -1234,24 +1635,92 @@ function getContactFilteredRows() {
   });
 }
 
+function getContactSelectedRows() {
+  return getContactFilteredRows().filter(row => {
+    const review = ensureReviewRow(row);
+    return review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
+  });
+}
+
+function bindContactReviewReading(detail, controls, runDir, rowId) {
+  const readingKey = JSON.stringify([runDir, rowId]), generation = _contactRunGeneration;
+  if (_contactReviewFocus?.runDir !== runDir) _contactReviewFocus = null;
+  let state = _contactReviewReadingStates.get(readingKey);
+  if (!state) {
+    if (_contactReviewReadingStates.size >= 500) _contactReviewReadingStates.delete(_contactReviewReadingStates.keys().next().value);
+    state = { open: false }; _contactReviewReadingStates.set(readingKey, state);
+  }
+  _contactReviewReadingNodes.set(readingKey, detail);
+  const current = () => detail.isConnected && _selectedRunDir === runDir && _contactRunGeneration === generation
+    && _contactReviewReadingNodes.get(readingKey) === detail;
+  detail.open = state.open;
+  detail.querySelector('summary').addEventListener('click', event => {
+    if (!current()) return;
+    event.preventDefault(); state.open = !detail.open; detail.open = state.open;
+    if (!state.open && _contactReviewFocus?.rowId === rowId) _contactReviewFocus = null;
+  });
+  detail.addEventListener('toggle', () => { if (current()) state.open = detail.open; });
+  for (const [field, control] of Object.entries(controls)) {
+    control.dataset.reviewField = field;
+    const remember = () => {
+      if (current() && document.activeElement === control) _contactReviewFocus = { runDir, rowId, field, generation,
+        start: control.selectionStart, end: control.selectionEnd };
+    };
+    for (const event of ['focus', 'input', 'select', 'keyup', 'click']) control.addEventListener(event, remember);
+    control.addEventListener('blur', event => {
+      if (current() && event.relatedTarget && _contactReviewFocus?.rowId === rowId && _contactReviewFocus.field === field) _contactReviewFocus = null;
+    });
+  }
+  requestAnimationFrame(() => {
+    const focus = _contactReviewFocus;
+    if (!current() || !state.open || !focus || focus.runDir !== runDir || focus.rowId !== rowId || focus.generation !== generation) return;
+    const control = controls[focus.field];
+    if (!control || control.disabled) return;
+    control.focus({ preventScroll: true });
+    if (Number.isInteger(focus.start) && Number.isInteger(focus.end) && control.setSelectionRange) control.setSelectionRange(focus.start, focus.end);
+  });
+}
+
 function resetContactPreviewState({ keepMeta = false } = {}) {
   _contactPreviewRows = [];
   _contactPreviewRunDir = '';
   _contactLoadedRunDir = '';
   _contactReviewMap = new Map();
   _contactSaveStatus = '';
+  _contactReviewFocus = null;
+  _contactReviewReadingNodes.clear();
+  _xhsContactScope = null;
+  _xhsContactState = { ..._xhsContactState, phase: 'idle', total: 0, completed: 0, found: 0, failed: 0,
+    currentCreatorName: '', lastCode: '', message: '' };
   resetEmailHandoff();
   if (!keepMeta) _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: false, error: '' };
 }
 
-async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) {
+function contactReviewRunScope() {
+  return { runDir: _selectedRunDir, generation: _contactRunGeneration };
+}
+
+function contactReviewRunCurrent(scope) {
+  return scope.runDir === _selectedRunDir && scope.generation === _contactRunGeneration;
+}
+
+async function loadContactReviewForRun(force = false, runDir = _selectedRunDir, stillCurrent = () => true) {
   const targetRunDir = String(runDir || '');
   if (!targetRunDir) return false;
-  if (!force && _contactLoadedRunDir === targetRunDir) return true;
+  if (!force && _contactLoadedRunDir === targetRunDir && !_contactReviewReadErrors.has(targetRunDir)) return true;
+  const scope = contactReviewRunScope();
   try {
     const r = await window.desktopAPI.exports.loadContactReview({ runDir: targetRunDir });
-    if (_selectedRunDir !== targetRunDir) return false;
-    if (!r?.ok) return false;
+    if (_selectedRunDir !== targetRunDir || !contactReviewRunCurrent(scope) || !stillCurrent()) return false;
+    if (!r?.ok || r.runDir !== targetRunDir || !Array.isArray(r.reviewRows)) {
+      _contactReviewReadErrors.set(targetRunDir, contactReviewFailure(!r?.ok ? r
+        : { code: r.runDir !== targetRunDir ? 'CONTACT_REVIEW_RUN_INVALID' : 'CONTACT_REVIEW_READ_FAILED' }));
+      return false;
+    }
+    const unsaved = _contactReviewReadErrors.has(targetRunDir) && _contactPreviewRunDir === targetRunDir
+      && (_contactFailedSaveRuns.has(targetRunDir) || _contactPendingSave?.payload.runDir === targetRunDir)
+      ? new Map(_contactReviewMap) : null;
+    _contactReviewReadErrors.delete(targetRunDir);
     const needsManualSelectionMigration = r.settings?.selectionPolicy !== CONTACT_SELECTION_POLICY;
     _contactReviewMap = new Map();
     (Array.isArray(r.reviewRows) ? r.reviewRows : []).forEach((row) => {
@@ -1264,30 +1733,34 @@ async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) 
       }
       _contactReviewMap.set(rowId, next);
     });
-    if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
-    if (r.settings?.projectName !== undefined) _contactProjectName = r.settings.projectName;
-    if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
-    if (r.settings?.xiaomifengSmartRemark) _xiaomifengSmartRemark = r.settings.xiaomifengSmartRemark;
-    if (r.settings?.xiaomifengTaskWechat !== undefined) _xiaomifengTaskWechat = r.settings.xiaomifengTaskWechat;
-    if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
-    if (['微信建联', '邮件建联', '蒲公英邀约'].includes(r.settings?.composerMethod)) {
-      _contactComposerMethod = r.settings.composerMethod;
+    if (unsaved) for (const [id, row] of unsaved) _contactReviewMap.set(id, row);
+    if (!unsaved) {
+      if (r.settings?.defaultGroupTag) _contactGroupTag = r.settings.defaultGroupTag;
+      if (r.settings?.projectName !== undefined) _contactProjectName = r.settings.projectName;
+      if (r.settings?.defaultGreeting) _contactGreeting = r.settings.defaultGreeting;
+      if (r.settings?.xiaomifengSmartRemark) _xiaomifengSmartRemark = r.settings.xiaomifengSmartRemark;
+      if (r.settings?.xiaomifengTaskWechat !== undefined) _xiaomifengTaskWechat = r.settings.xiaomifengTaskWechat;
+      if (r.settings?.contactChannel) _contactChannelStrategy = normalizeContactChannel(r.settings.contactChannel);
+      if (['微信建联', '邮件建联', '蒲公英邀约'].includes(r.settings?.composerMethod)) {
+        _contactComposerMethod = r.settings.composerMethod;
+      }
+      if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
+      if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
+      if (r.settings?.pgyCooperationGoal) _contactPgyCooperationGoal = r.settings.pgyCooperationGoal;
+      if (r.settings?.pgyCooperationMode) _contactPgyCooperationMode = r.settings.pgyCooperationMode;
+      if (r.settings?.pgyCooperationType) _contactPgyCooperationType = r.settings.pgyCooperationType;
+      if (r.settings?.pgyContactChannel) _contactPgyContactChannel = r.settings.pgyContactChannel;
+      if (r.settings?.pgyBrandName !== undefined) _contactPgyBrandName = r.settings.pgyBrandName;
+      if (r.settings?.pgyProductName !== undefined) _contactPgyProductName = r.settings.pgyProductName;
+      if (r.settings?.pgyContactWay !== undefined) _contactPgyContactWay = r.settings.pgyContactWay;
+      if (r.settings?.pgyIntro !== undefined) _contactPgyIntro = r.settings.pgyIntro;
+      if (r.settings?.pgyPublishStart !== undefined) _contactPgyPublishStart = r.settings.pgyPublishStart;
+      if (r.settings?.pgyPublishEnd !== undefined) _contactPgyPublishEnd = r.settings.pgyPublishEnd;
     }
-    if (r.settings?.emailSubject !== undefined) _contactEmailSubject = r.settings.emailSubject;
-    if (r.settings?.emailBody !== undefined) _contactEmailBody = r.settings.emailBody;
-    if (r.settings?.pgyCooperationGoal) _contactPgyCooperationGoal = r.settings.pgyCooperationGoal;
-    if (r.settings?.pgyCooperationMode) _contactPgyCooperationMode = r.settings.pgyCooperationMode;
-    if (r.settings?.pgyCooperationType) _contactPgyCooperationType = r.settings.pgyCooperationType;
-    if (r.settings?.pgyContactChannel) _contactPgyContactChannel = r.settings.pgyContactChannel;
-    if (r.settings?.pgyBrandName !== undefined) _contactPgyBrandName = r.settings.pgyBrandName;
-    if (r.settings?.pgyProductName !== undefined) _contactPgyProductName = r.settings.pgyProductName;
-    if (r.settings?.pgyContactWay !== undefined) _contactPgyContactWay = r.settings.pgyContactWay;
-    if (r.settings?.pgyIntro !== undefined) _contactPgyIntro = r.settings.pgyIntro;
-    if (r.settings?.pgyPublishStart !== undefined) _contactPgyPublishStart = r.settings.pgyPublishStart;
-    if (r.settings?.pgyPublishEnd !== undefined) _contactPgyPublishEnd = r.settings.pgyPublishEnd;
     _contactLoadedRunDir = targetRunDir;
     return true;
-  } catch (_) {
+  } catch (error) {
+    if (_selectedRunDir === targetRunDir && contactReviewRunCurrent(scope) && stillCurrent()) _contactReviewReadErrors.set(targetRunDir, contactReviewFailure(error));
     // keep unsaved in-memory edits if load fails
     return false;
   }
@@ -1295,7 +1768,7 @@ async function loadContactReviewForRun(force = false, runDir = _selectedRunDir) 
 
 function captureContactReviewSavePayload(runDir = _selectedRunDir) {
   const targetRunDir = String(runDir || '');
-  if (!targetRunDir) return null;
+  if (!targetRunDir || _contactReviewReadErrors.has(targetRunDir)) return null;
   const ownsLoadedState = _contactLoadedRunDir === targetRunDir || _contactPreviewRunDir === targetRunDir;
   if (!ownsLoadedState) return null;
   return {
@@ -1303,6 +1776,16 @@ function captureContactReviewSavePayload(runDir = _selectedRunDir) {
     reviewRows: getReviewRows(),
     settings: { ...getContactSettings() }
   };
+}
+
+function contactReviewFailure(result, fallback = 'CONTACT_REVIEW_READ_FAILED') {
+  const messages = {
+    CONTACT_REVIEW_RUN_INVALID: '采集结果目标无效，请重新选择结果',
+    CONTACT_REVIEW_READ_FAILED: '复核状态读取失败，已停止预览和保存；请核对原文件后重试',
+    CONTACT_REVIEW_SAVE_FAILED: '复核内容保存失败，原文件已保留，请重试保存'
+  };
+  const code = Object.hasOwn(messages, result?.code) ? result.code : fallback;
+  return { code, error: messages[code] };
 }
 
 function cancelPendingContactReviewSave(runDir = '') {
@@ -1324,11 +1807,24 @@ async function persistContactReviewPayload(payload) {
   if (!payload?.runDir) return null;
   const previous = _contactSaveInFlight?.promise;
   const promise = (previous ? previous.catch(() => null) : Promise.resolve())
-    .then(() => window.desktopAPI.exports.saveContactReview(payload));
+    .then(() => {
+      const blocked = _contactReviewReadErrors.get(payload.runDir);
+      return blocked ? { ok: false, ...blocked } : window.desktopAPI.exports.saveContactReview(payload);
+    });
   const marker = { runDir: payload.runDir, promise };
   _contactSaveInFlight = marker;
   try {
-    return await promise;
+    const result = await promise;
+    if (result?.ok) { _contactFailedSaveRuns.delete(payload.runDir); return result; }
+    _contactFailedSaveRuns.add(payload.runDir);
+    const failure = contactReviewFailure(result, 'CONTACT_REVIEW_SAVE_FAILED');
+    if (failure.code !== 'CONTACT_REVIEW_SAVE_FAILED') _contactReviewReadErrors.set(payload.runDir, failure);
+    return { ok: false, ...failure };
+  } catch (error) {
+    _contactFailedSaveRuns.add(payload.runDir);
+    const failure = contactReviewFailure(error, 'CONTACT_REVIEW_SAVE_FAILED');
+    if (failure.code !== 'CONTACT_REVIEW_SAVE_FAILED') _contactReviewReadErrors.set(payload.runDir, failure);
+    throw Object.assign(new Error(failure.error), { code: failure.code });
   } finally {
     if (_contactSaveInFlight === marker) _contactSaveInFlight = null;
   }
@@ -1336,7 +1832,10 @@ async function persistContactReviewPayload(payload) {
 
 async function saveContactReviewNow(payload = null) {
   const savePayload = payload || captureContactReviewSavePayload();
-  if (!savePayload) return null;
+  if (!savePayload) {
+    const blocked = _contactReviewReadErrors.get(_selectedRunDir);
+    return blocked ? { ok: false, ...blocked } : null;
+  }
   if (!payload) cancelPendingContactReviewSave(savePayload.runDir);
   return persistContactReviewPayload(savePayload);
 }
@@ -1344,16 +1843,23 @@ async function saveContactReviewNow(payload = null) {
 async function flushContactReviewSaveBeforeRunSwitch(runDir) {
   const targetRunDir = String(runDir || '');
   try {
-    const pendingPayload = cancelPendingContactReviewSave(targetRunDir);
-    if (pendingPayload) {
-      if (_selectedRunDir === targetRunDir) setContactSaveStatus('切换前保存中...');
-      const result = await saveContactReviewNow(pendingPayload);
-      if (!result?.ok) throw new Error(result?.error || '保存失败');
-    }
-    const inFlight = _contactSaveInFlight;
-    if (inFlight?.runDir === targetRunDir) {
-      const result = await inFlight.promise;
-      if (!result?.ok) throw new Error(result?.error || '保存失败');
+    // Edits may arrive while an older snapshot is being saved.
+    for (;;) {
+      const pendingPayload = cancelPendingContactReviewSave(targetRunDir);
+      if (pendingPayload) {
+        if (_selectedRunDir === targetRunDir) setContactSaveStatus('切换前保存中...');
+        const result = await saveContactReviewNow(pendingPayload);
+        if (!result?.ok) throw new Error(result?.error || '保存失败');
+        continue;
+      }
+      const inFlight = _contactSaveInFlight;
+      if (inFlight?.runDir === targetRunDir) {
+        const result = await inFlight.promise;
+        if (!result?.ok) throw new Error(result?.error || '保存失败');
+        continue;
+      }
+      if (_contactFailedSaveRuns.has(targetRunDir)) throw new Error('请先成功保存当前复核改动，再切换结果');
+      break;
     }
     return { ok: true };
   } catch (error) {
@@ -1364,11 +1870,14 @@ async function flushContactReviewSaveBeforeRunSwitch(runDir) {
 async function switchSelectedContactRun(nextRunDir) {
   const targetRunDir = String(nextRunDir || '');
   if (targetRunDir === _selectedRunDir) return true;
-  if (isPgyInviteBatchActive()) {
+  if (isPgyInviteBusy()) {
     setMsg('请先完成或停止当前蒲公英批量邀约，再切换采集结果。');
     return false;
   }
   const previousRunDir = _selectedRunDir;
+  if (_xhsContactState.running) {
+    setMsg('请先完成或安全停止当前联系方式补采，再切换采集结果。'); return false;
+  }
   if (previousRunDir) {
     const flushed = await flushContactReviewSaveBeforeRunSwitch(previousRunDir);
     if (!flushed.ok) {
@@ -1379,6 +1888,8 @@ async function switchSelectedContactRun(nextRunDir) {
   } else {
     cancelPendingContactReviewSave();
   }
+  if (isPgyInviteBusy() || _xhsContactState.running || _selectedRunDir !== previousRunDir) return false;
+  _contactRunGeneration++;
   _selectedRunDir = targetRunDir;
   resetContactPreviewState();
   _autoPreviewRequestedRunDir = '';
@@ -1391,6 +1902,7 @@ function requestSelectedContactRunSwitch(nextRunDir) {
   _contactRunSwitchTarget = targetRunDir;
   setTimeout(async () => {
     const switched = await switchSelectedContactRun(targetRunDir);
+    if (switched && !_runs.some((run) => run.path === targetRunDir)) await refreshRuns();
     _contactRunSwitchTarget = '';
     store.set({
       exports: {
@@ -1410,15 +1922,20 @@ function getXiaomifengApprovalPayload() {
   };
 }
 
-async function refreshXiaomifengApproval() {
+async function refreshXiaomifengApproval(stillCurrent = () => true) {
+  const scope = contactReviewRunScope();
+  const editGeneration = _contactReviewEditGeneration;
   if (!_selectedRunDir || !_contactPreviewRows.length) {
     _xiaomifengApproval = null;
     _xiaomifengApprovalCheck = null;
     return;
   }
   try {
-    const result = await window.desktopAPI.approvals.getXiaomifeng(getXiaomifengApprovalPayload());
-    if (!result?.ok) return;
+    const payload = getXiaomifengApprovalPayload(), signature = JSON.stringify(payload);
+    const result = await window.desktopAPI.approvals.getXiaomifeng(payload);
+    if (!result?.ok || !contactReviewRunCurrent(scope) || !stillCurrent()
+      || editGeneration !== _contactReviewEditGeneration
+      || signature !== JSON.stringify(getXiaomifengApprovalPayload())) return;
     _xiaomifengApproval = result.approval || null;
     _xiaomifengApprovalCheck = result.check || null;
   } catch (_) {}
@@ -1429,7 +1946,9 @@ async function importContactReviewWorkbookNow() {
     setMsg('请先刷新复核预览，再导入建联复核表。');
     return;
   }
+  const scope = contactReviewRunScope();
   const r = await window.desktopAPI.exports.importContactReviewWorkbook();
+  if (!contactReviewRunCurrent(scope)) return;
   if (r?.canceled) return;
   if (!r?.ok) {
     setMsg(`导入复核表失败：${r?.error || 'unknown error'}`);
@@ -1461,7 +1980,15 @@ async function importContactReviewWorkbookNow() {
     review.contactChannel = normalizeContactChannel(row.contactChannel || review.contactChannel || _contactChannelStrategy);
     updated += 1;
   });
-  await saveContactReviewNow();
+  let saved;
+  try { saved = await saveContactReviewNow(); }
+  catch (_) { saved = { ok: false }; }
+  if (!contactReviewRunCurrent(scope)) return;
+  if (!saved?.ok) {
+    setContactSaveStatus('导入内容保存失败，改动仍在当前页面；请重试保存复核');
+    setMsg('导入内容未保存，未确认完成；请先成功保存复核再切换结果。');
+    return;
+  }
   setContactSaveStatus(`已导入并保存 ${new Date().toLocaleTimeString()}`);
   const unmatchedHint = unmatchedRows.length
     ? `\n\n未匹配示例：\n${unmatchedRows.slice(0, 5).map((row) => `- 第${row.rowIndex || '?'}行 ${row.creatorName || ''} ${row.creatorUrl || ''}`).join('\n')}`
@@ -1471,11 +1998,18 @@ async function importContactReviewWorkbookNow() {
 }
 
 function scheduleContactReviewSave() {
+  _contactReviewEditGeneration++;
+  _xiaomifengApprovalCheck = null;
+  const blocked = _contactReviewReadErrors.get(_selectedRunDir);
+  if (blocked) {
+    if (_contactPreviewRunDir === _selectedRunDir && _contactReviewMap.size) _contactFailedSaveRuns.add(_selectedRunDir);
+    setContactSaveStatus(blocked.error, { refresh: false });
+    return;
+  }
   const payload = captureContactReviewSavePayload();
   if (!payload) return;
   cancelPendingContactReviewSave();
-  _contactSaveStatus = '等待自动保存';
-  _xiaomifengApprovalCheck = null;
+  setContactSaveStatus('等待自动保存', { refresh: false });
   _contactPendingSave = { payload };
   _contactSaveTimer = setTimeout(async () => {
     const pending = _contactPendingSave;
@@ -1487,7 +2021,9 @@ function scheduleContactReviewSave() {
       if (_selectedRunDir === scheduledRunDir) setContactSaveStatus('保存中...');
       const result = await saveContactReviewNow(pending.payload);
       if (!result?.ok) throw new Error(result?.error || '保存失败');
-      if (_selectedRunDir === scheduledRunDir) setContactSaveStatus(`已保存 ${new Date().toLocaleTimeString()}`);
+      if (_selectedRunDir === scheduledRunDir) setContactSaveStatus(
+        _contactPendingSave?.payload.runDir === scheduledRunDir || _contactSaveInFlight?.runDir === scheduledRunDir
+          ? '等待自动保存' : `已保存 ${new Date().toLocaleTimeString()}`);
     } catch (error) {
       if (_selectedRunDir === scheduledRunDir) {
         setContactSaveStatus(`自动保存失败：${error?.message || String(error)}`);
@@ -1497,7 +2033,12 @@ function scheduleContactReviewSave() {
 }
 
 async function refreshContactPreview() {
+  if (isPgyInviteBusy()) return;
   const runDir = _selectedRunDir;
+  const scope = contactReviewRunScope(), request = ++_contactPreviewRequest;
+  const editGeneration = _contactReviewEditGeneration;
+  const current = () => contactReviewRunCurrent(scope) && request === _contactPreviewRequest
+    && editGeneration === _contactReviewEditGeneration && !isPgyInviteBusy();
   if (!runDir) {
     _contactPreviewRows = [];
     _contactPreviewRunDir = '';
@@ -1506,11 +2047,12 @@ async function refreshContactPreview() {
   }
   setMsg('加载建联复核预览中...');
   try {
-    const loaded = await loadContactReviewForRun(false, runDir);
-    if (_selectedRunDir !== runDir) return;
+    const loaded = await loadContactReviewForRun(false, runDir, current);
+    if (!current()) return;
     if (!loaded) {
-      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: '复核状态读取失败' };
-      setMsg('加载复核预览失败：无法读取这个结果原有的复核状态，已停止刷新以避免覆盖。');
+      const failure = _contactReviewReadErrors.get(runDir) || contactReviewFailure();
+      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, ...failure };
+      setMsg(`加载复核预览失败：${failure.error} [${failure.code}]`);
       return;
     }
     const r = await window.desktopAPI.exports.getContactPreview({
@@ -1520,10 +2062,12 @@ async function refreshContactPreview() {
       ...getContactSettings(),
       reviewRows: getReviewRows()
     });
-    if (_selectedRunDir !== runDir) return;
+    if (!current()) return;
     if (!r?.ok) {
-      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: r?.error || 'unknown error' };
-      setMsg(`加载复核预览失败：${r?.error || 'unknown error'}`);
+      const failure = contactReviewFailure(r);
+      _contactReviewReadErrors.set(runDir, failure);
+      _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, ...failure };
+      setMsg(`加载复核预览失败：${failure.error} [${failure.code}]`);
       return;
     }
     _contactPreviewRows = Array.isArray(r.rows) ? r.rows : [];
@@ -1541,14 +2085,14 @@ async function refreshContactPreview() {
     });
     _contactReviewMap = migratedReviewMap;
     const saveResult = await saveContactReviewNow(captureContactReviewSavePayload(runDir));
+    if (!current()) return;
     if (!saveResult?.ok) throw new Error(saveResult?.error || '保存复核状态失败');
-    if (_selectedRunDir !== runDir) return;
-    await refreshXiaomifengApproval();
-    if (_selectedRunDir !== runDir) return;
+    await refreshXiaomifengApproval(current);
+    if (!current()) return;
     _contactSaveStatus = '';
     setMsg('');
   } catch (e) {
-    if (_selectedRunDir !== runDir) return;
+    if (!current()) return;
     _contactPreviewMeta = { rawFiles: 0, files: 0, loaded: true, error: e?.message || String(e) };
     setMsg(`加载复核预览异常：${e?.message || String(e)}`);
   }
@@ -1574,6 +2118,8 @@ export function renderExports(state) {
       if (targets.length) {
         setMsg(`蒲公英采集已完成，正在继续补采 ${targets.length} 位达人的小红书公开联系方式。`);
         await startXhsContactRows(targets, '本次采集名单', { confirm: false });
+      } else if (_contactPreviewRows.length) {
+        setMsg('蒲公英采集已完成；尚未勾选补采达人，请先在复核名单中选择。');
       } else {
         setMsg('蒲公英采集已结束，但本次没有可用的达人结果可继续补采。');
       }
@@ -1616,6 +2162,7 @@ export function renderExports(state) {
 
   const sel = document.createElement('select');
   sel.className = 'tpl-input';
+  sel.disabled = _resourceExportBusy;
   sel.style.height = '38px';
   (_runs || []).forEach((it) => {
     const opt = document.createElement('option');
@@ -1642,8 +2189,10 @@ export function renderExports(state) {
   btnRefresh.className = 'btn ghost';
   btnRefresh.style.height = '38px';
   btnRefresh.textContent = '刷新结果';
+  btnRefresh.disabled = _resourceExportBusy;
   btnRefresh.addEventListener('click', async () => {
     await refreshRuns();
+    if (!_columns.length) await ensureColumnsLoaded(true);
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
   });
 
@@ -1669,20 +2218,9 @@ export function renderExports(state) {
   btnExportResource.className = 'btn primary';
   btnExportResource.style.height = '38px';
   btnExportResource.textContent = '导出达人资源表';
-  btnExportResource.addEventListener('click', async () => {
-    setMsg('导出中...');
-    try {
-      const r = await window.desktopAPI.exports.exportResourceRun({ runDir: _selectedRunDir });
-      if (!r?.ok) {
-        setMsg(`导出失败：${r?.error || 'unknown error'}`);
-        return;
-      }
-      const dropped = (r.droppedCols !== undefined) ? `，已移除全空列=${r.droppedCols}` : '';
-      setMsg(`导出成功：\n${r.outPath}\n\n统计：raw_result.json=${r.files}，达人=${r.creators}，Top10笔记(非空标题)=${r.notesTop}${dropped}`);
-    } catch (e) {
-      setMsg(`导出异常：${e?.message || String(e)}`);
-    }
-  });
+  btnExportResource.disabled = _resourceExportBusy || !_selectedRunDir || !_columns.some((column) => _checked.has(column));
+  if (_resourceExportBusy) btnExportResource.textContent = '正在导出...';
+  btnExportResource.addEventListener('click', exportSelectedResourceColumns);
 
   const btnOpenRun = document.createElement('button');
   btnOpenRun.className = 'btn ghost';
@@ -1734,22 +2272,27 @@ export function renderExports(state) {
   contactComposer.className = 'contact-composer';
 
   const btnExportContact = document.createElement('button');
+  const contactExportScope = contactReviewRunScope();
   btnExportContact.className = 'btn primary';
   btnExportContact.className = 'btn primary export-main-cta';
   btnExportContact.textContent = _contactExportState.status === 'working' ? '正在导出...' : '导出建联表';
   btnExportContact.disabled = _contactExportState.status === 'working' || !_selectedRunDir || !_contactPreviewRows.length;
   btnExportContact.addEventListener('click', async () => {
-    if (_contactExportState.status === 'working') return;
+    if (_contactExportState.status === 'working' || !contactReviewRunCurrent(contactExportScope)) return;
+    const payload = captureContactReviewSavePayload(contactExportScope.runDir);
+    if (!payload) return setMsg('请先成功读取当前复核状态，再导出建联表。');
     _contactExportState = { status: 'working', message: '正在生成建联表，请稍候。', outPath: '' };
     setMsg('导出建联表中...');
     try {
-      const saveResult = await saveContactReviewNow();
-      if (saveResult && !saveResult.ok) throw new Error(saveResult.error || '复核内容保存失败');
+      const saveResult = await saveContactReviewNow(payload);
+      if (!contactReviewRunCurrent(contactExportScope)) return;
+      if (!saveResult?.ok) throw new Error(saveResult?.error || '复核内容保存失败');
       const r = await window.desktopAPI.exports.exportContactRun({
-        runDir: _selectedRunDir,
-        ...getContactSettings(),
-        reviewRows: getReviewRows()
+        runDir: payload.runDir,
+        ...payload.settings,
+        reviewRows: payload.reviewRows
       });
+      if (!contactReviewRunCurrent(contactExportScope)) return;
       if (!r?.ok) {
         _contactExportState = { status: 'error', message: `导出失败：${r?.error || 'unknown error'}`, outPath: '' };
         setMsg(`导出失败：${r?.error || 'unknown error'}`);
@@ -1769,11 +2312,14 @@ export function renderExports(state) {
       setMsg(`导出成功：\n${r.outPath}${fallbackLine}\n\n统计：raw_result.json=${r.files}，建联达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}${statusLine}`);
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     } catch (e) {
+      if (!contactReviewRunCurrent(contactExportScope)) return;
       _contactExportState = { status: 'error', message: `导出异常：${e?.message || String(e)}`, outPath: '' };
       setMsg(`导出异常：${e?.message || String(e)}`);
     } finally {
       if (_contactExportState.status === 'working') {
-        _contactExportState = { status: 'error', message: '导出未完成，请重试。', outPath: '' };
+        _contactExportState = contactReviewRunCurrent(contactExportScope)
+          ? { status: 'error', message: '导出未完成，请重试。', outPath: '' }
+          : { status: 'idle', message: '', outPath: '' };
       }
       store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
     }
@@ -1977,7 +2523,7 @@ export function renderExports(state) {
     button.className = 'contact-composer-tab';
     button.setAttribute('role', 'tab');
     button.textContent = method;
-    button.disabled = isPgyInviteBatchActive() && method !== '蒲公英邀约';
+    button.disabled = isPgyInviteBusy() && method !== '蒲公英邀约';
     if (button.disabled) button.title = '请先完成或停止当前蒲公英批量邀约';
     button.addEventListener('click', () => {
       const needsInitialTemplate = (method === '邮件建联' && !_contactEmailSubject && !_contactEmailBody)
@@ -2017,10 +2563,8 @@ export function renderExports(state) {
   const filteredContactRows = getContactFilteredRows();
   const contactReviewViewportKey = getContactReviewViewportKey();
   const savedContactReviewViewport = _contactReviewViewportStates.get(contactReviewViewportKey);
-  const selectedContactRows = filteredContactRows.filter((row) => {
-    const review = ensureReviewRow(row);
-    return review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
-  });
+  const selectedContactRows = getContactSelectedRows();
+  const reviewComposerMethod = _contactComposerMethod;
   const allReviewSummary = summarizeContactReviewRows(_contactPreviewRows);
   const filteredReviewSummary = summarizeContactReviewRows(filteredContactRows);
 
@@ -2099,7 +2643,7 @@ export function renderExports(state) {
     if (!result?.ok) return setMsg(`打开小红书失败：${result?.error || 'unknown error'}`);
     _xhsContactState = { ..._xhsContactState, session: 'waiting_login', message: '请在右侧人工登录' };
     setMsg('请在右侧完成小红书登录，完成后点击“检测登录”。');
-  }, { disabled: _xhsContactState.running || isPgyInviteBatchActive() });
+  }, { disabled: _xhsContactState.running || isPgyInviteBusy() });
 
   const btnCheckXhsLogin = makeSoftButton('检测登录', async () => {
     const result = await window.desktopAPI.contacts.checkXhsLogin();
@@ -2110,26 +2654,34 @@ export function renderExports(state) {
     }
     _xhsContactState = { ..._xhsContactState, session: result.loggedIn ? 'ready' : 'login_required', message: '' };
     setMsg(result.loggedIn ? '小红书页面已可用。' : '尚未完成小红书登录。');
-  }, { disabled: (_xhsContactState.running && !_xhsContactState.paused) || isPgyInviteBatchActive() });
+  }, { disabled: (_xhsContactState.running && !_xhsContactState.paused) || isPgyInviteBusy() });
 
+  const xhsStartScope = contactReviewRunScope();
   const btnStartXhsContact = makeSoftButton('补采已选达人联系方式', async () => {
-    await startXhsContactRows(selectedContactRows, `${_contactComposerMethod}已选达人`);
-  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running || _xhsContactState.session === 'risk' || isPgyInviteBatchActive() });
+    if (!contactReviewRunCurrent(xhsStartScope)) return;
+    if (!contactReviewRunCurrent(contactExportScope) || reviewComposerMethod !== _contactComposerMethod) return;
+    await startXhsContactRows(getContactSelectedRows(), `${_contactComposerMethod}已选达人`);
+  }, { primary: true, disabled: !_contactPreviewRows.length || !selectedContactRows.length || _xhsContactState.running || _xhsContactState.session === 'risk' || isPgyInviteBusy() });
   btnStartXhsContact.title = selectedContactRows.length
     ? '只补采当前明确勾选的达人，并保留串行低频和风险暂停'
     : '请先在下方达人名称前勾选“要建联”';
 
+  const xhsControlScope = _xhsContactScope;
   const btnPauseXhsContact = makeSoftButton(
     (_xhsContactState.paused || _xhsContactState.pausePending) ? '继续' : '暂停',
     async () => {
+    if (!xhsContactScopeCurrent(xhsControlScope) || !_xhsContactState.running || _xhsContactState.cancelPending) return;
     const result = (_xhsContactState.paused || _xhsContactState.pausePending)
       ? await window.desktopAPI.contacts.resumeXhsEnrichment()
       : await window.desktopAPI.contacts.pauseXhsEnrichment();
+    if (!xhsContactScopeCurrent(xhsControlScope) || !_xhsContactState.running) return;
     if (!result?.ok) setMsg(`补采任务操作失败：${result?.error || 'unknown error'}`);
   }, { disabled: !_xhsContactState.running || _xhsContactState.cancelPending });
 
   const btnCancelXhsContact = makeSoftButton(_xhsContactState.cancelPending ? '正在安全停止' : '停止', async () => {
+    if (!xhsContactScopeCurrent(xhsControlScope) || !_xhsContactState.running || _xhsContactState.cancelPending) return;
     const result = await window.desktopAPI.contacts.cancelXhsEnrichment();
+    if (!xhsContactScopeCurrent(xhsControlScope) || !_xhsContactState.running) return;
     if (!result?.ok) return setMsg(`停止失败：${result?.error || 'unknown error'}`);
     _xhsContactState = { ..._xhsContactState, cancelPending: true, phase: 'stopping', message: '停止请求已收到' };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -2139,7 +2691,7 @@ export function renderExports(state) {
     const result = await window.desktopAPI.browser.returnToCollectionResults();
     if (!result?.ok) return setMsg(`返回筛选结果失败：${result?.error || 'unknown error'}`);
     setMsg(result.warning || '已返回最近的蒲公英筛选结果页。');
-  }, { disabled: _xhsContactState.running || isPgyInviteBatchActive() });
+  }, { disabled: _xhsContactState.running || isPgyInviteBusy() });
 
   xhsContactBar.appendChild(xhsContactStatus);
   xhsContactActions.appendChild(btnReturnCollection);
@@ -2234,7 +2786,7 @@ export function renderExports(state) {
   btnPreview.className = 'btn ghost';
   btnPreview.style.height = '34px';
   btnPreview.textContent = '刷新名单';
-  btnPreview.disabled = isPgyInviteBatchActive();
+  btnPreview.disabled = isPgyInviteBusy();
   btnPreview.addEventListener('click', async () => {
     await refreshContactPreview();
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -2260,7 +2812,7 @@ export function renderExports(state) {
   btnImportReview.className = 'btn ghost';
   btnImportReview.style.height = '34px';
   btnImportReview.textContent = '导入修改后的表';
-  btnImportReview.disabled = !_contactPreviewRows.length || isPgyInviteBatchActive();
+  btnImportReview.disabled = !_contactPreviewRows.length || isPgyInviteBusy();
   btnImportReview.addEventListener('click', async () => {
     try {
       setContactSaveStatus('导入复核表中...');
@@ -2275,7 +2827,7 @@ export function renderExports(state) {
   btnUnselectAllContact.className = 'btn ghost';
   btnUnselectAllContact.style.height = '34px';
   btnUnselectAllContact.textContent = '清空整批勾选';
-  btnUnselectAllContact.disabled = !_contactPreviewRows.length || isPgyInviteBatchActive();
+  btnUnselectAllContact.disabled = !_contactPreviewRows.length || isPgyInviteBusy();
   btnUnselectAllContact.addEventListener('click', () => {
     _contactPreviewRows.forEach((row) => {
       const review = ensureReviewRow(row);
@@ -2296,7 +2848,8 @@ export function renderExports(state) {
   btnTencentEmail.disabled = !selectedContactRows.length || _emailHandoffState.status === 'preparing' || _xhsContactState.running;
   btnTencentEmail.title = '只整理当前已有邮箱并打开腾讯企业邮箱；不会启动补采、自动填写或发送';
   btnTencentEmail.addEventListener('click', async () => {
-    const selectedRows = selectedContactRows;
+    if (!contactReviewRunCurrent(contactExportScope) || _contactComposerMethod !== '邮件建联') return;
+    const selectedRows = getContactSelectedRows();
     if (!selectedRows.length) return setMsg('请先在达人名称前勾选“要建联”。');
     _emailHandoffState = { status: 'preparing', emails: [], missingNames: [], message: '正在整理已勾选达人的公开邮箱。' };
     store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
@@ -2331,28 +2884,15 @@ export function renderExports(state) {
   btnOpenPgyInvite.style.height = '34px';
   btnOpenPgyInvite.textContent = '打开邀约账号';
   btnOpenPgyInvite.title = '使用与采集账号完全独立的 Cookie 打开蒲公英；不会发送邀约';
-  btnOpenPgyInvite.addEventListener('click', async () => {
-    const result = await window.desktopAPI.invites.openAccount();
-    _pgyInviteAccountState = result?.ok
-      ? { status: 'opened', message: '邀约账号标签已打开。请在右侧登录第二个蒲公英账号。' }
-      : { status: 'error', message: `邀约账号打开失败：${result?.error || 'unknown error'}` };
-    setMsg(_pgyInviteAccountState.message);
-  });
+  btnOpenPgyInvite.disabled = isPgyInviteBusy() || _xhsContactState.running;
+  btnOpenPgyInvite.addEventListener('click', () => updatePgyInviteAccount(false));
   if (_contactComposerMethod === '蒲公英邀约') reviewTop.appendChild(btnOpenPgyInvite);
   const btnCheckPgyInvite = document.createElement('button');
   btnCheckPgyInvite.className = 'btn ghost';
   btnCheckPgyInvite.style.height = '34px';
   btnCheckPgyInvite.textContent = '检测邀约账号';
-  btnCheckPgyInvite.addEventListener('click', async () => {
-    const result = await window.desktopAPI.invites.checkLogin();
-    const ready = Boolean(result?.ok && result?.loggedIn && !result?.riskDetected);
-    _pgyInviteAccountState = ready
-      ? { status: 'ready', message: '邀约账号已登录，可以从名单打开达人链接。' }
-      : (result?.riskDetected
-          ? { status: 'risk', message: `邀约账号需要人工处理安全验证：${result?.riskText || '请查看右侧页面'}` }
-          : { status: result?.ok ? 'waiting' : 'error', message: result?.error || '邀约账号尚未登录，请在右侧完成登录。' });
-    setMsg(_pgyInviteAccountState.message);
-  });
+  btnCheckPgyInvite.disabled = isPgyInviteBusy() || _xhsContactState.running;
+  btnCheckPgyInvite.addEventListener('click', () => updatePgyInviteAccount(true));
   if (_contactComposerMethod === '蒲公英邀约') reviewTop.appendChild(btnCheckPgyInvite);
   const pgyInviteAccountStatus = document.createElement('span');
   pgyInviteAccountStatus.className = 'muted-line';
@@ -2369,12 +2909,12 @@ export function renderExports(state) {
     if (!r?.ok) setMsg(`打开最近建联表失败：${r?.error || 'unknown error'}`);
   });
   reviewTop.appendChild(btnOpenLastContact);
-  if (_contactSaveStatus) {
-    const saveStatus = document.createElement('div');
-    saveStatus.className = 'muted-line';
-    saveStatus.textContent = _contactSaveStatus;
-    reviewTop.appendChild(saveStatus);
-  }
+  const saveStatus = document.createElement('div');
+  saveStatus.className = 'muted-line';
+  saveStatus.dataset.contactSaveStatus = 'true';
+  saveStatus.setAttribute('role', 'status');
+  saveStatus.textContent = _contactSaveStatus;
+  reviewTop.appendChild(saveStatus);
   contactSec.appendChild(reviewTop);
 
   if (_contactComposerMethod === '蒲公英邀约') {
@@ -2408,22 +2948,39 @@ export function renderExports(state) {
     batchActions.className = 'pgy-invite-batch-actions';
     const startBatchButton = makeSoftButton(
       `蒲公英批量邀约（${selectedContactRows.length}）`,
-      async () => startPgyInviteBatch(selectedContactRows),
-      { primary: true, disabled: !selectedContactRows.length || isPgyInviteBatchActive() || _xhsContactState.running }
+      async () => {
+        if (!contactReviewRunCurrent(contactExportScope) || _contactComposerMethod !== '蒲公英邀约') return;
+        await startPgyInviteBatch(getContactSelectedRows());
+      },
+      { primary: true, disabled: !selectedContactRows.length || isPgyInviteBusy() || _xhsContactState.running }
     );
     startBatchButton.title = '逐位自动打开并准备邀约；每位真正发送前仍需人工确认';
     batchActions.appendChild(startBatchButton);
 
+    if (_pgyInviteBatchState.status === 'awaiting_brand' && currentRow) {
+      const brandChoice = createPgyInviteBrandChoice(currentRow, currentRow.rowId, _pgyInviteBatchState.id);
+      if (brandChoice) batchActions.appendChild(brandChoice);
+    }
+
     if (_pgyInviteBatchState.status === 'awaiting_confirmation') {
       batchActions.appendChild(makeSoftButton('人工确认发送当前达人', sendCurrentPgyInviteBatchItem, { primary: true }));
+      batchActions.appendChild(makeSoftButton(
+        _pgyInviteBatchState.currentIndex + 1 < total ? '不发送，准备下一位' : '不发送，完成本批准备',
+        async () => {
+          await advancePgyInviteBatch('unsent', '已准备但未发送；再次发送前需重新准备。');
+        }
+      ));
       batchActions.appendChild(makeSoftButton('已在右侧处理，下一位', async () => {
         await advancePgyInviteBatch('manual', '由操作人在右侧人工处理');
       }));
     }
     if (_pgyInviteBatchState.status === 'checking_result') {
       batchActions.appendChild(makeSoftButton('已核对右侧，继续下一位', async () => {
-        await advancePgyInviteBatch('manual', '平台结果由操作人核对');
+        if (currentRow) await reviewPgyInviteOutcome(currentRow, true);
       }, { primary: true }));
+      batchActions.appendChild(makeSoftButton('已核对未发出', async () => {
+        if (currentRow) await reviewPgyInviteOutcome(currentRow, false);
+      }));
     }
     if (_pgyInviteBatchState.status === 'error') {
       batchActions.appendChild(makeSoftButton('重试当前达人', prepareCurrentPgyInviteBatchItem, { primary: true }));
@@ -2603,7 +3160,7 @@ export function renderExports(state) {
       scheduleContactReviewSave();
       setMsg(`已选中本批次全部 ${_contactPreviewRows.length} 位达人。`);
     });
-    selectAllButton.disabled = isPgyInviteBatchActive();
+    selectAllButton.disabled = isPgyInviteBusy();
     selectAllButton.title = '选中本批次全部已采集达人，不受当前筛选条件影响';
     selectionActions.appendChild(selectAllButton);
 
@@ -2616,7 +3173,7 @@ export function renderExports(state) {
       scheduleContactReviewSave();
       setMsg('已清空本批次全部达人勾选；采集数据和已填写内容保持不变。');
     });
-    resetSelectionButton.disabled = isPgyInviteBatchActive();
+    resetSelectionButton.disabled = isPgyInviteBusy();
     resetSelectionButton.title = '清空本批次全部达人勾选，不删除采集数据或已填写内容';
     selectionActions.appendChild(resetSelectionButton);
 
@@ -2662,19 +3219,23 @@ export function renderExports(state) {
       const ok = await copyTextWithFallback(text);
       if (ok) setMsg(`已复制当前筛选结果摘要：${filteredContactRows.length} 条`);
     }));
+    const selectionExportScope = contactReviewRunScope();
     filterActions.appendChild(mkFilterBtn('导出当前Excel', async () => {
+      if (!contactReviewRunCurrent(selectionExportScope)) return;
       if (!filteredContactRows.length) {
         setMsg('当前筛选结果为空，无法导出。');
         return;
       }
+      const reviewPayload = captureContactReviewSavePayload(selectionExportScope.runDir);
+      if (!reviewPayload) return setMsg('请先成功读取当前复核状态，再导出。');
+      const exportPayload = JSON.parse(JSON.stringify({ runDir: selectionExportScope.runDir,
+        suffix: buildContactSelectionExportSuffix(), rows: buildExportRowsFromContactRows(filteredContactRows), ...getContactSettings() }));
       try {
-        await saveContactReviewNow();
-        const r = await window.desktopAPI.exports.exportContactSelection({
-          runDir: _selectedRunDir,
-          suffix: buildContactSelectionExportSuffix(),
-          rows: buildExportRowsFromContactRows(filteredContactRows),
-          ...getContactSettings()
-        });
+        const saved = await saveContactReviewNow(reviewPayload);
+        if (!contactReviewRunCurrent(selectionExportScope)) return;
+        if (!saved?.ok) throw new Error(saved?.error || '复核内容保存失败');
+        const r = await window.desktopAPI.exports.exportContactSelection(exportPayload);
+        if (!contactReviewRunCurrent(selectionExportScope)) return;
         if (!r?.ok) {
           setMsg(`导出当前筛选失败：${r?.error || 'unknown error'}`);
           return;
@@ -2683,6 +3244,7 @@ export function renderExports(state) {
         setMsg(`导出当前筛选成功：\n${r.outPath}\n\n统计：达人=${r.creators}，蒲公英邀约=${r.pgyInviteRows || 0}，邮件建联=${r.emailContactRows || 0}，小蜜蜂导入=${r.xiaomifengRows || 0}，待补联系方式=${r.pendingContactRows || 0}`);
         store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } });
       } catch (e) {
+        if (!contactReviewRunCurrent(selectionExportScope)) return;
         setMsg(`导出当前筛选异常：${e?.message || String(e)}`);
       }
     }));
@@ -2820,7 +3382,7 @@ export function renderExports(state) {
       const selectedInput = document.createElement('input');
       selectedInput.type = 'checkbox';
       selectedInput.checked = review?.selected === true && getContactExecutionChannel(review) === _contactComposerMethod;
-      selectedInput.disabled = isPgyInviteBatchActive();
+      selectedInput.disabled = isPgyInviteBusy();
       selectedInput.addEventListener('change', () => {
         if (!review) return;
         _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
@@ -2851,7 +3413,7 @@ export function renderExports(state) {
         pgyLink.className = 'contact-pgy-link';
         pgyLink.href = normalizeContactUrl(row.creatorUrl);
         pgyLink.textContent = '采集账号查看';
-        pgyLink.title = row.creatorUrl;
+        pgyLink.title = '可选查看：在采集账号打开主页；准备邀约不需要先点这里';
         pgyLink.addEventListener('click', async (event) => {
           event.preventDefault();
           _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
@@ -2860,21 +3422,16 @@ export function renderExports(state) {
         });
         creatorBlock.appendChild(pgyLink);
         if (_contactComposerMethod === '蒲公英邀约') {
-          const pgyInviteLink = document.createElement('a');
-          pgyInviteLink.className = 'contact-pgy-link';
-          pgyInviteLink.href = normalizeContactUrl(row.creatorUrl);
+          const pgyInviteLink = document.createElement('button');
+          pgyInviteLink.type = 'button';
+          pgyInviteLink.className = 'contact-pgy-link contact-pgy-action';
+          pgyInviteLink.disabled = isPgyInviteBusy() || _xhsContactState.running;
           pgyInviteLink.textContent = '邀约账号打开';
-          pgyInviteLink.title = '在独立邀约账号标签打开该达人；不会填写或发送';
+          pgyInviteLink.title = '可选查看：在邀约账号打开主页；准备邀约和批量流程会自动打开';
           pgyInviteLink.addEventListener('click', async (event) => {
             event.preventDefault();
             _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
-            setPgyInviteDraftState(rowId, null);
-            const result = await window.desktopAPI.invites.openCreator({
-              runDir: _selectedRunDir,
-              rowId
-            });
-            if (!result?.ok) setMsg(`邀约账号打开达人失败：${result?.error || 'unknown error'}`);
-            else setMsg(`已在邀约账号打开 ${row.creatorName || '该达人'}。当前仅打开页面，不会填写或发送邀约。`);
+            await openPgyInviteForRow(row, rowId);
           });
           creatorBlock.appendChild(pgyInviteLink);
 
@@ -2884,14 +3441,14 @@ export function renderExports(state) {
           prepareInviteButton.className = 'contact-pgy-link contact-pgy-action';
           prepareInviteButton.textContent = inviteDraftState?.status === 'preparing' ? '正在准备...' : '准备邀约';
           prepareInviteButton.title = '打开该达人，进入详细邀约表单，填写固定模板并逐项回读；不会发送';
-          prepareInviteButton.disabled = inviteDraftState?.status === 'preparing' || inviteDraftState?.status === 'sending' || isPgyInviteBatchActive();
+          prepareInviteButton.disabled = inviteDraftState?.status === 'submitted' || isPgyInviteBusy() || _xhsContactState.running;
           prepareInviteButton.addEventListener('click', async () => {
             _contactReviewViewportStates.setActiveRow(contactReviewViewportKey, rowId, reviewList);
             await preparePgyInviteForRow(row, rowId);
           });
           creatorBlock.appendChild(prepareInviteButton);
 
-          if (inviteDraftState?.status === 'ready' && !isPgyInviteBatchActive()) {
+          if (inviteDraftState?.status === 'ready' && !isPgyInviteBusy() && !_xhsContactState.running) {
             const sendInviteButton = document.createElement('button');
             sendInviteButton.type = 'button';
             sendInviteButton.className = 'contact-pgy-link contact-pgy-action send';
@@ -2904,6 +3461,15 @@ export function renderExports(state) {
             creatorBlock.appendChild(sendInviteButton);
           }
 
+          if (inviteDraftState?.status === 'submitted' && !isPgyInviteBusy()) {
+            creatorBlock.appendChild(makeSoftButton('已核对成功发出', () => reviewPgyInviteOutcome(row, true)));
+            creatorBlock.appendChild(makeSoftButton('已核对未发出', () => reviewPgyInviteOutcome(row, false)));
+          }
+
+          if (inviteDraftState?.status === 'brand_selection' && !isPgyInviteBusy()) {
+            const brandChoice = createPgyInviteBrandChoice(row, rowId);
+            if (brandChoice) creatorBlock.appendChild(brandChoice);
+          }
           if (inviteDraftState?.message) {
             const inviteStatus = document.createElement('div');
             inviteStatus.className = `pgy-invite-row-status ${inviteDraftState.status || ''}`.trim();
@@ -2968,6 +3534,7 @@ export function renderExports(state) {
       followupField.textContent = '跟进';
       const followup = document.createElement('select');
       followup.className = 'tpl-input';
+      followup.disabled = isPgyInviteBusy();
       followup.style.height = '34px';
       const currentFollowup = defaultFollowupStatus(review);
       if (!FOLLOWUP_STATUS_OPTIONS.includes(currentFollowup)) {
@@ -2998,6 +3565,7 @@ export function renderExports(state) {
       channelField.textContent = '方式';
       const channel = document.createElement('select');
       channel.className = 'tpl-input';
+      channel.disabled = isPgyInviteBusy();
       channel.style.height = '34px';
       CONTACT_CHANNEL_OPTIONS.forEach((value) => {
         const opt = document.createElement('option');
@@ -3113,6 +3681,7 @@ export function renderExports(state) {
       detailSummary.textContent = '编辑跟进信息';
       detail.appendChild(detailSummary);
       detail.appendChild(fields);
+      bindContactReviewReading(detail, { followup, channel, priority, email, wechat, phone, exclude, note }, _selectedRunDir, rowId);
 
       card.appendChild(main);
       card.appendChild(quickMeta);
@@ -3122,46 +3691,33 @@ export function renderExports(state) {
     });
     contactSec.appendChild(reviewList);
     reviewList.addEventListener('scroll', () => {
-      _contactReviewViewportStates.capture(contactReviewViewportKey, reviewList);
+      if (reviewList.isConnected) _contactReviewViewportStates.capture(contactReviewViewportKey, reviewList);
     });
   }
   root.appendChild(contactSec);
+  root.appendChild(renderFeishuWorkbench({
+    runDir: _selectedRunDir,
+    rows: _contactPreviewRows.map(row => ({ ...row, ...ensureReviewRow(row) })),
+    save: saveContactReviewNow,
+    rerender: () => store.set({ exports: { ...(store.state.exports || {}), _t: Date.now() } }),
+    apply: applyFeishuContactPatch
+  }));
   if (contactReviewList) {
     requestAnimationFrame(() => {
       if (!contactReviewList.isConnected || !savedContactReviewViewport) return;
       restoreReviewViewport(contactReviewList, savedContactReviewViewport);
+      const restoredTop = contactReviewList.scrollTop;
       requestAnimationFrame(() => {
-        if (contactReviewList.isConnected) restoreReviewViewport(contactReviewList, savedContactReviewViewport);
+        if (contactReviewList.isConnected && contactReviewList.scrollTop === restoredTop) {
+          restoreReviewViewport(contactReviewList, savedContactReviewViewport);
+        }
       });
     });
   }
 
-  // 二次导出：按列勾选（两栏 + sticky 操作条）
+  // Keep column settings beside the resource export action across rerenders.
   const sec = document.createElement('div');
-  sec.className = 'card';
-  sec.style.marginTop = '14px';
-  sec.style.padding = '14px';
-
-  const head = document.createElement('div');
-  head.style.display = 'flex';
-  head.style.alignItems = 'baseline';
-  head.style.justifyContent = 'space-between';
-  head.style.gap = '12px';
-  head.style.marginBottom = '10px';
-
-  const h3 = document.createElement('div');
-  h3.style.fontWeight = '900';
-  h3.style.letterSpacing = '0.2px';
-  h3.textContent = '二次导出（按列勾选）';
-
-  const hint = document.createElement('div');
-  hint.style.color = 'var(--muted)';
-  hint.style.fontSize = '12px';
-  hint.textContent = '导出精简版：按勾选列导出，并自动剔除全空列；会记住你的上次选择。';
-
-  head.appendChild(h3);
-  head.appendChild(hint);
-  sec.appendChild(head);
+  sec.className = 'resource-column-content';
 
   const groups = (_groups && _groups.length) ? _groups : [{ name: '全部列', columns: _columns }];
   if (!_activeGroup && groups.length) _activeGroup = groups[0].name;
@@ -3220,7 +3776,7 @@ export function renderExports(state) {
 
   const pane = document.createElement('div');
   pane.style.display = 'grid';
-  pane.style.gridTemplateColumns = '190px 1fr';
+  pane.style.gridTemplateColumns = 'minmax(120px, 170px) minmax(0, 1fr)';
   pane.style.gap = '12px';
   pane.style.minHeight = '360px';
 
@@ -3228,7 +3784,7 @@ export function renderExports(state) {
   const left = document.createElement('div');
   left.style.background = 'var(--panel2)';
   left.style.border = '1px solid var(--line)';
-  left.style.borderRadius = '14px';
+  left.style.borderRadius = '8px';
   left.style.padding = '10px';
 
   groups.forEach((g) => {
@@ -3268,7 +3824,9 @@ export function renderExports(state) {
   // 右：列列表
   const right = document.createElement('div');
   right.style.border = '1px solid var(--line)';
-  right.style.borderRadius = '14px';
+  right.style.borderRadius = '8px';
+  right.style.minWidth = '0';
+  right.style.maxHeight = '380px';
   right.style.background = 'var(--panel)';
   right.style.overflow = 'auto';
   right.style.position = 'relative';
@@ -3289,14 +3847,14 @@ export function renderExports(state) {
   rtSub.style.color = 'var(--muted)';
   rtSub.style.fontSize = '12px';
   rtSub.style.marginTop = '4px';
-  rtSub.textContent = `已选 ${_checked.size} / ${_columns.length}`;
+  rtSub.textContent = `已选 ${_columns.filter((column) => _checked.has(column)).length} / ${_columns.length}`;
 
   rightTop.appendChild(rtTitle);
   rightTop.appendChild(rtSub);
   right.appendChild(rightTop);
 
   const list = document.createElement('div');
-  list.style.padding = '10px 12px 68px 12px'; // 预留 sticky 底部
+  list.style.padding = '10px 12px';
 
   const cols = _filteredColumns(Array.isArray(active.columns) ? active.columns : []);
   if (!cols.length && String(_query || '').trim()) {
@@ -3340,73 +3898,28 @@ export function renderExports(state) {
   }
   right.appendChild(list);
 
-  // sticky 导出条
-  const sticky = document.createElement('div');
-  sticky.style.position = 'sticky';
-  sticky.style.bottom = '0';
-  sticky.style.left = '0';
-  sticky.style.right = '0';
-  sticky.style.zIndex = '3';
-  sticky.style.padding = '10px 12px';
-  sticky.style.borderTop = '1px solid var(--line)';
-  sticky.style.background = 'rgba(255,255,255,0.92)';
-  sticky.style.backdropFilter = 'blur(10px)';
-  sticky.style.display = 'flex';
-  sticky.style.alignItems = 'center';
-  sticky.style.justifyContent = 'space-between';
-  sticky.style.gap = '10px';
-
-  const leftStat = document.createElement('div');
-  leftStat.style.color = 'var(--muted)';
-  leftStat.style.fontSize = '12px';
-  leftStat.textContent = `已选 ${_checked.size} / ${_columns.length} · 会自动剔除全空列`;
-
-  const btnExportSlim = document.createElement('button');
-  btnExportSlim.className = 'btn primary';
-  btnExportSlim.style.height = '36px';
-  btnExportSlim.textContent = '导出精简版';
-  btnExportSlim.disabled = !_columns.length;
-  btnExportSlim.addEventListener('click', async () => {
-    const selectedColumns = _columns.filter((c) => _checked.has(c));
-    if (!selectedColumns.length) {
-      alert('请至少勾选 1 列');
-      return;
-    }
-    setMsg('导出精简版中...');
-    try {
-      await window.desktopAPI.exports.saveColumnPreset(selectedColumns);
-      const r = await window.desktopAPI.exports.exportResourceRun({
-        runDir: _selectedRunDir,
-        selectedColumns,
-        mode: 'slim'
-      });
-      if (!r?.ok) {
-        setMsg(`导出失败：${r?.error || 'unknown error'}`);
-        return;
-      }
-      const dropped = (r.droppedCols !== undefined) ? `，已移除全空列=${r.droppedCols}` : '';
-      setMsg(`导出成功：\n${r.outPath}\n\n统计：达人=${r.creators}，selectedCols=${r.selectedCols ?? selectedColumns.length}${dropped}`);
-    } catch (e) {
-      setMsg(`导出异常：${e?.message || String(e)}`);
-    }
-  });
-
-  sticky.appendChild(leftStat);
-  sticky.appendChild(btnExportSlim);
-  right.appendChild(sticky);
-
   pane.appendChild(left);
   pane.appendChild(right);
   sec.appendChild(pane);
-  root.appendChild(sec);
+  const columnSettings = createAdvancedSection({
+    title: `导出列设置 · 已选 ${_columns.filter((column) => _checked.has(column)).length} / ${_columns.length}`,
+    open: _resourceColumnsOpen,
+    onToggle: (open) => { _resourceColumnsOpen = open; },
+    children: [sec]
+  });
+  columnSettings.className = 'advanced-section resource-column-settings';
+  bar.appendChild(columnSettings);
 
   const msg = document.createElement('div');
   msg.style.marginTop = '10px';
   msg.style.fontSize = '13px';
   msg.style.whiteSpace = 'pre-wrap';
   msg.style.color = 'var(--text)';
+  msg.style.gridColumn = '1 / -1';
+  msg.style.overflowWrap = 'anywhere';
+  msg.setAttribute('role', 'status');
   msg.textContent = _msg || '';
-  root.appendChild(msg);
+  bar.appendChild(msg);
 
   return root;
 }

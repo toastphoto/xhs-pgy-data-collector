@@ -106,6 +106,11 @@ function parseCandidateInstruction(value, options = {}) {
     return { ok: false, code: 'CANDIDATE_COMMAND_COUNT_MISSING', error: '请写明范围，例如“前20位”或“第42位到第50位”。' };
   }
   const { mode, startRank, endRank } = range;
+  const currentPageRequested = /(?:当前|目前|本)页(?:面)?/.test(instruction);
+  if (currentPageRequested && /(?:第\s*(?:1|一)页|首页)/.test(instruction)) {
+    return { ok: false, code: 'CANDIDATE_COMMAND_ORIGIN_CONFLICT', error: '指令同时指定了当前页和第一页，请保留一个起点。' };
+  }
+  const rankOrigin = currentPageRequested ? 'current_page' : 'search_start';
   if (!Number.isInteger(startRank) || !Number.isInteger(endRank) || startRank < 1 || endRank < startRank) {
     return { ok: false, code: 'CANDIDATE_COMMAND_RANGE_INVALID', error: '范围顺序不正确，请按“第 A 位到第 B 位”填写，并确保 A 不大于 B。' };
   }
@@ -136,6 +141,7 @@ function parseCandidateInstruction(value, options = {}) {
     ok: true,
     instruction,
     mode,
+    rankOrigin,
     startRank,
     endRank,
     requestedCount: count,

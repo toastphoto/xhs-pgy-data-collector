@@ -12,6 +12,10 @@ assert.match(exportsSource, /已将模板中的项目名称替换为/);
 assert.match(exportsSource, /新增模板/);
 assert.match(exportsSource, /保存到当前模板/);
 assert.match(exportsSource, /另存为新模板/);
+const templateManagerSource = exportsSource.slice(exportsSource.indexOf('function createOutreachTemplateManager('),
+  exportsSource.indexOf('function createOutreachTemplateManager(') + exportsSource.slice(exportsSource.indexOf('function createOutreachTemplateManager(')).indexOf('\n  deleteButton.addEventListener'));
+assert.doesNotMatch(templateManagerSource, /window\.prompt\(/, 'Electron does not support browser prompt dialogs');
+assert.match(templateManagerSource, /nextTemplateName\('新模板'\)/);
 assert.match(exportsSource, /删除当前模板/);
 assert.match(exportsSource, /设为默认/);
 assert.match(exportsSource, /仅生成或填写草稿，发送前必须人工确认/);

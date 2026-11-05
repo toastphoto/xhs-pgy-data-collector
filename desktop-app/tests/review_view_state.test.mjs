@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
 import {
   buildReviewViewportKey,
   captureReviewViewport,
@@ -48,6 +50,33 @@ const rerendered = {
 };
 assert.equal(restoreReviewViewport(rerendered, captureReviewViewport(container)), 155);
 assert.equal(rerendered.scrollTop, 155);
+
+// offsetTop may be relative to the workbench, not the scrolling list.
+function positionedList(parentTop, scrollTop, border = 2) {
+  const list = { scrollTop, scrollHeight:720, clientHeight:180, clientTop:border,
+    getBoundingClientRect:()=>({top:parentTop}) };
+  list.children = [0,110,220].map((top,i)=>({ ...card(String(i),parentTop+top,100),
+    getBoundingClientRect:()=>({top:parentTop+border+top-list.scrollTop}) }));
+  return list;
+}
+const embedded = positionedList(1800,135);
+const embeddedState = captureReviewViewport(embedded, {activeRowId:'1'});
+assert.deepEqual(embeddedState,{scrollTop:135,anchorRowId:'1',anchorOffset:-25,activeRowId:'1'});
+const shifted = positionedList(2300,0);
+assert.equal(restoreReviewViewport(shifted,embeddedState),135);
+assert.equal(captureReviewViewport(shifted).anchorOffset,-25);
+
+const renderer = fs.readFileSync(new URL('../renderer/views/exports.js',import.meta.url),'utf8');
+const restoration = renderer.slice(renderer.indexOf('  if (contactReviewList) {'),renderer.indexOf('  // Keep column settings beside'));
+assert.ok(restoration.includes('restoreReviewViewport'));
+for (const interrupted of [false,true]) {
+  const frames=[], list={...rerendered,isConnected:true,scrollTop:0};
+  vm.runInNewContext(restoration,{contactReviewList:list,savedContactReviewViewport:captureReviewViewport(container),
+    restoreReviewViewport,requestAnimationFrame:fn=>frames.push(fn)});
+  frames.shift()(); assert.equal(list.scrollTop,155);
+  if(interrupted)list.scrollTop=300;
+  frames.shift()(); assert.equal(list.scrollTop,interrupted?300:155,'Second frame must not overwrite newer manual scrolling');
+}
 
 const changedList = {
   scrollTop: 0,

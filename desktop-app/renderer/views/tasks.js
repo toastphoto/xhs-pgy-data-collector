@@ -49,6 +49,43 @@ let _searchAdvancedOpen = false;
 let _candidateBulkOpen = false;
 let _candidateListScrollTop = 0;
 let _candidateListViewportKey = '';
+let _taskStateLoaded = false;
+
+async function refreshTaskState() {
+  _taskStateLoaded = true;
+  const before = store.state.tasks;
+  try {
+    const result = await window.desktopAPI.tasks.getState();
+    // A live event arriving during the request is newer than this snapshot.
+    if (store.state.tasks !== before) return;
+    if (!result?.ok) throw new Error(result?.error || '任务状态暂时无法读取');
+    store.set({ tasks: { ...before, ...result.state } });
+  } catch (error) {
+    if (store.state.tasks === before) store.set({ tasks: { ...before, recoveryError: error.message } });
+  }
+}
+
+async function recoverInterruptedTask(runDir) {
+  try {
+    const result = await window.desktopAPI.tasks.recover(runDir);
+    if (!result?.ok) return alert(`恢复失败：${result?.error || '任务状态无法读取'}`);
+    await refreshTaskState();
+    requestAnimationFrame(() => document.getElementById('taskRecoveryPanel')?.scrollIntoView({ block: 'start' }));
+  } catch (error) {
+    alert(`恢复失败：${error.message}`);
+  }
+}
+
+async function stopCollectionTask() {
+  if (!window.confirm('确定停止整批任务吗？\n\n已完成的结果会保留，未处理达人不会继续。停止后可重新选择候选，按批次间隔开始新采集。')) return;
+  try {
+    const result = await window.desktopAPI.tasks.stop();
+    if (!result?.ok) alert(`停止失败：${result?.error || '任务状态无法保存'}`);
+    await refreshTaskState();
+  } catch (error) {
+    alert(`停止异常：${error.message}`);
+  }
+}
 
 function requestRendererKeyboardFocus(element) {
   if (_candidateCommandFocusRequestPending) return;
@@ -386,6 +423,8 @@ function completeCandidateSearchRead(command, result) {
   const rangeLabel = command.startRank === 1
     ? `前 ${command.endRank} 位`
     : `第 ${command.startRank}-${command.endRank} 位`;
+  const originLabel = command.rankOrigin === 'current_page'
+    ? `第 ${result.stats?.startPage || '?'} 页起` : '第一页起';
   _lastSearchSnapshot = {
     url: result.url || '',
     filters: result.filters || null,
@@ -406,7 +445,7 @@ function completeCandidateSearchRead(command, result) {
     items: items.slice(0, 10)
   };
   _candidateInstructionStatus = items.length
-    ? `已完整读取${rangeLabel}中的 ${items.length} 位；本次采集已切到最近加入的一段`
+    ? `${originLabel}：已完整读取${rangeLabel}中的 ${items.length} 位；本次采集已切到最近加入的一段`
     : '未读取到达人，请确认右侧停留在蒲公英筛选结果页。';
   const filterText = summarizeSearchFilters(result.filters);
   alert([
@@ -798,6 +837,7 @@ function renderExecutionRecords(root) {
 }
 
 export function renderTasks(state) {
+  if (!_taskStateLoaded && window.desktopAPI.tasks.getState) refreshTaskState();
   const completedRunDir = String(state.tasks?.runDir || '');
   const completionQueue = Array.isArray(state.tasks?.queue) ? state.tasks.queue : [];
   const queueFinished = completionQueue.length > 0 && completionQueue.every((item) => ['ok', 'fail', 'skipped'].includes(String(item?.status || '')));
@@ -835,7 +875,9 @@ export function renderTasks(state) {
   const stats = queueStats(queue);
   const currentIndex = queue.findIndex((item) => item.id === state.tasks?.currentId);
   const processedCount = queue.filter((item) => ['ok', 'fail', 'skipped'].includes(String(item?.status || ''))).length;
-  const statusInfo = state.tasks?.running
+  const statusInfo = state.tasks?.unfinishedRun
+    ? { label: '旧任务待恢复', tone: 'warn', detail: '请先在顶部恢复旧任务，再选择继续或停止。' }
+    : state.tasks?.running
     ? state.tasks?.stopPending
       ? { label: '正在安全停止', tone: 'warn', detail: '停止请求已收到；当前安全操作结束后不会再处理下一位达人。' }
       : state.tasks?.paused
@@ -919,6 +961,63 @@ export function renderTasks(state) {
   hero.appendChild(heroMain);
   hero.appendChild(heroMeta);
   root.appendChild(hero);
+
+  const unfinished = state.tasks?.unfinishedRun;
+  const restored = Boolean(state.tasks?.running && state.tasks?.recoveryPending);
+  if (unfinished || restored || state.tasks?.recoveryError) {
+    const recovery = document.createElement('section');
+    recovery.id = 'taskRecoveryPanel';
+    recovery.className = 'task-run-status warn';
+    recovery.style.display = 'flex';
+    recovery.style.flexDirection = 'column';
+    recovery.style.alignItems = 'stretch';
+    recovery.style.gap = '10px';
+    recovery.setAttribute('role', 'status');
+    const heading = document.createElement('b');
+    heading.style.fontSize = '14px';
+    heading.textContent = restored ? '旧任务已恢复，当前暂停' : unfinished ? '有一批未完成的采集任务' : '上次任务状态读取失败';
+    recovery.appendChild(heading);
+    const detail = document.createElement('div');
+    const savedTime = unfinished?.updatedAt && new Date(unfinished.updatedAt);
+    detail.textContent = restored
+      ? `已处理 ${processedCount}/${queue.length} 位。可以直接停止旧任务，或核对队列后继续采集。`
+      : unfinished
+        ? [unfinished.taskName || '未命名采集任务', savedTime && Number.isFinite(savedTime.getTime()) ? `上次保存：${savedTime.toLocaleString('zh-CN', { hour12: false })}` : '', unfinished.total !== null ? `已处理 ${unfinished.processed}/${unfinished.total} 位` : '', unfinished.error || '恢复后保持暂停，可以直接停止。'].filter(Boolean).join(' · ')
+        : state.tasks.recoveryError;
+    detail.style.overflowWrap = 'anywhere';
+    detail.style.fontSize = '12px';
+    recovery.appendChild(detail);
+    const actions = document.createElement('div');
+    actions.className = 'task-actions';
+    const addAction = (label, style, action) => {
+      const button = document.createElement('button');
+      button.className = `btn ${style}`;
+      button.textContent = label;
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try { await action(); } finally { button.disabled = false; }
+      });
+      actions.appendChild(button);
+    };
+    if (restored) {
+      addAction('停止旧任务', 'danger', stopCollectionTask);
+      addAction('查看采集队列', 'ghost', () => document.getElementById('collectionQueue')?.scrollIntoView({ block: 'start' }));
+    } else if (unfinished) {
+      addAction('恢复旧任务（保持暂停）', 'primary', () => recoverInterruptedTask(unfinished.runDir));
+    } else {
+      addAction('重新读取任务状态', 'ghost', refreshTaskState);
+    }
+    recovery.appendChild(actions);
+    root.prepend(recovery);
+  }
+
+  if (!state.tasks?.running && Number(state.tasks?.cooldownUntil) > Date.now()) {
+    const cooldown = document.createElement('div');
+    cooldown.className = 'task-banner';
+    cooldown.setAttribute('role', 'status');
+    cooldown.textContent = `上一批已结束。新采集可在 ${new Date(state.tasks.cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false })} 后开始（批次间隔 5 分钟）；现在可以整理候选。`;
+    root.appendChild(cooldown);
+  }
 
   const taskStatusPanel = document.createElement('section');
   taskStatusPanel.className = `task-run-status ${statusInfo.tone}`;
@@ -1109,6 +1208,7 @@ export function renderTasks(state) {
         requestedCount: command.requestedCount,
         startRank: command.startRank,
         endRank: command.endRank,
+        rankOrigin: command.rankOrigin,
         templatePath: _selectedTemplatePath || state.templates?.activeTemplatePath || ''
       });
       handleCandidateSearchResult(command, r);
@@ -1130,7 +1230,7 @@ export function renderTasks(state) {
   commandInputRow.className = 'candidate-command-input-row';
   const commandInput = document.createElement('input');
   commandInput.className = 'tpl-input candidate-command-input';
-  commandInput.placeholder = '例如：前30位，或第42位到第50位达人加入候选';
+  commandInput.placeholder = '例如：当前页面前20位，或从第一页取前30位达人';
   commandInput.value = _candidateInstruction;
   commandInput.disabled = candidateCommandLocked;
   commandInput.addEventListener('pointerdown', () => requestRendererKeyboardFocus(commandInput));
@@ -1204,7 +1304,9 @@ export function renderTasks(state) {
         }
         stopCandidateCheckpointTimer();
         _candidateCheckpoint = null;
-        _candidateInstructionStatus = '本次读取已结束，暂存结果未加入候选池。';
+        _candidateInstructionStatus = result.restoreSkipped
+          ? '本次读取已结束，暂存结果未加入候选池；页面变化或无法核实安全状态，未自动回页，请人工核对。'
+          : '本次读取已结束，暂存结果未加入候选池。';
         store.set({ tasks: { ...store.state.tasks } });
       } catch (error) {
         alert(`结束本次读取异常：${error?.message || String(error)}`);
@@ -2122,6 +2224,10 @@ export function renderTasks(state) {
   btnStart.textContent = '开始采集';
   btnStart.disabled = !!state.tasks?.running;
   btnStart.addEventListener('click', async () => {
+    if (store.state.tasks?.unfinishedRun) {
+      document.getElementById('taskRecoveryPanel')?.scrollIntoView({ block: 'start' });
+      return;
+    }
     const urls = getCollectionUrls();
     if (!urls.length) {
       alert('当前采集范围内没有可采集的 URL。请调整候选状态或采集范围。');
@@ -2169,11 +2275,10 @@ export function renderTasks(state) {
           const recover = window.confirm([
             '检测到上次异常中断的采集任务。',
             '为避免重复采集和绕过冷却，本次新任务没有启动。',
-            '是否恢复旧任务？恢复后会保持暂停，确认队列后再点“继续”。'
+            '是否恢复旧任务？恢复后保持暂停，页面顶部可直接停止旧任务；要接着采集再点“继续”。'
           ].join('\n'));
           if (recover) {
-            const recovered = await window.desktopAPI.tasks.recover(r.runDir);
-            if (!recovered?.ok) alert(`恢复失败：${recovered?.error || 'unknown error'}`);
+            await recoverInterruptedTask(r.runDir);
             return;
           }
         }
@@ -2238,16 +2343,7 @@ export function renderTasks(state) {
   btnStop.className = 'btn danger';
   btnStop.textContent = state.tasks?.stopPending ? '正在安全停止' : '停止整批';
   btnStop.disabled = !state.tasks?.running || !!state.tasks?.stopPending;
-  btnStop.addEventListener('click', async () => {
-    const ok = window.confirm('确定停止整批任务吗？\n\n程序会在下一个安全点结束当前达人，后续未处理达人不会继续。已经完成的结果会保留。');
-    if (!ok) return;
-    try {
-      const result = await window.desktopAPI.tasks.stop();
-      if (!result?.ok) alert(`停止失败：${result?.error || 'unknown error'}`);
-    } catch (error) {
-      alert(`停止异常：${error?.message || String(error)}`);
-    }
-  });
+  btnStop.addEventListener('click', stopCollectionTask);
 
   ctrl.appendChild(btnStart);
   ctrl.appendChild(btnPause);
@@ -2260,6 +2356,7 @@ export function renderTasks(state) {
   // 队列表格
   const tableHeader = document.createElement('div');
   tableHeader.className = 'task-toolbar';
+  tableHeader.id = 'collectionQueue';
   const tableTitle = document.createElement('div');
   tableTitle.className = 'section-label';
   tableTitle.textContent = '采集队列';

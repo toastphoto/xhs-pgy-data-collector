@@ -1,3 +1,4 @@
+import { enhanceWorkspace } from './native-workflow.js';
 import { store } from './state/store.js';
 import { renderLogin } from './views/login.js';
 import { renderRecordings } from './views/recordings.js';
@@ -6,6 +7,13 @@ import { renderTasks } from './views/tasks.js';
 import { renderExports } from './views/exports.js';
 import { renderReport } from './views/report_chat.js';
 import { renderToolbox } from './views/toolbox.js';
+import {
+  WORKSPACE_LAYOUT_LIMITS,
+  getWorkspaceLayoutBounds,
+  normalizeWorkspaceLayout,
+  readWorkspaceLayout,
+  writeWorkspaceLayout
+} from './state/workspace_layout.mjs';
 
 const views = {
   login: renderLogin,
@@ -41,6 +49,19 @@ function renderSafely(name, render) {
 
 function renderSidebar(state) {
   const sidebar = document.getElementById('sidebar');
+  if (sidebar.childElementCount) {
+    sidebar.querySelectorAll('.nav-item').forEach(item => {
+      const active = item.dataset.view === state.view;
+      item.classList.toggle('active', active);
+      if (active) item.setAttribute('aria-current', 'page');
+      else item.removeAttribute('aria-current');
+    });
+    sidebar.querySelectorAll('.flow-strip span').forEach((item, index) => {
+      item.classList.toggle('current', ['login', 'tasks', 'exports'][index] === state.view);
+    });
+    return;
+  }
+  sidebar.setAttribute('aria-label', '工作台导航');
   sidebar.innerHTML = '';
 
   const iconSvg = (d) =>
@@ -81,9 +102,9 @@ function renderSidebar(state) {
   sidebar.appendChild(brand);
 
   const flow = h('div', { class: 'flow-strip' }, [
-    h('span', {}, ['搜索']),
-    h('span', {}, ['复核']),
-    h('span', {}, ['建联'])
+    h('span', { class: state.view === 'login' ? 'current' : '' }, ['01 准备']),
+    h('span', { class: state.view === 'tasks' ? 'current' : '' }, ['02 采集']),
+    h('span', { class: state.view === 'exports' ? 'current' : '' }, ['03 建联'])
   ]);
   sidebar.appendChild(flow);
 
@@ -94,6 +115,7 @@ function renderSidebar(state) {
     group.items.forEach(([key, label, desc]) => {
       const icon = document.createElement('span');
       icon.className = 'nav-icon';
+      icon.setAttribute('aria-hidden', 'true');
       icon.innerHTML = icons[key] || '';
       const text = h('span', { class: 'nav-text' }, [
         h('span', { class: 'nav-label' }, [label]),
@@ -104,6 +126,10 @@ function renderSidebar(state) {
           'button',
           {
             class: `nav-item ${state.view === key ? 'active' : ''}`,
+            'data-view': key,
+            'aria-label': label,
+            title: `${label} · ${desc}`,
+            'aria-current': state.view === key ? 'page' : null,
             onclick: () => store.set({ view: key })
           },
           [icon, text]
@@ -318,9 +344,62 @@ function renderContent(state) {
   const content = document.getElementById('content');
   const keepScroll = lastRenderedView === state.view;
   const scrollTop = keepScroll ? content.scrollTop : 0;
+  content._routeGhost?.remove();
+  let routeGhost = null;
+  const motion = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!keepScroll && motion && content.firstElementChild && content.animate) {
+    const bounds = content.getBoundingClientRect();
+    routeGhost = document.createElement('div');
+    routeGhost.inert = true;
+    routeGhost.setAttribute('aria-hidden', 'true');
+    routeGhost.style.cssText = `position:fixed;left:${bounds.left}px;top:${bounds.top}px;width:${bounds.width}px;height:${bounds.height}px;overflow:hidden;pointer-events:none;z-index:4;box-sizing:border-box;padding:24px;background:var(--bg)`;
+    const snapshot = content.firstElementChild.cloneNode(true);
+    snapshot.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
+    snapshot.style.transform = `translateY(${-content.scrollTop}px)`;
+    routeGhost.appendChild(snapshot);
+  }
   content.innerHTML = '';
   const view = views[state.view] || views.login;
-  content.appendChild(view(state));
+  const page = view(state);
+  enhanceWorkspace(page, state);
+  // Section navigation keeps the original controls, handlers and workflow order.
+  const sections = state.view === 'tasks'
+    ? [['.signing-panel', '搜索发现'], ['.task-panel:not(.signing-panel)', '导入名单'], ['.candidate-panel', '候选池'], ['.pre-run-panel', '采集检查'], ['.task-toolbar', '执行队列'], ['.execution-table', '执行记录']]
+    : state.view === 'exports'
+      ? [['.export-run-card', '当前结果'], ['.export-workbench', '复核与邀约'], ['.contact-review-list', '达人名单'], ['.feishu-workbench', '飞书项目']]
+      : [];
+  if (sections.length && state.view !== 'exports') {
+    const outline = document.createElement('nav');
+    outline.className = 'workspace-outline';
+    outline.setAttribute('aria-label', '本页区域');
+    sections.forEach(([selector, label]) => {
+      const target = page.querySelector(selector);
+      if (!target) return;
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.addEventListener('click', () => {
+        target.scrollIntoView({ block: 'start', behavior: 'auto' });
+        target.setAttribute('tabindex', '-1');
+        target.focus({ preventScroll: true });
+      });
+      outline.appendChild(button);
+    });
+    page.prepend(outline);
+  }
+  content.appendChild(page);
+  if (!keepScroll && !window.matchMedia('(prefers-reduced-motion: reduce)').matches && page.animate) {
+    // Animate only route changes. Autosaves and list refreshes keep their position.
+    Array.from(page.children).slice(0, 18).forEach((node, index) => {
+      node.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }],
+        { duration: 180, delay: Math.min(index * 18, 90), easing: 'ease-out' });
+    });
+  }
+  if (routeGhost) {
+    content.appendChild(routeGhost);
+    content._routeGhost = routeGhost;
+    const exit = routeGhost.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 110, easing: 'ease-out' });
+    exit.finished.catch(() => {}).finally(() => routeGhost.remove());
+  }
   content.scrollTop = scrollTop;
   lastRenderedView = state.view;
 }
@@ -334,69 +413,140 @@ function initSplitters() {
   if (!body || !consoleEl || !sidebar || !splitMain || !splitSidebar) return;
 
   const rootStyle = document.documentElement.style;
-  const browserMinWidth = 320;
-  const splitterWidth = 10;
+  const savedLayout = readWorkspaceLayout(window.localStorage);
+  let layout = normalizeWorkspaceLayout({
+    viewportWidth: body.getBoundingClientRect().width,
+    ...savedLayout
+  });
+  // A temporary viewport clamp must not replace the user's committed preference.
+  let preferredConsoleWidth = Number.isFinite(savedLayout.consoleWidth)
+    ? savedLayout.consoleWidth : layout.consoleWidth;
+  let browserLayoutFrame = 0;
 
-  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-
-  const drag = (el, onMove) => {
-    let dragging = false;
-    const onMouseMove = (e) => {
-      if (!dragging) return;
-      onMove(e);
-    };
-    const onMouseUp = () => {
-      if (!dragging) return;
-      dragging = false;
-      el.classList.remove('dragging');
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    };
-    el.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      dragging = true;
-      el.classList.add('dragging');
-      window.addEventListener('mousemove', onMouseMove);
-      window.addEventListener('mouseup', onMouseUp);
-      document.body.style.cursor = 'col-resize';
-      document.body.style.userSelect = 'none';
+  const syncBrowserLayout = () => {
+    if (browserLayoutFrame) return;
+    browserLayoutFrame = window.requestAnimationFrame(() => {
+      browserLayoutFrame = 0;
+      try {
+        window.desktopAPI?.browser?.setLayout?.({ consoleWidth: layout.consoleWidth });
+      } catch (_) {}
     });
   };
 
-  // 默认让日常操作台占主要空间；右侧网页保留登录和人工点击所需宽度。
-  try {
-    const rect = body.getBoundingClientRect();
-    const min = 620;
-    const max = Math.max(min, rect.width - browserMinWidth - splitterWidth);
-    const w = clamp(Math.round(rect.width * 0.72), min, max);
-    rootStyle.setProperty('--w-console', `${w}px`);
-    if (w && window.desktopAPI?.browser?.setLayout) window.desktopAPI.browser.setLayout({ consoleWidth: w });
-  } catch (_) {}
+  const updateSplitterAria = () => {
+    const bounds = getWorkspaceLayoutBounds(
+      body.getBoundingClientRect().width,
+      layout.consoleWidth
+    );
+    splitMain.setAttribute('aria-valuemin', String(bounds.consoleMinWidth));
+    splitMain.setAttribute('aria-valuemax', String(bounds.consoleMaxWidth));
+    splitMain.setAttribute('aria-valuenow', String(layout.consoleWidth));
+    splitSidebar.setAttribute('aria-valuemin', String(bounds.sidebarMinWidth));
+    splitSidebar.setAttribute('aria-valuemax', String(bounds.sidebarMaxWidth));
+    splitSidebar.setAttribute('aria-valuenow', String(layout.sidebarWidth));
+  };
 
-  drag(splitMain, (e) => {
-    const rect = body.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    // 工作台宽度：控制左侧工具区与右侧网页区比例
-    const min = 620;
-    const max = Math.max(min, rect.width - browserMinWidth - splitterWidth);
-    const w = clamp(x, min, max);
-    rootStyle.setProperty('--w-console', `${Math.round(w)}px`);
-    try {
-      if (window.desktopAPI?.browser?.setLayout) window.desktopAPI.browser.setLayout({ consoleWidth: Math.round(w) });
-    } catch (_) {}
+  const applyLayout = (next = {}, { persist = false } = {}) => {
+    layout = normalizeWorkspaceLayout({
+      viewportWidth: body.getBoundingClientRect().width,
+      consoleWidth: next.consoleWidth ?? layout.consoleWidth,
+      sidebarWidth: next.sidebarWidth ?? layout.sidebarWidth
+    });
+    if (persist && next.consoleWidth != null) preferredConsoleWidth = layout.consoleWidth;
+    document.body.classList.toggle('compact-workspace', layout.consoleWidth < 800);
+    rootStyle.setProperty('--w-console', `${layout.consoleWidth}px`);
+    rootStyle.setProperty('--w-sidebar', `${layout.sidebarWidth}px`);
+    updateSplitterAria();
+    syncBrowserLayout();
+    if (persist) writeWorkspaceLayout(window.localStorage, { ...layout, consoleWidth: preferredConsoleWidth });
+  };
+
+  const bindSplitter = (el, { valueFromPointer, valueFromLayout, applyValue, resetValue }) => {
+    let pointerId = null;
+
+    const finish = (event) => {
+      if (pointerId === null || (event?.pointerId != null && event.pointerId !== pointerId)) return;
+      const capturedPointerId = pointerId;
+      pointerId = null;
+      el.classList.remove('dragging');
+      document.body.classList.remove('layout-dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      try {
+        if (el.hasPointerCapture?.(capturedPointerId)) el.releasePointerCapture(capturedPointerId);
+      } catch (_) {}
+      // Commit the normalized final value through the same path as keyboard edits.
+      applyValue(valueFromLayout(), true);
+    };
+
+    el.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      event.preventDefault();
+      pointerId = event.pointerId;
+      try { el.setPointerCapture?.(pointerId); } catch (_) {}
+      el.classList.add('dragging');
+      document.body.classList.add('layout-dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+    el.addEventListener('pointermove', (event) => {
+      if (event.pointerId !== pointerId) return;
+      event.preventDefault();
+      applyValue(valueFromPointer(event), false);
+    });
+    el.addEventListener('pointerup', finish);
+    el.addEventListener('pointercancel', finish);
+    el.addEventListener('lostpointercapture', finish);
+    window.addEventListener('blur', () => finish());
+    el.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      applyValue(resetValue(), true);
+    });
+    el.addEventListener('keydown', (event) => {
+      const bounds = getWorkspaceLayoutBounds(
+        body.getBoundingClientRect().width,
+        layout.consoleWidth
+      );
+      const min = el === splitMain ? bounds.consoleMinWidth : bounds.sidebarMinWidth;
+      const max = el === splitMain ? bounds.consoleMaxWidth : bounds.sidebarMaxWidth;
+      const step = event.shiftKey ? 50 : 20;
+      let next = valueFromLayout();
+      if (event.key === 'ArrowLeft') next -= step;
+      else if (event.key === 'ArrowRight') next += step;
+      else if (event.key === 'Home') next = min;
+      else if (event.key === 'End') next = max;
+      else return;
+      event.preventDefault();
+      applyValue(next, true);
+    });
+  };
+
+  bindSplitter(splitMain, {
+    valueFromPointer: (event) => event.clientX - body.getBoundingClientRect().left,
+    valueFromLayout: () => layout.consoleWidth,
+    applyValue: (consoleWidth, persist) => applyLayout({ consoleWidth }, { persist }),
+    resetValue: () => Math.round(
+      body.getBoundingClientRect().width * WORKSPACE_LAYOUT_LIMITS.defaultConsoleRatio
+    )
   });
 
-  drag(splitSidebar, (e) => {
-    const rect = consoleEl.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    // sidebar 宽度：控制左侧导航与中间内容比例
-    const min = 180;
-    const max = Math.min(320, Math.max(min, rect.width - 360)); // 内容至少 360
-    const w = clamp(x, min, max);
-    rootStyle.setProperty('--w-sidebar', `${Math.round(w)}px`);
+  bindSplitter(splitSidebar, {
+    valueFromPointer: (event) => event.clientX - consoleEl.getBoundingClientRect().left,
+    valueFromLayout: () => layout.sidebarWidth,
+    applyValue: (sidebarWidth, persist) => applyLayout({ sidebarWidth }, { persist }),
+    resetValue: () => WORKSPACE_LAYOUT_LIMITS.defaultSidebarWidth
   });
+
+  let resizeFrame = 0;
+  window.addEventListener('resize', () => {
+    if (resizeFrame) return;
+    resizeFrame = window.requestAnimationFrame(() => {
+      resizeFrame = 0;
+      applyLayout({ consoleWidth: preferredConsoleWidth }, { persist: false });
+    });
+  });
+
+  applyLayout(savedLayout, { persist: false });
 }
 
 async function bootstrap() {

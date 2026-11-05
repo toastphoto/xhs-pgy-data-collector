@@ -1,0 +1,58 @@
+const {chromium}=require('playwright'),assert=require('node:assert/strict'),path=require('path'),fs=require('fs');
+(async()=>{
+ const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+ try{
+  const p=await browser.newPage({viewport:{width:1800,height:1100},reducedMotion:'reduce'}),errors=[],external=[],results=[];
+  p.on('pageerror',e=>errors.push(e.message));p.on('console',m=>{if(m.type()==='error')errors.push(m.text());});p.on('request',r=>{if(/^https?:/.test(r.url()))external.push(r.url());});
+  fs.mkdirSync('evidence',{recursive:true});
+  const a=async action=>p.locator(`[data-action="${action}"]`).first().click();
+  const state=()=>p.evaluate(()=>prototypeState());
+  const reset=async()=>{await a('reset');await a('confirm-reset');};
+  const shot=async name=>{await p.screenshot({path:`evidence/${name}.png`});};
+  await p.goto('file:///'+(fs.existsSync(path.join(__dirname,'index.html'))?path.join(__dirname,'index.html'):path.resolve('prototype/index.html')).replace(/\\/g,'/'));
+  await p.locator('.workspace-shell').waitFor();
+  assert.equal((await state()).rows.length,100);assert.equal(await p.locator('#record-table tbody tr').count(),100);await shot('01-warm-browser-list-detail');
+  const blueButtons=await p.locator('button:visible').evaluateAll(nodes=>nodes.filter(el=>['backgroundColor','color'].some(property=>{const c=getComputedStyle(el)[property].match(/[\d.]+/g)?.map(Number);return c&&!(c[3]===0)&&c[2]>c[0]+16&&c[2]>c[1]+6;})).map(el=>el.textContent));
+  assert.deepEqual(blueButtons,[]);results.push('Warm neutral buttons, hover basis, 100 real DOM rows and default list/detail/browser composition');
+  // Login, filtering, scrolling, role switching, hide and continue preserve their own simulation.
+  await a('mock-login');await p.locator('#mock-category').selectOption('家居好物');await p.locator('#mock-fans').selectOption('5–15万');await a('mock-filter');await a('mock-page:next');
+  await p.locator('.browser-content').evaluate(el=>{el.scrollTop=200;el.dispatchEvent(new Event('scroll'));});
+  const before=await state();await a('browser-toggle');assert.equal(await p.locator('#embedded-browser').count(),0);await a('browser-toggle');
+  assert.equal((await state()).browser.sessions.collection.page,before.browser.sessions.collection.page);assert.equal((await state()).browser.sessions.collection.category,'家居好物');assert.equal((await state()).browser.sessions.collection.fan,'5–15万');assert.ok(await p.locator('.browser-content').evaluate(el=>el.scrollTop>=190));
+  await p.locator('[data-action^="mock-profile:"]').first().click();await a('mock-login');await a('mock-note:'+((await state()).browser.sessions.detail.id)+':1');await a('mock-back');await a('browser:collection');assert.equal((await state()).browser.sessions.collection.page,2);results.push('Interactive mock login/filter/page/profile/note/history plus hidden/continued search session and scroll');
+  const split=p.locator('#browserSplitter'),box=await split.boundingBox(),oldWidth=(await state()).browser.width;
+  await p.mouse.move(box.x+6,box.y+70);await p.mouse.down();await p.mouse.move(box.x-70,box.y+70,{steps:10});await p.mouse.up();assert.ok((await state()).browser.width>oldWidth+50);await split.focus();await p.keyboard.press('ArrowRight');const newWidth=(await state()).browser.width;await shot('02-resized-web-review');results.push('Pointer and keyboard resizing changes mock workspace width without resetting role session');
+  await p.reload();await p.locator('.workspace-shell').waitFor();assert.equal((await state()).browser.width,newWidth);assert.equal((await state()).browser.sessions.collection.page,2);results.push('Reload keeps prototype-only browser role, filter, page and width');
+  // P2-02: search and scope changes reconcile current record, zero rows clear every side action.
+  await p.locator('[data-row="3"]').click();await p.locator('#contact-filter').selectOption('no');const filtered=(await state());assert.notEqual(filtered.focus,3);assert.equal(await p.locator('#record-inspector [data-action="toggle-outreach:3"]').count(),0);
+  await p.locator('#search').fill('不存在的虚构对象');assert.equal(await p.locator('#record-table tbody tr').count(),0);assert.equal(await p.locator('#record-inspector [data-action^="toggle-outreach:"]').count(),0);await shot('03-empty-detail-guard');
+  await p.locator('#search').fill('');await p.locator('#contact-filter').selectOption('all');await p.locator('#run-selector').selectOption('first');assert.equal(await p.locator('#record-table tbody tr').count(),50);assert.ok((await state()).focus<=50);results.push('P2-02 fixed: filter/scope reconcile inspector; empty list clears actions; old object cannot be operated');
+  // Phone + stable scroll and focus after save.
+  await p.locator('#record-table .tablewrap').evaluate(el=>{el.scrollTop=650;el.dispatchEvent(new Event('scroll'));});
+  await a('edit:1');await p.locator('#edit-phone').fill('DEMO_PHONE_MANUAL_001');await p.locator('#edit-note').fill('本次手机与备注手工核实');await a('save-edit');
+  await p.waitForFunction(()=>document.activeElement?.dataset.row==='1');assert.equal((await state()).rows[0].phone,'DEMO_PHONE_MANUAL_001');assert.ok(await p.locator('#record-table .tablewrap').evaluate(el=>el.scrollTop>=640));results.push('Phone field persists; save restores same record keyboard focus and list scroll');
+  // Prepare two people, then reproduce exact shortcut switch into a one-person new run.
+  await p.locator('[data-select="1"]').check();await p.locator('[data-select="2"]').check();await a('include');await a('plan');await a('prepare');assert.equal((await state()).browser.activeRole,'invite');await a('mock-login');await a('prepare');await p.locator('#prepare-ack').check();await a('prepare-confirm');await p.waitForFunction(()=>prototypeState().plan.status==='awaiting');assert.equal(await p.locator('[data-mock-form="brand"]').inputValue(),'秋日居家 DEMO');await shot('04-unsent-with-embedded-form');
+  await a('unsent-next');await p.waitForFunction(()=>prototypeState().plan.status==='awaiting');await a('unsent-next');assert.equal((await state()).plan.prepared.length,2);assert.equal((await state()).plan.status,'completed');assert.equal((await state()).rows.filter(r=>r.outreach).length,2);results.push('Same-batch two-person unsent preparation reflected in docked form; final send disabled');
+  await a('go:discover');await p.locator('[data-select="1"]').check();await a('collect');await p.locator('#collect-ack').check();await a('start-job');await a('advance');await a('review-job');
+  assert.equal(await p.locator('#record-table tbody tr').count(),1);assert.equal((await state()).plan.status,'stale');assert.deepEqual((await state()).plan.prepared,[]);assert.equal((await state()).focus,1);await a('go:delivery');assert.equal(await p.locator('[data-action="prepare"]').isDisabled(),true);await shot('05-shortcut-revokes-plan');results.push('P2-01 exact reproduction fixed: completed-job shortcut revokes old two-person plan and approval');
+  // All entry variants also use the same function.
+  await a('go:history');await a('review-run:second');assert.equal((await state()).runKey,'second');assert.ok((await state()).focus>50);await a('go:overview');await a('review-run:first');assert.equal((await state()).runKey,'first');results.push('History, overview and dropdown batch entries consistently synchronize records and revoke old preparation');
+  // P2-03: select an excluded candidate in default selected scope: secondary exact-object confirmation mandatory.
+  await reset();await a('go:discover');await p.locator('[data-row="1"]').click();await p.locator('#edit-priority').selectOption('排除');await a('save-edit');await p.locator('[data-select="1"]').check();await a('collect');await a('login-dialog');await p.locator('#collect-ack').check();await a('start-job');assert.equal((await state()).job.status,'idle');assert.match(await p.locator('#modal').innerText(),/小禾的慢生活/);await a('start-all-job');assert.equal((await state()).job.status,'idle');await shot('06-excluded-exact-confirmation');await p.locator('#all-ack').check();await a('start-all-job');assert.deepEqual((await state()).job.ids,[1]);results.push('P2-03 exact reproduction fixed: excluded checkbox cannot bypass separate named confirmation');
+  // Processed vs saved vs skipped counts.
+  await a('skip');await a('safe-point');assert.equal((await state()).job.done,1);assert.equal((await state()).job.skippedIds.length,1);await a('review-job');assert.equal(await p.locator('#record-table tbody tr').count(),0);assert.match(await p.locator('#run-selector').innerText(),/已保存0位 \/ 跳过1位/);results.push('Skipped is not saved; current run collection contains only saved records and count labels agree');
+  // Resource table scope count and phone column, ordinary CSV only.
+  await p.locator('#run-selector').selectOption('second');await a('export');await a('export-mode:resource');assert.match(await p.locator('#export-scope').innerText(),/当前结果范围（50位）/);await p.locator('#export-scope').selectOption('all');const downloadPromise=p.waitForEvent('download');await a('download:false');const download=await downloadPromise;const file=await download.path(),csv=fs.readFileSync(file,'utf8');assert.equal(csv.trim().split(/\r?\n/).length,51);assert.match(csv.split(/\r?\n/)[0],/手机/);assert.match(csv,/来源批次/);results.push('Full resource CSV contains phone/provenance and exactly 50 rows from selected run');
+  // Explicit AI-test creation previews marker before first mock create.
+  await p.locator('[data-select="51"]').check();await a('include');await a('plan');await a('cloud');await p.locator('#cloud-mode').selectOption('test-create');await p.locator('#cloud-owner').selectOption('demo');await a('cloud-preview');assert.match(await p.locator('#modal').innerText(),/首次创建标题：\[AI测试\]/);assert.match(await p.locator('#modal').innerText(),/DEMO-R3-20261016/);assert.equal((await state()).mockTestRecords.length,0);await shot('07-ai-test-first-create');await p.locator('#cloud-ack').check();await a('cloud-confirm');assert.equal((await state()).mockTestRecords[0].mode,'test');await a('close');results.push('AI test creation has explicit destination and marker/batch before first mock creation, formal path separate');
+  // Narrow workspace & warmer focus/hover checks. Native engine intentionally not included.
+  for(const width of [1600,1280,1100,840,390]){await p.setViewportSize({width,height:1000});await a('go:library');assert.ok(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`No page overflow ${width}`);await shot('width-'+width);}
+  results.push('1600/1280/1100/840/390 responsive layouts; table scroll remains local');
+  await p.setViewportSize({width:1800,height:1100});await a('browser-contract');assert.match(await p.locator('#modal').innerText(),/同一个允许域 WebContents/);await a('close');await p.emulateMedia({reducedMotion:'no-preference'});await a('go:jobs');await a('go:library');await p.emulateMedia({reducedMotion:'reduce'});await a('workspace:list');await a('workspace:triple');await p.waitForFunction(()=>!document.getAnimations().some(a=>a.playState==='running'));
+  assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
+  const result={ok:true,results,consoleErrors:errors,externalRequests:external,layer:'offline browser interaction model; native BrowserView and actual sessions NOT validated'};
+  fs.writeFileSync('evidence/acceptance.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));
+ }finally{await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+

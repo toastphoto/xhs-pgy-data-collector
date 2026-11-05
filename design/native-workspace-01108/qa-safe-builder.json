@@ -1,0 +1,58 @@
+{
+  "appId": "com.solo.contentanalyzer.qa",
+  "productName": "PGY Workbench QA",
+  "directories": {
+    "output": "dist-coexist-qa-01108-safe"
+  },
+  "asar": true,
+  "asarUnpack": [
+    "**/node_modules/sql.js/dist/sql-wasm.wasm"
+  ],
+  "files": [
+    "main.js",
+    "preload.js",
+    "browser_preload.js",
+    "templates/**/*",
+    "lib/**/*",
+    "renderer/**/*",
+    "package.json",
+    "node_modules/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "C:\\Users\\feibo\\Documents\\Codex\\2026-06-25\\s\\projects\\xhs-pgy-data-collector\\desktop-app\\dist-invite-selection-01105-final\\win-unpacked\\resources\\content-analyzer",
+      "to": "content-analyzer"
+    },
+    {
+      "from": "C:\\Users\\feibo\\Documents\\Codex\\2026-06-25\\s\\projects\\xhs-pgy-data-collector\\desktop-app\\dist-invite-selection-01105-final\\win-unpacked\\resources\\content-analyzer-backend",
+      "to": "content-analyzer-backend"
+    }
+  ],
+  "mac": {
+    "target": "dmg"
+  },
+  "win": {
+    "artifactName": "PGY-Workbench-QA-${version}-setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "guid": "86505d45-1343-47e6-9b32-92faec441da9",
+    "shortcutName": "PGY Workbench QA",
+    "uninstallDisplayName": "PGY Workbench QA",
+    "createDesktopShortcut": false,
+    "createStartMenuShortcut": true,
+    "runAfterFinish": false,
+    "include": "C:\\Users\\feibo\\multica_workspaces_desktop-api.multica.ai\\mianbaogong-570bc60cb6f0\\toast-2-053cb7f0b2a0\\worktree\\qa-installer.nsh"
+  },
+  "portable": {
+    "artifactName": "${productName}-${version}-windows-${arch}-portable.${ext}"
+  },
+  "executableName": "pgy-workbench-qa",
+  "extraMetadata": {
+    "name": "pgy-workbench-qa",
+    "productName": "PGY Workbench QA",
+    "buildFlavor": "coexist-qa"
+  }
+}
